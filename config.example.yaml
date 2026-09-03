@@ -1,0 +1,125 @@
+server:
+  host: 0.0.0.0
+  port: 8788
+  log_level: info
+
+upstream:
+  base_url: http://localhost:4000/v1
+  # Use a fixed upstream key, or set passthrough_authorization: true.
+  api_key: ${UPSTREAM_API_KEY:-}
+  passthrough_authorization: true
+  timeout_seconds: 300
+
+memory:
+  enabled: true
+  database_path: ./infinitum.db
+  retrieve_candidates: 50
+  minimum_retrieval_score: 0.18
+  inject_max_memories: 24
+  dedup_similarity: 0.88
+  # Near-identical wording reinforces directly.
+  reinforce_similarity: 0.86
+  # Semantically equivalent wording can reinforce when embeddings are enabled.
+  reinforce_semantic_similarity: 0.90
+  # A model-proposed reinforce hint still requires type/topic compatibility plus
+  # a credible retrieval/similarity match.
+  reinforce_hint_min_score: 0.55
+  reinforce_hint_min_lexical: 0.40
+  reinforce_hint_min_semantic: 0.72
+  supersede_similarity_floor: 0.30
+  freshness_half_life_days: 120
+
+context:
+  model_context_window: 262144
+  reserve_output_tokens: 32768
+  reserve_free_tokens: 16384
+  max_memory_tokens: 100000
+  memory_message_role: system
+
+embeddings:
+  enabled: false
+  base_url: http://localhost:8000/v1
+  api_key: ${EMBEDDING_API_KEY:-}
+  model: text-embedding-3-small
+  timeout_seconds: 60
+
+learning:
+  enabled: true
+  # If model is empty, the model from the original request is reused.
+  model: ""
+  # Empty base_url means reuse upstream.base_url.
+  base_url: ""
+  api_key: ${LEARNING_API_KEY:-}
+  # Background extraction is non-streaming and may take longer on local models.
+  timeout_seconds: 600
+  max_tokens: 2048
+  # Optional vendor-specific OpenAI-compatible fields for background learning.
+  # For vLLM/Qwen reasoning models you may want:
+  # extra_body:
+  #   chat_template_kwargs:
+  #     enable_thinking: false
+  extra_body: {}
+  poll_interval_seconds: 1.0
+  max_attempts: 5
+
+  # Topic summaries are incremental in v0.2.x (introduced in v0.1.2). Memory changes are accumulated
+  # and summarized once after a quiet period, or sooner after enough changes.
+  topic_summaries: true
+  topic_summary_min_memories: 3
+  topic_summary_debounce_seconds: 30
+  topic_summary_update_threshold: 5
+  topic_summary_max_changed_memories: 24
+  topic_summary_context_memories: 8
+  topic_summary_bootstrap_max_memories: 32
+  topic_summary_max_tokens: 1024
+  topic_summary_fallback_memories: 12
+
+# Optional request provenance/affinity hints. OpenCode can send any of the
+# configured header aliases. In the current global-memory line these values are
+# NOT an authorization boundary: they are recorded on events/requests and only
+# provide a soft ranking preference for memories observed in the same context.
+request_context:
+  enabled: true
+  derive_project_from_cwd: true
+
+  user_headers:
+    - x-infinitum-user-id
+    # Legacy pre-0.2 alias:
+    - x-context-user-id
+    - x-opencode-user-id
+    - x-opencode-user
+    - x-headroom-user-id
+    - x-litellm-user-id
+  project_headers:
+    - x-infinitum-project-id
+    # Legacy pre-0.2 alias:
+    - x-context-project-id
+    - x-opencode-project-id
+    - x-opencode-project
+    - x-headroom-project-id
+  cwd_headers:
+    - x-infinitum-cwd
+    # Legacy pre-0.2 alias:
+    - x-context-cwd
+    - x-opencode-directory
+    - x-opencode-cwd
+    - x-headroom-cwd
+
+  # Bonuses are applied only after a memory already clears the normal global
+  # relevance threshold. Same-project context is intentionally strongest.
+  user_affinity_bonus: 0.03
+  project_affinity_bonus: 0.07
+  cwd_affinity_bonus: 0.01
+
+  # If Infinitum's immediate upstream is Headroom, enable this to emit
+  # canonical x-headroom-user-id/project-id/cwd headers from the resolved
+  # request context. Consumed aliases are otherwise stripped before forwarding.
+  forward_to_headroom: false
+
+retrieval_weights:
+  semantic: 0.45
+  lexical: 0.18
+  importance: 0.14
+  confidence: 0.10
+  freshness: 0.05
+  topic: 0.08
