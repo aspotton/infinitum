@@ -96,6 +96,14 @@ This makes memory cost grow with **new information and meaningful change**, rath
 
 ---
 
+## V0.2.2 structured-output transport resilience
+
+The global-memory runtime now treats OpenAI-compatible `message.content` and schema-shaped tool/function arguments as two possible transports for the same bounded memory-extraction result. This addresses local/Qwen deployments where an automatic tool parser can convert the model's requested JSON into `finish_reason="tool_calls"` even when Infinitum did not advertise tools. The acceptance rule is intentionally narrow: only arguments matching the Infinitum memory schema are consumed; arbitrary tool calls are ignored.
+
+Future structured-learning stages should preserve this principle: distinguish the **semantic result contract** from the provider/model's **wire representation**. Prefer explicit structured-output mechanisms when a backend supports them reliably, but keep provider-neutral parsing/fallbacks and never allow output-transport quirks to bypass deterministic mutation, provenance, scope, or validation rules.
+
+For deployments with aggressive tool parsing, `learning.extra_body.tool_choice: none` is the preferred prevention knob, while parser recovery remains a resilience layer rather than the primary protocol.
+
 ## V0.2.1 learning-output resilience
 
 The current global-memory runtime now treats model-generated summaries as an optimization rather than a single point of failure. Empty final output from a reasoning-capable learning model falls back to bounded active canonical memories, and deployment-specific background controls can be supplied through `learning.extra_body`. This principle should carry into periodic consolidation: expensive LLM maintenance must be restartable and optional, while canonical detailed memory and immutable evidence remain usable without it.

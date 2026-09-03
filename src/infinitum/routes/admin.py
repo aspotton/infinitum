@@ -16,7 +16,7 @@ async def health(request: Request):
     runtime = _runtime(request)
     return {
         "status": "ok",
-        "version": "0.2.1",
+        "version": "0.2.2",
         "memory_enabled": runtime.config.memory.enabled,
         "learning_enabled": runtime.config.learning.enabled,
         "embeddings_enabled": runtime.config.embeddings.enabled,

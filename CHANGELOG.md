@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2
+
+- Fixed lost memory-learning turns when an OpenAI-compatible server returns `finish_reason="tool_calls"` with empty assistant content.
+- Memory extraction now recovers schema-shaped `message.tool_calls[].function.arguments` or legacy `function_call.arguments` when they contain the expected memory JSON; unrelated tool calls are ignored.
+- Topic summarization can recover a simple `summary`, `text`, or `content` value from tool-call arguments before using the deterministic fallback.
+- Extraction and summary prompts explicitly instruct background models not to call tools/functions.
+- Empty-output diagnostics now include tool-call count and function names.
+- Documented `learning.extra_body.tool_choice: none` as the preferred defense for servers with aggressive automatic tool-call parsing; this composes with `chat_template_kwargs.enable_thinking: false`.
+- Added regression tests for schema-shaped tool-call extraction, unrelated tool-call rejection, and tool-call topic-summary recovery.
+
 ## 0.2.1
 
 - Fixed repeated topic-summary job failures when an OpenAI-compatible learning model returns an empty final `message.content`.

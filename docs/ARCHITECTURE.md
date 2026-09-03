@@ -1,4 +1,4 @@
-# Infinitum v0.2.1 Architecture
+# Infinitum v0.2.2 Architecture
 
 ## Request path
 
@@ -188,9 +188,11 @@ Memories are added in score order only while they fit. The runtime is designed t
 
 ## Empty-output resilience for background learning
 
-Background memory extraction and topic summarization are deliberately separate from the foreground response path. Reasoning-capable OpenAI-compatible models may consume their generation budget in reasoning tokens and return an empty final `message.content`. V0.2.1 treats this as an output-shape/learning-quality problem rather than a reason to repeatedly replay the same summary job.
+Background memory extraction and topic summarization are deliberately separate from the foreground response path. Reasoning-capable OpenAI-compatible models may consume their generation budget in reasoning tokens and return an empty final `message.content`. Some model servers also run automatic tool-call parsers and return `finish_reason="tool_calls"` with structured data in `message.tool_calls` even though Infinitum supplied no tools. V0.2.2 treats both cases as output-shape/learning-quality problems rather than blindly replaying work.
+
+For extraction, normal assistant content remains preferred. When it is empty, Infinitum may recover tool/function arguments only when they already match the expected memory schema (`{"memories": [...]}` or one candidate-shaped object). Arbitrary tool calls are ignored. This preserves the deterministic mutation boundary: a tool-call transport does not gain any more authority than ordinary extraction JSON.
 
 For topic summaries, Infinitum records non-content diagnostics, then creates a bounded deterministic summary from current active canonical memories. Detailed memories remain authoritative, so this fallback is safe and can later be replaced by the next successful incremental LLM summary. For interaction extraction, empty final content is logged and produces no candidates; the immutable interaction events remain available for future replay/consolidation tooling.
 Because failed summary jobs leave `topic_updates` untouched, startup recovery scans dirty topics and recreates a pending summary job when no pending/running owner exists and the learning model can be recovered from configuration or prior job payload. This lets an upgrade recover topics that previously exhausted their retry count.
 
-`learning.extra_body` allows deployment-specific background controls such as disabling thinking on a compatible vLLM/Qwen endpoint. These extensions apply only to learning calls; Infinitum still fixes the learning model/messages, forces non-streaming mode, and enforces configured token caps.
+`learning.extra_body` allows deployment-specific background controls such as `tool_choice: none` and disabling thinking on a compatible vLLM/Qwen endpoint. These extensions apply only to learning calls; Infinitum still fixes the learning model/messages, forces non-streaming mode, and enforces configured token caps.

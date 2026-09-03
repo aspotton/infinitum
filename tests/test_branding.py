@@ -10,7 +10,7 @@ from infinitum.config import load_config
 
 
 def test_infinitum_is_primary_package_and_legacy_namespace_still_imports():
-    assert infinitum.__version__ == "0.2.1"
+    assert infinitum.__version__ == "0.2.2"
     assert context_runtime.__version__ == infinitum.__version__
     assert legacy_create_app is create_app
 

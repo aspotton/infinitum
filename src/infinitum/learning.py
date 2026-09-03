@@ -73,7 +73,7 @@ class MemoryLearner:
             context_lines.append(f"cwd={request_context.cwd}")
         context_text = "\n".join(context_lines) or "(none)"
 
-        prompt = f"""Extract durable memories from this interaction. Return JSON only.
+        prompt = f"""Extract durable memories from this interaction. Return JSON only. Do not call tools or functions.
 Do not save transient chit-chat, guesses, assistant inventions, or obvious restatements.
 Prefer concise current-state facts, decisions, preferences, goals, procedures, lessons, or episodic events.
 If the user explicitly corrects or replaces an existing memory, set operation_hint='supersede', explicit_correction=true, and list only relevant existing memory IDs.
@@ -94,7 +94,7 @@ Schema:
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a conservative persistent-memory extraction engine. Output strict JSON.",
+                    "content": "You are a conservative persistent-memory extraction engine. Output strict JSON directly in assistant content. Do not call tools or functions.",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -104,16 +104,29 @@ Schema:
             max_tokens=self.config.learning.max_tokens,
             extra_body=self.config.learning.extra_body,
         )
-        raw, _metadata = extract_nonstream_assistant(result)
-        if not raw.strip():
-            log.warning(
-                "memory extraction model returned empty final content; no candidates extracted (%s). "
-                "If this is a reasoning model, consider disabling thinking for background learning "
-                "with learning.extra_body or increasing learning.max_tokens",
-                self._response_diagnostics(result),
-            )
-            return
-        obj = self._parse_json(raw)
+        raw, metadata = extract_nonstream_assistant(result)
+        if raw.strip():
+            obj = self._parse_json(raw)
+        else:
+            # Some OpenAI-compatible servers/tool parsers return a perfectly
+            # usable structured model answer as message.tool_calls with
+            # finish_reason="tool_calls", even though Infinitum did not provide
+            # any tools. Treat schema-shaped function arguments as another model
+            # output transport rather than silently dropping the learning turn.
+            obj = self._memory_payload_from_tool_calls(metadata)
+            if obj:
+                log.info(
+                    "memory extraction used schema-shaped tool-call arguments (%s)",
+                    self._response_diagnostics(result),
+                )
+            else:
+                log.warning(
+                    "memory extraction model returned no usable final content; no candidates extracted (%s). "
+                    "If finish_reason is 'tool_calls', consider setting learning.extra_body.tool_choice='none'; "
+                    "if this is a reasoning model, also consider disabling thinking or increasing learning.max_tokens",
+                    self._response_diagnostics(result),
+                )
+                return
         candidates: list[MemoryCandidate] = []
         for item in obj.get("memories", []) if isinstance(obj, dict) else []:
             try:
@@ -163,6 +176,80 @@ Schema:
                 return json.loads(match.group(0))
             except Exception:
                 return {}
+
+    def _memory_payload_from_tool_calls(self, metadata: dict[str, Any]) -> dict[str, Any]:
+        """Recover memory JSON from schema-shaped tool/function arguments.
+
+        A few OpenAI-compatible model servers run an automatic tool-call parser
+        even when the caller did not provide tools. Qwen-family models can then
+        emit the requested JSON through ``message.tool_calls`` and leave
+        ``message.content`` empty. We only accept arguments that already match
+        Infinitum's memory-extraction shape; arbitrary tool calls are ignored.
+        """
+
+        payloads: list[Any] = []
+        tool_calls = metadata.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                if isinstance(function, dict):
+                    payloads.append(function.get("arguments"))
+
+        function_call = metadata.get("function_call")
+        if isinstance(function_call, dict):
+            payloads.append(function_call.get("arguments"))
+
+        for payload in payloads:
+            parsed: Any = payload
+            if isinstance(payload, str):
+                parsed = self._parse_json(payload)
+            if isinstance(parsed, list):
+                parsed = {"memories": parsed}
+            if not isinstance(parsed, dict):
+                continue
+
+            memories = parsed.get("memories")
+            if isinstance(memories, list):
+                return parsed
+
+            # Be tolerant of a single candidate object as tool arguments while
+            # still requiring the fields that identify an actual memory record.
+            if isinstance(parsed.get("content"), str) and parsed.get("memory_type"):
+                return {"memories": [parsed]}
+
+        return {}
+
+    @staticmethod
+    def _summary_from_tool_calls(metadata: dict[str, Any]) -> str:
+        """Recover a plain topic summary from simple tool-call arguments."""
+
+        tool_calls = metadata.get("tool_calls")
+        calls = tool_calls if isinstance(tool_calls, list) else []
+        function_call = metadata.get("function_call")
+        if isinstance(function_call, dict):
+            calls = [*calls, {"function": function_call}]
+
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            args = function.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    continue
+            if not isinstance(args, dict):
+                continue
+            for key in ("summary", "text", "content"):
+                value = args.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
 
     async def _apply(
         self,
@@ -348,7 +435,7 @@ Active memory sample ({len(bootstrap)} of {active_count} active memories):
                 f"- [{m.memory_type}] {m.content}" for m in context_memories
             ) or "(none)"
             prompt = f"""Update an existing persistent-memory topic summary using the changed memory records below.
-Preserve still-valid information from the current summary. Incorporate new active information. If a changed record is superseded, remove or qualify outdated statements it previously supported. Preserve meaningful uncertainty or disagreement. Do not invent facts. Return only the updated summary text.
+Preserve still-valid information from the current summary. Incorporate new active information. If a changed record is superseded, remove or qualify outdated statements it previously supported. Preserve meaningful uncertainty or disagreement. Do not invent facts. Return only the updated summary text. Do not call tools or functions.
 
 Topic: {topic}
 
@@ -367,7 +454,7 @@ Small current-topic context sample:
             messages=[
                 {
                     "role": "system",
-                    "content": "Maintain a compact, accurate current-state topic summary from persistent memory. Return plain text only.",
+                    "content": "Maintain a compact, accurate current-state topic summary from persistent memory. Return plain text directly in assistant content. Do not call tools or functions.",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -377,18 +464,27 @@ Small current-topic context sample:
             max_tokens=self.config.learning.topic_summary_max_tokens,
             extra_body=self.config.learning.extra_body,
         )
-        summary, _metadata = extract_nonstream_assistant(result)
+        summary, metadata = extract_nonstream_assistant(result)
         summary = summary.strip()
         if not summary:
+            summary = self._summary_from_tool_calls(metadata)
+            if summary:
+                log.info(
+                    "topic summary used tool-call arguments for topic %r (%s)",
+                    topic,
+                    self._response_diagnostics(result),
+                )
+        if not summary:
             # Empty final content is common with reasoning-capable local models
-            # when the completion budget is consumed by hidden/reasoning tokens.
-            # Replaying the identical durable job several times is both expensive
-            # and unlikely to help. Topic summaries are an optimization, while
+            # when the completion budget is consumed by hidden/reasoning tokens,
+            # and some tool parsers can also produce unusable tool calls. Replaying
+            # the identical durable job several times is both expensive and
+            # unlikely to help. Topic summaries are an optimization, while
             # detailed active memories remain authoritative, so degrade safely to
             # a bounded deterministic active-memory summary instead.
             summary = await self._deterministic_topic_fallback(topic, active_count)
             log.warning(
-                "topic summary model returned empty final content for topic %r; "
+                "topic summary model returned no usable final content for topic %r; "
                 "using deterministic fallback instead of retrying (%s)",
                 topic,
                 self._response_diagnostics(result),
@@ -436,10 +532,24 @@ Small current-topic context sample:
         if reasoning is None:
             reasoning = message.get("reasoning")
         reasoning_chars = len(reasoning) if isinstance(reasoning, str) else 0
+        tool_calls = message.get("tool_calls")
+        tool_calls = tool_calls if isinstance(tool_calls, list) else []
+        tool_names: list[str] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if isinstance(function, dict) and isinstance(function.get("name"), str):
+                tool_names.append(function["name"][:80])
+        if isinstance(message.get("function_call"), dict):
+            name = message["function_call"].get("name")
+            if isinstance(name, str):
+                tool_names.append(name[:80])
         usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
         completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
         return (
             f"finish_reason={choice.get('finish_reason')!r}, "
+            f"tool_calls={len(tool_calls)}, tool_names={tool_names!r}, "
             f"reasoning_chars={reasoning_chars}, completion_tokens={completion_tokens!r}"
         )
 

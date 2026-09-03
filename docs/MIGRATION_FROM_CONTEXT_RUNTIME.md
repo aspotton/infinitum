@@ -1,11 +1,11 @@
-# Migrating Context Runtime v0.1.x to Infinitum v0.2.1
+# Migrating Context Runtime v0.1.x to Infinitum v0.2.2
 
 Infinitum v0.2.x is a project/package rename with compatibility support. The memory/event schema remains compatible with v0.1.x.
 
 ## Recommended upgrade
 
 1. Stop the old service cleanly.
-2. Install or unpack Infinitum v0.2.1.
+2. Install or unpack Infinitum v0.2.2.
 3. Reuse your existing `config.yaml`.
 4. Keep `memory.database_path` pointed at your existing SQLite database.
 5. Start with `infinitum serve --config config.yaml`.

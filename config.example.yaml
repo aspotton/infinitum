@@ -56,6 +56,8 @@ learning:
   # Optional vendor-specific OpenAI-compatible fields for background learning.
   # For vLLM/Qwen reasoning models you may want:
   # extra_body:
+  #   # Useful when an automatic tool parser turns JSON into tool calls.
+  #   tool_choice: none
   #   chat_template_kwargs:
   #     enable_thinking: false
   extra_body: {}

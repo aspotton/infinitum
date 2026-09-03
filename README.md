@@ -14,7 +14,7 @@
 
 Infinitum is a standalone Python 3 memory and context runtime for AI agents and LLM applications. It exposes an OpenAI-compatible API, maintains durable event-sourced memory, learns and consolidates useful long-term context, and injects only the most relevant memory into each request.
 
-Current release: **v0.2.1**.
+Current release: **v0.2.2**.
 
 ## Repository
 
@@ -23,6 +23,25 @@ Current release: **v0.2.1**.
 - **Python distribution:** `infinitum`
 - **Python package:** `infinitum`
 - **CLI:** `infinitum`
+
+## What changed in v0.2.2
+
+V0.2.2 hardens background learning for OpenAI-compatible servers that return structured output through `message.tool_calls` instead of normal `message.content`. This can happen with Qwen-family models behind an automatic tool-call parser even when Infinitum did not provide any tools. Infinitum now accepts only schema-shaped tool/function arguments that match the memory extraction contract, while unrelated tool calls remain ignored.
+
+The extraction and topic-summary prompts now explicitly tell the model not to call tools or functions. Diagnostics include tool-call count and names, and topic summaries can recover a simple `summary`, `text`, or `content` field from tool-call arguments before falling back to deterministic active-memory summaries.
+
+If your upstream supports standard `tool_choice`, the most defensive local-model configuration is:
+
+```yaml
+learning:
+  max_tokens: 2048
+  extra_body:
+    tool_choice: none
+    chat_template_kwargs:
+      enable_thinking: false
+```
+
+`tool_choice: none` addresses the `finish_reason='tool_calls'` case; `enable_thinking: false` addresses reasoning-token consumption. Infinitum v0.2.2 remains resilient if either setting is ignored by the upstream.
 
 ## What changed in v0.2.1
 
@@ -34,6 +53,7 @@ It also adds `learning.extra_body` so vendor-specific learning controls can be s
 ```yaml
 learning:
   extra_body:
+    tool_choice: none
     chat_template_kwargs:
       enable_thinking: false
 ```
@@ -433,6 +453,7 @@ For vLLM/Qwen deployments that support `chat_template_kwargs`, a useful setup is
 ```yaml
 learning:
   extra_body:
+    tool_choice: none
     chat_template_kwargs:
       enable_thinking: false
 ```
