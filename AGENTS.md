@@ -101,6 +101,8 @@ Topic summaries are incremental: dirty topic deltas are coalesced, then an exist
 
 An empty final response from a reasoning/local model must not create a retry storm. Topic summaries should degrade to a bounded deterministic active-memory representation; detailed memories remain authoritative. Vendor-specific background request knobs belong under `learning.extra_body`, never in foreground proxy requests.
 
+Background learning may optionally defer job start while foreground proxy requests are in flight via `learning.skip_when_upstream_busy`; deferred work stays in the durable job queue (deferred, not dropped) and consumes no attempt count. The active-request counter lives in `runtime.py` and is instrumented only in `routes/openai.py` around proxied upstream calls; the learner's own upstream calls bypass it by design, so the worker cannot starve itself.
+
 ## Code map
 
 Foreground path:

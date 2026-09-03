@@ -510,6 +510,26 @@ learning:
 `extra_body` is merged only into background learning Chat Completions. Infinitum's
 core `model`, `messages`, `stream: false`, and configured token cap remain authoritative.
 
+### Deferring learning while the upstream is busy
+
+When the extraction model is the same server as the answering model, background
+learning competes with foreground requests for the same GPU/CPU. With
+`skip_when_upstream_busy` enabled, the learning worker skips claiming jobs
+while a proxy request is in flight:
+
+```yaml
+learning:
+  enabled: true
+  skip_when_upstream_busy: true
+```
+
+Deferred turns are never lost: learning work lives in the durable job queue, so
+a skipped job simply stays pending and runs once the proxy is idle. The boundary
+is honest. Only job *start* is deferred: a job already running continues to
+completion within `learning.timeout_seconds`, and a hung streaming request keeps
+learning deferred while it counts as active. `GET /health` reports the live
+`active_requests` count so you can see why the worker is idle.
+
 ### Incremental topic-summary controls
 
 V0.1.2+ no longer regenerates a topic summary from up to 100 topic memories after every learned interaction. Changed memory IDs are persisted as dirty topic state, and one debounced background job updates the existing summary.

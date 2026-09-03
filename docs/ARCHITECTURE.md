@@ -218,3 +218,13 @@ For topic summaries, Infinitum records non-content diagnostics, then creates a b
 Because failed summary jobs leave `topic_updates` untouched, startup recovery scans dirty topics and recreates a pending summary job when no pending/running owner exists and the learning model can be recovered from configuration or prior job payload. This lets an upgrade recover topics that previously exhausted their retry count.
 
 `learning.extra_body` allows deployment-specific background controls such as `tool_choice: none` and disabling thinking on a compatible vLLM/Qwen endpoint. These extensions apply only to learning calls; Infinitum still fixes the learning model/messages, forces non-streaming mode, and enforces configured token caps.
+
+## Deferring learning under upstream contention
+
+When the learning model shares an upstream with the answering model, background extraction can steal throughput from user-facing requests. `learning.skip_when_upstream_busy` (default false) adds an optional best-effort gate between the two.
+
+The mechanism is a small in-process counter (`ActiveRequestCounter` in `runtime.py`) incremented only around foreground upstream calls in the Chat Completions proxy route; retrieval and compilation time are never counted. The non-streaming path increments around the request and completion-recording block, and the streaming path hands the byte iterator to a counted wrapper so the decrement runs on normal exhaustion, client disconnect, and error paths alike. The current value is exposed as `active_requests` on `/health`.
+
+When the flag is on, `LearningWorker` checks the counter before `claim_job()`. If any foreground request is in flight, the worker claims nothing, sleeps for one `poll_interval_seconds` in a stop-interruptible way, and tries again on the next poll. Deferred jobs are skipped, never failed: no attempt count is consumed and the durable queue keeps the work until the proxy goes idle.
+
+This is single-node best-effort scheduling, not a coordination protocol. A request that starts just after the check overlaps one poll, which is harmless. The decrement saturates at zero, so even a leaked increment cannot permanently starve learning. Already-running jobs are not preempted, and the learner's own upstream calls bypass the counter by design, so a busy worker can never deadlock itself.
