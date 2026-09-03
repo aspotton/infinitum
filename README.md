@@ -1,6 +1,16 @@
+<div align="center">
+
 # Infinitum
 
 **Persistent memory and context for AI.**
+
+[![status](https://img.shields.io/badge/status-work--in--progress-orange)](#)-[![works for me](https://img.shields.io/badge/%20works%20for%20me-brightgreen)](#)-[![RFC](https://img.shields.io/badge/RFCs-welcome-blue)](https://github.com/aspotton/infinitum/issues)
+
+> 🚧 **Work in progress.** Infinitum is built and works for me, but it is not a
+> polished production product yet. Design critiques, use cases, and pull
+> requests are welcome — open an issue and tell me what this should become.
+
+</div>
 
 Infinitum is a standalone Python 3 memory and context runtime for AI agents and LLM applications. It exposes an OpenAI-compatible API, maintains durable event-sourced memory, learns and consolidates useful long-term context, and injects only the most relevant memory into each request.
 
