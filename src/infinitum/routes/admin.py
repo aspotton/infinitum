@@ -21,6 +21,7 @@ async def health(request: Request):
         "learning_enabled": runtime.config.learning.enabled,
         "embeddings_enabled": runtime.config.embeddings.enabled,
         "fts_enabled": runtime.db.fts_enabled,
+        "active_requests": runtime.active_requests.value,
     }
 
 
