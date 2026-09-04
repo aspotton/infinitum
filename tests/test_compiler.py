@@ -146,7 +146,10 @@ def test_inject_suffix_empty_messages_does_not_raise():
     injected = compiler.inject([], _compiled())
 
     assert injected == [
-        {"role": config.context.memory_message_role, "content": "<infinitum_memory>x</infinitum_memory>"}
+        {
+            "role": config.context.memory_message_role,
+            "content": "<infinitum_memory>x</infinitum_memory>",
+        }
     ]
 
 
