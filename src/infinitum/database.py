@@ -528,6 +528,23 @@ class Database:
             tuple([now, *memory_ids]),
         )
 
+    async def memory_state_watermark(self) -> str:
+        """Single invalidation watermark for session-pinned compiled blocks.
+
+        Deliberately has NO status filter: archive/supersede bump updated_at on
+        every row, so archiving a non-newest memory still moves the watermark
+        instead of pinning a block that contains an archived memory forever.
+        All stored ISO strings share the +00:00 offset, so the lexicographic MAX
+        is also the chronological one. Returns "" when both tables are empty.
+        """
+        row = await self.fetchone(
+            "SELECT MAX(u) AS w FROM ("
+            "SELECT updated_at AS u FROM memories "
+            "UNION ALL SELECT updated_at AS u FROM topics"
+            ") AS w"
+        )
+        return row["w"] if row and row["w"] is not None else ""
+
     async def fts_memory_ids(self, query: str, limit: int = 100) -> list[str]:
         if not self.fts_enabled or not query.strip():
             return []

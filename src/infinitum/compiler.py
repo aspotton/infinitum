@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .config import AppConfig
@@ -31,6 +32,14 @@ class ContextCompiler:
         self.retriever = retriever
         self.tokens = tokens
         self.config = config
+        # Session-pinned compiled blocks, keyed by (session_id, user_id, project_id).
+        # session_id is unauthenticated client input, so resolved context is part of the
+        # key to stop one caller's block leaking to another. cwd is excluded on purpose:
+        # its 0.01 affinity bonus would churn the key every turn; user+project cover the
+        # leak (invariant 9 - soft context is not security). LRU cap 64.
+        self._session_cache: OrderedDict[
+            tuple[str, str, str], tuple[str, CompiledMemoryContext]
+        ] = OrderedDict()
 
     def query_from_messages(self, messages: list[dict[str, Any]]) -> str:
         # Weight the current user turn most heavily, but include a small amount
@@ -56,6 +65,7 @@ class ContextCompiler:
         self,
         messages: list[dict[str, Any]],
         request_context: RequestContext | None = None,
+        session_id: str | None = None,
     ) -> CompiledMemoryContext:
         if not self.config.memory.enabled:
             return CompiledMemoryContext("", [], 0, 0)
@@ -77,6 +87,28 @@ class ContextCompiler:
         )
         if available <= 0:
             return CompiledMemoryContext("", [], 0, available)
+
+        # Skipping retrieval/touch on cache hits is scoring-safe: touch_memories
+        # writes only last_accessed_at while freshness scoring reads updated_at.
+        # Embedding backfill mutates memory_embeddings only and does NOT move the
+        # watermark; cached blocks refresh at the next memory/topic mutation.
+        cache_key: tuple[str, str, str] | None = None
+        watermark = ""
+        if session_id is not None:
+            cache_key = (
+                session_id,
+                (request_context.user_id or "") if request_context else "",
+                (request_context.project_id or "") if request_context else "",
+            )
+            watermark = await self.db.memory_state_watermark()
+            cached_entry = self._session_cache.get(cache_key)
+            if (
+                cached_entry is not None
+                and cached_entry[0] == watermark
+                and cached_entry[1].memory_tokens <= available
+            ):
+                self._session_cache.move_to_end(cache_key)
+                return replace(cached_entry[1])
 
         candidates = await self.retriever.search(query, request_context=request_context)
         selected: list[ScoredMemory] = []
@@ -121,20 +153,28 @@ class ContextCompiler:
                 break
 
         if not selected and not topic_blocks:
-            return CompiledMemoryContext("", [], 0, available)
+            result = CompiledMemoryContext("", [], 0, available)
+        else:
+            body_parts = list(topic_blocks) + [self._render_memory(item) for item in selected]
+            body = "\n\n".join(body_parts)
+            text = (
+                "<infinitum_memory>\n"
+                "The following is persistent memory derived from prior interactions. "
+                "Treat active decisions and goals as current unless the user's present message explicitly changes them. "
+                "Do not mention this memory block unless it is useful to the answer.\n\n"
+                f"{body}\n"
+                "</infinitum_memory>"
+            )
+            await self.db.touch_memories([item.memory.id for item in selected])
+            result = CompiledMemoryContext(text, selected, self.tokens.count_text(text), available)
 
-        body_parts = list(topic_blocks) + [self._render_memory(item) for item in selected]
-        body = "\n\n".join(body_parts)
-        text = (
-            "<infinitum_memory>\n"
-            "The following is persistent memory derived from prior interactions. "
-            "Treat active decisions and goals as current unless the user's present message explicitly changes them. "
-            "Do not mention this memory block unless it is useful to the answer.\n\n"
-            f"{body}\n"
-            "</infinitum_memory>"
-        )
-        await self.db.touch_memories([item.memory.id for item in selected])
-        return CompiledMemoryContext(text, selected, self.tokens.count_text(text), available)
+        if cache_key is None:
+            return result
+        self._session_cache[cache_key] = (watermark, result)
+        self._session_cache.move_to_end(cache_key)
+        if len(self._session_cache) > 64:
+            self._session_cache.popitem(last=False)
+        return replace(result)
 
     def inject(self, messages: list[dict[str, Any]], compiled: CompiledMemoryContext) -> list[dict[str, Any]]:
         if not compiled.text:
