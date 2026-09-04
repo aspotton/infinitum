@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -171,7 +172,7 @@ async def chat_completions(request: Request) -> Response:
     ours_injected: set[str] = set()
     if memory_enabled:
         compiled = await runtime.compiler.compile(
-            original_messages, request_context=request_context
+            original_messages, request_context=request_context, session_id=session_id
         )
         # Inject our tool defs + hint BEFORE inject(): inject copies the message
         # list and embeds compiled.text at call time, so mutating either after
@@ -185,10 +186,14 @@ async def chat_completions(request: Request) -> Response:
                     + memory_tools.build_tool_defs(ours_injected)
                 )
                 if compiled.memories:
-                    compiled.text += (
-                        "\n\nDeeper detail is available via the "
+                    # Copy-on-write: compile() may hand back a cached block, so
+                    # never append the hint into the object the cache still holds.
+                    compiled = replace(
+                        compiled,
+                        text=compiled.text
+                        + "\n\nDeeper detail is available via the "
                         + " and ".join(sorted(ours_injected))
-                        + " tools using the memory ids above."
+                        + " tools using the memory ids above.",
                     )
         body["messages"] = runtime.compiler.inject(original_messages, compiled)
     else:
