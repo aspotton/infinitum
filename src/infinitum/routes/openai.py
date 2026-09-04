@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -242,23 +243,120 @@ async def chat_completions(request: Request) -> Response:
                 request_context=request_context,
             )
 
-        try:
-            iterator = await runtime.upstream.stream_bytes(
-                "chat/completions",
-                body,
-                request.headers,
-                completed,
-                request_context=request_context,
-            )
-        except httpx.HTTPStatusError as exc:
-            response = exc.response
-            return Response(
-                content=response.content,
-                status_code=response.status_code,
-                media_type=response.headers.get("content-type", "application/json"),
-                headers=debug_headers,
-            )
-        return StreamingResponse(iterator, media_type="text/event-stream", headers=debug_headers)
+        # stream_bytes binds on_complete at call time but the classifier only
+        # decides while consuming, so every iteration passes None and the
+        # terminal iteration's recording happens in the returned generator's
+        # finally: suppressed iterations never reach a generator, so they never
+        # record. The loop runs inside the handler; only the terminal
+        # iteration's bytes ever reach the client.
+        tool_rounds = 0
+        final_iterator: AsyncIterator[bytes] | None = None
+        for _ in range(memory_tools.MAX_ITERATIONS):
+            try:
+                iterator = await runtime.upstream.stream_bytes(
+                    "chat/completions",
+                    body,
+                    request.headers,
+                    None,
+                    request_context=request_context,
+                )
+            except httpx.HTTPStatusError as exc:
+                response = exc.response
+                return Response(
+                    content=response.content,
+                    status_code=response.status_code,
+                    media_type=response.headers.get("content-type", "application/json"),
+                    headers=debug_headers,
+                )
+
+            classifier = memory_tools.StreamClassifier(ours_injected)
+            accum = bytearray()
+            exhausted = True
+            try:
+                async for chunk in iterator:
+                    accum.extend(chunk)
+                    classifier.feed(chunk)
+                    if classifier.decide() == "passthrough":
+                        exhausted = False
+                        break
+            except httpx.RequestError as exc:
+                raise HTTPException(502, f"upstream connection failed: {exc}") from exc
+
+            decision = "passthrough" if not exhausted else classifier.finish()
+            if decision in ("passthrough", "replay"):
+                live: AsyncIterator[bytes] | None = iterator
+                if decision == "replay":
+                    # Drain the rest here (its finally closes the upstream
+                    # response); the full bytes replay from accum below.
+                    try:
+                        async for chunk in iterator:
+                            accum.extend(chunk)
+                    except httpx.RequestError as exc:
+                        raise HTTPException(
+                            502, f"upstream connection failed: {exc}"
+                        ) from exc
+                    live = None
+
+                async def stream_out(
+                    accum=accum, live=live
+                ) -> AsyncIterator[bytes]:  # default-args pin this iteration's state
+                    try:
+                        if accum:
+                            yield bytes(accum)
+                        if live is not None:
+                            async for chunk in live:
+                                accum.extend(chunk)
+                                yield chunk
+                    finally:
+                        await completed(bytes(accum))
+
+                final_iterator = stream_out()
+                break
+
+            tool_rounds += 1
+            calls = memory_tools.reassemble_stream_tool_calls(classifier.calls)
+            assistant_content, _ = extract_stream_assistant(classifier.collected_bytes())
+            assistant_message: dict[str, Any] = {"role": "assistant"}
+            if assistant_content:
+                assistant_message["content"] = assistant_content
+            assistant_message["tool_calls"] = calls
+            body["messages"] = body["messages"] + [assistant_message]
+            for call in calls:
+                arguments = call["function"].get("arguments", "")
+                result = await memory_tools.execute(
+                    call["function"]["name"], arguments, runtime, request_context
+                )
+                await runtime.db.add_event(
+                    Event(
+                        session_id=session_id,
+                        user_id=request_context.user_id,
+                        project_id=request_context.project_id,
+                        cwd=request_context.cwd,
+                        request_id=request_id,
+                        event_type="memory.tool_call",
+                        role="tool",
+                        content=arguments,
+                        metadata={
+                            "name": call["function"]["name"],
+                            "result_chars": len(result),
+                            "tool_call_id": call.get("id"),
+                            "assistant_message": assistant_message,
+                        },
+                    )
+                )
+                body["messages"] = body["messages"] + [
+                    {"role": "tool", "tool_call_id": call.get("id"), "content": result}
+                ]
+
+        if debug and (ours_injected or tool_rounds):
+            debug_headers["x-infinitum-memory-tool-calls"] = str(tool_rounds)
+        if final_iterator is None:
+            # Cap exhausted with every round suppressed: dead branch (clients
+            # never invoke our tools directly); emit an empty SSE stream.
+            final_iterator = iter(())
+        return StreamingResponse(
+            final_iterator, media_type="text/event-stream", headers=debug_headers
+        )
 
     tool_rounds = 0
     for _ in range(memory_tools.MAX_ITERATIONS):

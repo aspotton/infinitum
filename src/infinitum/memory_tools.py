@@ -8,7 +8,7 @@ the server-side tool loop can feed them back to the model.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any, Protocol
 
 TOOL_NAMES = ("infinitum_memory_search", "infinitum_memory_get")
@@ -58,6 +58,116 @@ TOOL_DEFS: dict[str, dict[str, Any]] = {
         },
     },
 }
+
+
+class StreamClassifier:
+    """Byte-boundary-safe SSE classifier for the tool-loop holdback.
+
+    Network chunks may split a `data:` line at any byte, so only complete
+    (newline-terminated) data lines are JSON-parsed; the partial tail stays in
+    the buffer. Content or a foreign function name decides "passthrough" the
+    moment it is seen; at end of stream a content-free all-ours tool-call stream
+    is "suppress" (run the loop), anything else is "replay" (terminal). Every
+    fed byte is accumulated for verbatim replay.
+    """
+
+    def __init__(self, ours: Iterable[str]) -> None:
+        self._ours = set(ours)
+        self._line_buf = bytearray()
+        self._held: list[bytes] = []
+        self._collected = bytearray()
+        self._passthrough = False
+        self._content_seen = False
+        self._foreign_seen = False
+        self._chunks: list[dict[str, Any]] = []
+        self._finish_reason: str | None = None
+
+    def feed(self, chunk: bytes) -> list[bytes]:
+        """Consume one network chunk; return raw bytes safe to forward now.
+
+        Returns nothing while the decision is undecided; on the feed that turns
+        the decision into "passthrough", returns every held chunk so far.
+        """
+        self._collected.extend(chunk)
+        if self._passthrough:
+            return [chunk]
+        self._held.append(chunk)
+        self._line_buf.extend(chunk)
+        while (newline := self._line_buf.find(b"\n")) >= 0:
+            line = bytes(self._line_buf[:newline])
+            del self._line_buf[: newline + 1]
+            self._scan_line(line)
+        if self._content_seen or self._foreign_seen:
+            self._passthrough = True
+            flushed, self._held = list(self._held), []
+            return flushed
+        return []
+
+    def decide(self) -> str:
+        """Mid-stream decision after a feed: "passthrough" or "undecided"."""
+        return "passthrough" if self._passthrough else "undecided"
+
+    def finish(self) -> str:
+        """Resolve the decision at end of stream: suppress (loop) or replay."""
+        if self._passthrough or self._content_seen or self._foreign_seen:
+            return "passthrough"
+        if classify_tool_calls(reassemble_stream_tool_calls(self._chunks), self._ours):
+            return "suppress"
+        return "replay"
+
+    def _scan_line(self, line: bytes) -> None:
+        text = line.rstrip(b"\r").decode("utf-8", errors="replace").strip()
+        if not text.startswith("data:"):
+            return
+        payload = text[5:].strip()
+        if not payload or payload == "[DONE]":
+            return
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return
+        choices = data.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            return
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            self._content_seen = True
+        for call in delta.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or {}
+            name = function.get("name")
+            flat: dict[str, Any] = {
+                "id": call.get("id"),
+                "name": name,
+                "arguments": function.get("arguments"),
+            }
+            if call.get("index") is not None:
+                flat["index"] = call["index"]
+            self._chunks.append(flat)
+            if isinstance(name, str) and name and name not in self._ours:
+                self._foreign_seen = True
+        reason = choice.get("finish_reason")
+        if isinstance(reason, str) and reason:
+            self._finish_reason = reason
+
+    @property
+    def content_seen(self) -> bool:
+        return self._content_seen
+
+    @property
+    def calls(self) -> list[dict[str, Any]]:
+        """Flattened per-chunk tool_call deltas for reassemble_stream_tool_calls."""
+        return self._chunks
+
+    @property
+    def finish_reason(self) -> str | None:
+        return self._finish_reason
+
+    def collected_bytes(self) -> bytes:
+        return bytes(self._collected)
 
 
 class ToolRuntime(Protocol):

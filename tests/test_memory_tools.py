@@ -622,3 +622,201 @@ def test_qa_r_memory_disabled_injects_no_tools():
             assert response.status_code == 200
             assert upstream.calls == 1
             assert "tools" not in upstream.bodies[0]
+
+
+# --- Batch 4: streaming server-side tool loop (QA E, F, K, L, M, S) -----------
+#
+# SSE idiom (per tests/test_upstream_none_callback.py): MockTransport handler
+# returning httpx.Response(200, content=async-iterator) so bytes arrive as
+# network chunks and errors can be raised mid-consumption.
+
+
+def _delta_event(delta: dict, finish_reason: str | None = None) -> bytes:
+    return (
+        b"data: "
+        + json.dumps(
+            {"choices": [{"delta": delta, "finish_reason": finish_reason}]}
+        ).encode()
+        + b"\n\n"
+    )
+
+
+def _content_chunk(text: str) -> bytes:
+    return _delta_event({"content": text})
+
+
+def _tool_chunk(index: int, call_id: str | None, name: str | None, arguments: str) -> bytes:
+    return _delta_event(
+        {
+            "tool_calls": [
+                {
+                    "index": index,
+                    "id": call_id,
+                    "function": {"name": name, "arguments": arguments},
+                }
+            ]
+        }
+    )
+
+
+def _finish_chunk(reason: str) -> bytes:
+    return _delta_event({}, finish_reason=reason)
+
+
+_DONE = b"data: [DONE]\n\n"
+
+
+class _SseUpstream:
+    """Scripted SSE upstream; each reply is (network chunks, mid-stream error)."""
+
+    def __init__(
+        self, runtime, replies: list[tuple[list[bytes], Exception | None]]
+    ) -> None:
+        self.replies = list(replies)
+        self.bodies: list[dict] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            self.bodies.append(json.loads(request.content))
+            chunks, error = self.replies.pop(0)
+
+            async def body():
+                for chunk in chunks:
+                    yield chunk
+                if error is not None:
+                    raise error
+
+            return httpx.Response(200, content=body())
+
+        runtime.upstream.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    @property
+    def calls(self) -> int:
+        return len(self.bodies)
+
+
+def test_qa_e_stream_tool_round_suppressed_and_recorded_once():
+    round1 = [
+        _tool_chunk(0, "call_e", "infinitum_memory_search", '{"query": "database"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    round2 = [_content_chunk("PostgreSQL 17."), _finish_chunk("stop"), _DONE]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(round1, None), (round2, None)])
+            response = _chat(client, "qa-e", extra={"stream": True})
+            assert response.status_code == 200
+            body_text = response.content.decode()
+            # Client sees ONLY round-2 bytes: no tool-call deltas, ends [DONE].
+            assert body_text == b"".join(round2).decode()
+            assert "tool_calls" not in body_text
+            assert body_text.rstrip().endswith("data: [DONE]")
+            assert upstream.calls == 2
+            second = upstream.bodies[1]
+            assistant = [m for m in second["messages"] if m.get("tool_calls")]
+            assert len(assistant) == 1
+            assert assistant[0]["role"] == "assistant"
+            assert assistant[0]["tool_calls"][0]["id"] == "call_e"
+            events = _events(client, "qa-e")
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1
+            assert assistants[0]["content"] == "PostgreSQL 17."
+            # stream_complete True proves the terminal recording saw the
+            # complete bytes INCLUDING the [DONE] sentinel.
+            assert assistants[0]["metadata"]["stream_complete"] is True
+            tool_events = [e for e in events if e["event_type"] == "memory.tool_call"]
+            assert len(tool_events) == 1
+            meta = tool_events[0]["metadata"]
+            assert meta["name"] == "infinitum_memory_search"
+            assert meta["tool_call_id"] == "call_e"
+            assert meta["assistant_message"]["role"] == "assistant"
+
+
+def test_qa_f_content_first_stream_passthrough_single_call():
+    stream = [_content_chunk("he"), _content_chunk("llo"), _finish_chunk("stop"), _DONE]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(stream, None)])
+            response = _chat(client, "qa-f", extra={"stream": True})
+            assert response.status_code == 200
+            assert response.content == b"".join(stream)
+            assert upstream.calls == 1
+            events = _events(client, "qa-f")
+            assert sum(e["event_type"] == "message.assistant" for e in events) == 1
+            assert not any(e["event_type"] == "memory.tool_call" for e in events)
+
+
+def test_qa_k_midstream_failure_yields_502_unrecorded():
+    partial = [_tool_chunk(0, "call_k", "infinitum_memory_search", '{"query": "db"}')]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(
+                app.state.runtime, [(partial, httpx.ConnectError("boom"))]
+            )
+            response = _chat(client, "qa-k", extra={"stream": True})
+            assert response.status_code == 502
+            assert upstream.calls == 1
+            events = _events(client, "qa-k")
+            assert not any(e["event_type"] == "message.assistant" for e in events)
+
+
+def test_qa_l_data_line_split_across_chunks_still_passthrough():
+    # The data: line is split mid-JSON; the content delta straddles the split.
+    chunk1 = b'data: {"choices":[{"delta":{"content":"hel'
+    chunk2 = b'lo"}}],"finish_reason":null}\n\ndata: [DONE]\n\n'
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [([chunk1, chunk2], None)])
+            response = _chat(client, "qa-l", extra={"stream": True})
+            assert response.status_code == 200
+            assert response.content == chunk1 + chunk2
+            assert upstream.calls == 1
+            events = _events(client, "qa-l")
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1
+            assert assistants[0]["content"] == "hello"
+            assert assistants[0]["metadata"]["stream_complete"] is True
+
+
+def test_qa_m_client_tool_stream_passes_through_intact():
+    client_tool = {
+        "type": "function",
+        "function": {"name": "get_weather", "parameters": {}},
+    }
+    stream = [
+        _tool_chunk(0, "call_w", "get_weather", '{"city": "Oslo"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(stream, None)])
+            response = _chat(client, "qa-m", extra={"stream": True, "tools": [client_tool]})
+            assert response.status_code == 200
+            assert response.content == b"".join(stream)
+            assert '"get_weather"' in response.content.decode()
+            assert upstream.calls == 1
+
+
+def test_qa_s_query_from_messages_truncates_tool_blobs():
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app):
+            query = app.state.runtime.compiler.query_from_messages(
+                [
+                    {"role": "user", "content": "which database"},
+                    {"role": "tool", "tool_call_id": "c1", "content": "x" * 8192},
+                ]
+            )
+            assert "x" * 500 in query
+            assert "x" * 501 not in query
