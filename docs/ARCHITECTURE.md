@@ -18,6 +18,26 @@ flowchart TD
     K --> L[Queue durable learning job]
 ```
 
+## Server-side memory tool loop
+
+With `memory.tools_enabled` and an injected memory block, the request path may run a transparent tool loop before responding:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant I as Infinitum
+    participant U as Upstream
+    C->>I: chat/completions
+    I->>U: augmented request (memory block + tool defs)
+    U-->>I: tool_calls (infinitum_memory_*)
+    Note over I: suppressed from client, audited as memory.tool_call events
+    I->>U: follow-up request with tool results
+    U-->>I: final answer
+    I-->>C: final answer only
+```
+
+The loop runs on the foreground path while background learning stays on its usual path afterwards: learning is enqueued exactly once per HTTP request, at final completion. Intermediate rounds never reach the client or the assistant event stream. Each suppressed call is persisted as a `memory.tool_call` event whose metadata carries the reconstructed assistant message (including its `tool_calls`) as the audit trail. The loop caps at 4 rounds; any tool call naming a function other than the two Infinitum tools is terminal and forwarded verbatim.
+
 ## Storage model
 
 ```mermaid

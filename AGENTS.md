@@ -67,6 +67,7 @@ Use these canonical names in new code/docs:
 - `X-Infinitum-Learning`
 - `X-Infinitum-Debug`
 - `<infinitum_memory>...</infinitum_memory>`
+- `infinitum_memory_search` / `infinitum_memory_get` (read-only drill-down tool names, not headers; gated by `memory.tools_enabled`)
 
 Legacy `X-Context-*` headers remain accepted but should be lower priority than canonical Infinitum headers. Runtime-only headers must be stripped before normal upstream forwarding. Headroom forwarding, when explicitly enabled, should be generated from the already-resolved request context rather than blindly forwarding inbound identity-like headers.
 

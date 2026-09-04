@@ -41,6 +41,10 @@ class ContextCompiler:
             if role not in {"user", "assistant", "tool"}:
                 continue
             text = first_text_content(msg.get("content"))
+            if role == "tool":
+                # Tool-loop echoes would otherwise dominate lexical retrieval
+                # for all later turns; keep only a bounded probe.
+                text = text[:500]
             if text:
                 recent.append(text)
             if len(recent) >= 4:
