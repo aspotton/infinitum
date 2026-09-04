@@ -99,9 +99,10 @@ class UpstreamClient:
         path: str,
         body: dict[str, Any],
         incoming_headers: Mapping[str, str],
-        on_complete: Callable[[bytes], Awaitable[None]],
+        on_complete: Callable[[bytes], Awaitable[None]] | None,
         request_context: RequestContext | None = None,
     ) -> AsyncIterator[bytes]:
+        """Stream the upstream response; ``on_complete=None`` skips the completion callback."""
         request = self.client.build_request(
             "POST",
             self.url(path),
@@ -131,7 +132,8 @@ class UpstreamClient:
                     yield chunk
             finally:
                 await response.aclose()
-                await on_complete(bytes(captured))
+                if on_complete is not None:
+                    await on_complete(bytes(captured))
 
         return iterator()
 
