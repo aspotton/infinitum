@@ -186,7 +186,7 @@ memory:
   tools_enabled: true  # default: false
 ```
 
-When enabled, and only when a memory block was actually injected and the client has not defined a tool of the same name, Infinitum appends two function tools to the client's tool list:
+When enabled, Infinitum appends two function tools to the client's tool list on every memory-enabled request, as long as the client has not defined a tool of the same name:
 
 - `infinitum_memory_search(query, limit)` — ranked search over active memories (default limit 10, max 50);
 - `infinitum_memory_get(memory_id)` — full current content plus provenance source event ids for one memory.

@@ -175,13 +175,9 @@ async def chat_completions(request: Request) -> Response:
         )
         # Inject our tool defs + hint BEFORE inject(): inject copies the message
         # list and embeds compiled.text at call time, so mutating either after
-        # this point would be dead.
-        if (
-            memory_enabled
-            and runtime.config.memory.enabled
-            and runtime.config.memory.tools_enabled
-            and compiled.text
-        ):
+        # this point would be dead. Tool defs are exposed statically (flag-only
+        # gate) so the tools region never flaps between turns and stays cacheable.
+        if runtime.config.memory.enabled and runtime.config.memory.tools_enabled:
             ours_injected = set(memory_tools.injected_tool_names(body.get("tools")))
             if ours_injected:
                 body["tools"] = (
