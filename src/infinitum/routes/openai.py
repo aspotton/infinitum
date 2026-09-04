@@ -7,6 +7,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
+from .. import memory_tools
 from ..models import Event, RequestContext, new_id
 from ..runtime import Runtime
 from ..text import first_text_content
@@ -166,10 +167,32 @@ async def chat_completions(request: Request) -> Response:
         "on", "true", "1"
     }
 
+    ours_injected: set[str] = set()
     if memory_enabled:
         compiled = await runtime.compiler.compile(
             original_messages, request_context=request_context
         )
+        # Inject our tool defs + hint BEFORE inject(): inject copies the message
+        # list and embeds compiled.text at call time, so mutating either after
+        # this point would be dead.
+        if (
+            memory_enabled
+            and runtime.config.memory.enabled
+            and runtime.config.memory.tools_enabled
+            and compiled.text
+        ):
+            ours_injected = set(memory_tools.injected_tool_names(body.get("tools")))
+            if ours_injected:
+                body["tools"] = (
+                    list(body.get("tools") or [])
+                    + memory_tools.build_tool_defs(ours_injected)
+                )
+                if compiled.memories:
+                    compiled.text += (
+                        "\n\nDeeper detail is available via the "
+                        + " and ".join(sorted(ours_injected))
+                        + " tools using the memory ids above."
+                    )
         body["messages"] = runtime.compiler.inject(original_messages, compiled)
     else:
         compiled = None
@@ -237,35 +260,88 @@ async def chat_completions(request: Request) -> Response:
             )
         return StreamingResponse(iterator, media_type="text/event-stream", headers=debug_headers)
 
-    try:
-        upstream = await runtime.upstream.request(
-            "POST",
-            "chat/completions",
-            incoming_headers=request.headers,
-            json_body=body,
-            request_context=request_context,
-        )
-    except httpx.RequestError as exc:
-        raise HTTPException(502, f"upstream connection failed: {exc}") from exc
+    tool_rounds = 0
+    for _ in range(memory_tools.MAX_ITERATIONS):
+        try:
+            upstream = await runtime.upstream.request(
+                "POST",
+                "chat/completions",
+                incoming_headers=request.headers,
+                json_body=body,
+                request_context=request_context,
+            )
+        except httpx.RequestError as exc:
+            raise HTTPException(502, f"upstream connection failed: {exc}") from exc
 
-    if upstream.status_code < 400:
+        if upstream.status_code >= 400:
+            break  # terminal: forward verbatim, no recording (mirrors the old guard)
+
         try:
             parsed = upstream.json()
-            assistant_text, assistant_meta = extract_nonstream_assistant(parsed)
         except Exception:
-            assistant_text, assistant_meta = "", {}
-        await _record_completion(
-            runtime,
-            request_id=request_id,
-            session_id=session_id,
-            user_event_id=user_event.id,
-            user_text=user_text,
-            assistant_text=assistant_text,
-            assistant_metadata=assistant_meta,
-            model=model,
-            learning_enabled=learning_enabled,
-            request_context=request_context,
-        )
+            parsed = None  # terminal; records ("", {}) like the old fallback
+
+        calls = [
+            tool_call
+            for choice in ((parsed or {}).get("choices") or [])[:1]
+            for tool_call in (choice.get("message") or {}).get("tool_calls") or []
+        ]
+        if parsed is None or not memory_tools.classify_tool_calls(calls, ours_injected):
+            try:
+                assistant_text, assistant_meta = extract_nonstream_assistant(parsed)
+            except Exception:
+                assistant_text, assistant_meta = "", {}
+            await _record_completion(
+                runtime,
+                request_id=request_id,
+                session_id=session_id,
+                user_event_id=user_event.id,
+                user_text=user_text,
+                assistant_text=assistant_text,
+                assistant_metadata=assistant_meta,
+                model=model,
+                learning_enabled=learning_enabled,
+                request_context=request_context,
+            )
+            break
+
+        tool_rounds += 1
+        assistant_message = (parsed.get("choices") or [{}])[0].get("message") or {
+            "role": "assistant",
+            "tool_calls": calls,
+        }
+        body["messages"] = body["messages"] + [assistant_message]
+        for call in calls:
+            arguments = call["function"].get("arguments", "")
+            result = await memory_tools.execute(
+                call["function"]["name"], arguments, runtime, request_context
+            )
+            await runtime.db.add_event(
+                Event(
+                    session_id=session_id,
+                    user_id=request_context.user_id,
+                    project_id=request_context.project_id,
+                    cwd=request_context.cwd,
+                    request_id=request_id,
+                    event_type="memory.tool_call",
+                    role="tool",
+                    content=arguments,
+                    metadata={
+                        "name": call["function"]["name"],
+                        "result_chars": len(result),
+                        "tool_call_id": call.get("id"),
+                        "assistant_message": assistant_message,
+                    },
+                )
+            )
+            body["messages"] = body["messages"] + [
+                {"role": "tool", "tool_call_id": call.get("id"), "content": result}
+            ]
+    else:
+        pass  # cap exhausted: forward the last tool-call response verbatim, unrecorded
+
+    if debug and (ours_injected or tool_rounds):
+        debug_headers["x-infinitum-memory-tool-calls"] = str(tool_rounds)
 
     return Response(
         content=upstream.content,

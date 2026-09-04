@@ -4,7 +4,11 @@ import json
 import tempfile
 from types import SimpleNamespace
 
+import httpx
+from fastapi.testclient import TestClient
+
 from infinitum import memory_tools
+from infinitum.app import create_app
 from infinitum.config import AppConfig
 from infinitum.database import Database
 from infinitum.embeddings import EmbeddingClient
@@ -280,3 +284,341 @@ def test_constants():
     assert memory_tools.MAX_RESULT_CHARS == 8000
     assert memory_tools.MAX_SEARCH_LIMIT == 50
     assert memory_tools.MAX_ITERATIONS == 4
+
+
+# --- Batch 3: non-streaming server-side tool loop (QA A-R) ---------------------
+#
+# Idiom: swap runtime.upstream.client for a MockTransport that scripts canned
+# upstream replies in order and records every forwarded request body.
+
+
+def _completion(text: str) -> dict:
+    return {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "test-model",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
+def _tool_reply(calls: list[tuple[str, str, str]], content: str | None = None) -> dict:
+    return {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "test-model",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        }
+                        for (name, arguments, call_id) in calls
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+    }
+
+
+def _chat_app(
+    tmp: str,
+    *,
+    tools_enabled: bool = True,
+    memory_enabled: bool = True,
+    learning_enabled: bool = False,
+) -> object:
+    cfg = AppConfig()
+    cfg.memory.database_path = f"{tmp}/runtime.db"
+    cfg.learning.enabled = learning_enabled
+    cfg.memory.enabled = memory_enabled
+    cfg.memory.tools_enabled = tools_enabled
+    cfg.upstream.passthrough_authorization = False
+    return create_app(cfg)
+
+
+class _ScriptedUpstream:
+    """Canned-reply upstream; records each forwarded request body."""
+
+    def __init__(self, runtime, replies: list[dict]) -> None:
+        self.replies = list(replies)
+        self.bodies: list[dict] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            self.bodies.append(json.loads(request.content))
+            return httpx.Response(200, json=self.replies.pop(0))
+
+        runtime.upstream.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    @property
+    def calls(self) -> int:
+        return len(self.bodies)
+
+
+def _seed_memory(client: TestClient) -> None:
+    created = client.post(
+        "/memory",
+        json={
+            "memory_type": "decision",
+            "topic": "database",
+            "content": "PostgreSQL 17 is the current database standard.",
+            "importance": 1.0,
+            "confidence": 1.0,
+        },
+    )
+    assert created.status_code == 200
+
+
+def _chat(
+    client: TestClient, session: str, extra: dict | None = None, headers: dict | None = None
+):
+    body: dict = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "What database standard do we use?"}],
+    }
+    if extra:
+        body.update(extra)
+    hdrs = {"X-Infinitum-Session-ID": session}
+    if headers:
+        hdrs.update(headers)
+    return client.post("/v1/chat/completions", json=body, headers=hdrs)
+
+
+def _events(client: TestClient, session: str) -> list[dict]:
+    response = client.get(f"/events?session_id={session}&limit=1000")
+    assert response.status_code == 200
+    return response.json()
+
+
+def test_qa_a_flag_off_request_untouched():
+    reply = _completion("plain answer")
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp, tools_enabled=False)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, [reply])
+            response = _chat(client, "qa-a")
+            assert response.status_code == 200
+            assert response.json() == reply
+            assert upstream.calls == 1
+            assert "tools" not in upstream.bodies[0]
+
+
+def test_qa_b_search_roundtrip_records_final_once():
+    search = ("infinitum_memory_search", '{"query": "database", "limit": 5}', "call_s")
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(
+                app.state.runtime, [_tool_reply([search]), _completion("PostgreSQL 17.")]
+            )
+            response = _chat(client, "qa-b")
+            assert response.json()["choices"][0]["message"]["content"] == "PostgreSQL 17."
+            assert upstream.calls == 2
+            second = upstream.bodies[1]
+            assistant = [m for m in second["messages"] if m.get("tool_calls")]
+            tools = [m for m in second["messages"] if m.get("role") == "tool"]
+            assert len(assistant) == 1
+            assert assistant[0]["role"] == "assistant"
+            assert assistant[0]["tool_calls"][0]["id"] == "call_s"
+            assert len(tools) == 1
+            assert tools[0]["tool_call_id"] == "call_s"
+            results = json.loads(tools[0]["content"])["results"]
+            assert any("PostgreSQL" in r["content"] for r in results)
+            for body in upstream.bodies:
+                contents = [str(m.get("content", "")) for m in body["messages"]]
+                assert any("<infinitum_memory>" in c for c in contents)
+                names = [t["function"]["name"] for t in body["tools"]]
+                assert names == list(memory_tools.TOOL_NAMES)
+            hint = any("Deeper detail" in str(m.get("content", "")) for m in second["messages"])
+            assert hint
+            events = _events(client, "qa-b")
+            assert sum(e["event_type"] == "message.assistant" for e in events) == 1
+            tool_events = [e for e in events if e["event_type"] == "memory.tool_call"]
+            assert len(tool_events) == 1
+            meta = tool_events[0]["metadata"]
+            assert meta["name"] == "infinitum_memory_search"
+            assert meta["tool_call_id"] == "call_s"
+            assert meta["result_chars"] == len(tools[0]["content"])
+            assert meta["assistant_message"]["tool_calls"][0]["id"] == "call_s"
+
+
+def test_qa_c_client_tool_call_forwarded_verbatim():
+    client_tool = {"type": "function", "function": {"name": "get_weather", "parameters": {}}}
+    reply = _tool_reply([("get_weather", '{"city": "Oslo"}', "call_w")])
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, [reply])
+            response = _chat(client, "qa-c", extra={"tools": [client_tool]})
+            assert response.status_code == 200
+            assert response.json() == reply
+            assert upstream.calls == 1
+            names = [t["function"]["name"] for t in upstream.bodies[0]["tools"]]
+            assert names == ["get_weather", *memory_tools.TOOL_NAMES]
+
+
+def test_qa_d_mixed_tool_calls_terminal_not_looped():
+    reply = _tool_reply(
+        [
+            ("infinitum_memory_search", '{"query": "db"}', "call_s"),
+            ("get_weather", "{}", "call_w"),
+        ]
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, [reply])
+            response = _chat(client, "qa-d")
+            assert response.json() == reply
+            assert upstream.calls == 1
+
+
+def test_qa_g_get_unknown_id_error_result_roundtrip():
+    call = ("infinitum_memory_get", '{"memory_id": "mem_missing"}', "call_g")
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(
+                app.state.runtime, [_tool_reply([call]), _completion("not in memory")]
+            )
+            response = _chat(client, "qa-g")
+            assert response.json()["choices"][0]["message"]["content"] == "not in memory"
+            assert upstream.calls == 2
+            tools = [m for m in upstream.bodies[1]["messages"] if m.get("role") == "tool"]
+            assert json.loads(tools[0]["content"]) == {"error": "not found"}
+            events = _events(client, "qa-g")
+            assert sum(e["event_type"] == "memory.tool_call" for e in events) == 1
+
+
+def test_qa_h_four_round_cap_forwards_last_unrecorded():
+    call = ("infinitum_memory_search", '{"query": "db"}', "call_h")
+    replies = [_tool_reply([call]) for _ in range(memory_tools.MAX_ITERATIONS)]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, replies)
+            response = _chat(client, "qa-h")
+            assert response.status_code == 200
+            assert response.json() == replies[-1]
+            assert upstream.calls == memory_tools.MAX_ITERATIONS
+            events = _events(client, "qa-h")
+            assert not any(e["event_type"] == "message.assistant" for e in events)
+            assert sum(e["event_type"] == "memory.tool_call" for e in events) == 4
+
+
+def test_qa_i_client_owned_name_not_shadowed_or_looped():
+    client_search = {
+        "type": "function",
+        "function": {"name": "infinitum_memory_search", "parameters": {}},
+    }
+    reply = _tool_reply([("infinitum_memory_search", '{"query": "x"}', "call_c")])
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, [reply])
+            response = _chat(client, "qa-i", extra={"tools": [client_search]})
+            assert response.json() == reply
+            assert upstream.calls == 1
+            names = [t["function"]["name"] for t in upstream.bodies[0]["tools"]]
+            assert names == ["infinitum_memory_search", "infinitum_memory_get"]
+
+
+def test_qa_j_learning_enqueue_carries_final_text_only():
+    call = ("infinitum_memory_search", '{"query": "db"}', "call_j")
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp, learning_enabled=True)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            enqueued: list[tuple[str, dict]] = []
+
+            async def spy(job_type: str, payload: dict) -> str:
+                enqueued.append((job_type, payload))
+                return "job-spy"
+
+            app.state.runtime.db.enqueue_job = spy
+            _ScriptedUpstream(
+                app.state.runtime,
+                [_tool_reply([call]), _completion("FINAL ANSWER ONLY")],
+            )
+            response = _chat(client, "qa-j")
+            assert response.json()["choices"][0]["message"]["content"] == "FINAL ANSWER ONLY"
+            learn_jobs = [payload for kind, payload in enqueued if kind == "learn_interaction"]
+            assert len(learn_jobs) == 1
+            assert learn_jobs[0]["assistant_text"] == "FINAL ANSWER ONLY"
+
+
+def test_qa_n_memory_off_header_injects_no_tools():
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, [_completion("plain")])
+            response = _chat(client, "qa-n", headers={"X-Infinitum-Memory": "off"})
+            assert response.status_code == 200
+            assert upstream.calls == 1
+            assert "tools" not in upstream.bodies[0]
+
+
+def test_qa_p_malformed_arguments_error_result_no_500():
+    call = ("infinitum_memory_search", '{"query": broken', "call_p")
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(
+                app.state.runtime, [_tool_reply([call]), _completion("recovered")]
+            )
+            response = _chat(client, "qa-p")
+            assert response.status_code == 200
+            assert response.json()["choices"][0]["message"]["content"] == "recovered"
+            assert upstream.calls == 2
+            tools = [m for m in upstream.bodies[1]["messages"] if m.get("role") == "tool"]
+            assert json.loads(tools[0]["content"]) == {"error": "invalid arguments"}
+
+
+def test_qa_q_debug_header_counts_tool_rounds():
+    call = ("infinitum_memory_search", '{"query": "db"}', "call_q")
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(
+                app.state.runtime,
+                [_tool_reply([call]), _tool_reply([("get_weather", "{}", "call_w")])],
+            )
+            response = _chat(client, "qa-q", headers={"X-Infinitum-Debug": "true"})
+            assert response.status_code == 200
+            assert response.headers["x-infinitum-memory-tool-calls"] == "1"
+            assert upstream.calls == 2
+
+
+def test_qa_r_memory_disabled_injects_no_tools():
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp, memory_enabled=False)
+        with TestClient(app) as client:
+            upstream = _ScriptedUpstream(app.state.runtime, [_completion("plain")])
+            response = _chat(client, "qa-r")
+            assert response.status_code == 200
+            assert upstream.calls == 1
+            assert "tools" not in upstream.bodies[0]
