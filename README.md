@@ -177,6 +177,32 @@ The Context Compiler then:
 
 The configured memory budget is a ceiling, not a target.
 
+### Deep retrieval tools
+
+The compiler injects a bounded memory block per request. When the model needs more than that block shows, optional read-only tools let it drill deeper:
+
+```yaml
+memory:
+  tools_enabled: true  # default: false
+```
+
+When enabled, and only when a memory block was actually injected and the client has not defined a tool of the same name, Infinitum appends two function tools to the client's tool list:
+
+- `infinitum_memory_search(query, limit)` — ranked search over active memories (default limit 10, max 50);
+- `infinitum_memory_get(memory_id)` — full current content plus provenance source event ids for one memory.
+
+The tools use the same scorer as injection, so results are ranked identically. They read the same global namespace, and request user/project/CWD context stays a soft affinity, never an access-control filter.
+
+The tool loop runs server-side and is transparent to the client: intermediate tool-call rounds never appear in the client's response or stream, and the client sees only the final answer. Up to 4 tool rounds run per request. Suppressed rounds are recorded as `memory.tool_call` events; only the final assistant message becomes an assistant event. With `X-Infinitum-Debug: true`, the response carries `x-infinitum-memory-tool-calls` with the round count.
+
+Latency edges worth knowing:
+
+- Streaming holds back the first tokens until Infinitum can tell whether the stream is a memory tool call; ordinary content passes through as soon as it appears.
+- Each tool round is a full extra upstream round-trip. A long loop multiplies upstream latency and a client-side timeout can fire mid-loop.
+- If your upstream rejects or mishandles tool definitions, turn the flag off; requests then behave exactly as before.
+
+Parser-hazard note: some upstreams run automatic tool-call parsers and emit tool calls on their own. Any tool call whose function name is not one of the two Infinitum names is never executed or looped. It is treated as terminal and forwarded to the client verbatim.
+
 ## Learning
 
 Learning occurs after the user has already received the model response.

@@ -265,6 +265,8 @@ Automatic prompt injection should remain the first layer, but the model should b
 
 ### 2.1 Native memory tools
 
+**Status:** partially implemented. `memory_search` and `memory_get` ship as the read-only `infinitum_memory_search` / `infinitum_memory_get` tools behind `memory.tools_enabled`, with the server-side tool loop transparent in both the streaming and non-streaming proxy paths. `memory_history`, `event_get`, and the 2.3 retrieval-planning step remain open.
+
 Expose tool definitions that can be injected when enabled:
 
 ```text

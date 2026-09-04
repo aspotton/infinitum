@@ -16,6 +16,8 @@ memory:
   retrieve_candidates: 50
   minimum_retrieval_score: 0.18
   inject_max_memories: 24
+  # Read-only drill-down tools: infinitum_memory_search / infinitum_memory_get.
+  tools_enabled: false
   dedup_similarity: 0.88
   # Near-identical wording reinforces directly.
   reinforce_similarity: 0.86
