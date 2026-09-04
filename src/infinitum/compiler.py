@@ -140,9 +140,7 @@ class ContextCompiler:
         if not compiled.text:
             return list(messages)
         result = [dict(m) for m in messages]
-        index = 0
-        while index < len(result) and result[index].get("role") in {"system", "developer"}:
-            index += 1
+        index = self._inject_index(result)
         result.insert(
             index,
             {
@@ -151,6 +149,16 @@ class ContextCompiler:
             },
         )
         return result
+
+    def _inject_index(self, result: list[dict[str, Any]]) -> int:
+        if self.config.context.inject_position == "suffix":
+            for idx in range(len(result) - 1, -1, -1):
+                if result[idx].get("role") == "user":
+                    return idx
+        index = 0
+        while index < len(result) and result[index].get("role") in {"system", "developer"}:
+            index += 1
+        return index
 
     @staticmethod
     def _render_memory(item: ScoredMemory) -> str:
