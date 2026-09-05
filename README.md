@@ -528,7 +528,10 @@ a skipped job simply stays pending and runs once the proxy is idle. The boundary
 is honest. Only job *start* is deferred: a job already running continues to
 completion within `learning.timeout_seconds`, and a hung streaming request keeps
 learning deferred while it counts as active. `GET /health` reports the live
-`active_requests` count so you can see why the worker is idle.
+`active_requests` count so you can see why the worker is idle. Set
+`learning.upstream_idle_grace_seconds` (default `0`) to keep learning deferred
+until the upstream has been continuously idle for that long after traffic
+drains; any new foreground request restarts the window.
 
 ### Incremental topic-summary controls
 
