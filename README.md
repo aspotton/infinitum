@@ -14,7 +14,7 @@
 
 Infinitum is a standalone Python 3 memory and context runtime for AI agents and LLM applications. It exposes an OpenAI-compatible API, maintains durable event-sourced memory, learns and consolidates useful long-term context, and injects only the most relevant memory into each request.
 
-Current release: **v0.2.4**.
+Current release: **v0.2.5**.
 
 ## Repository
 
@@ -23,6 +23,10 @@ Current release: **v0.2.4**.
 - **Python distribution:** `infinitum`
 - **Python package:** `infinitum`
 - **CLI:** `infinitum`
+
+## What changed in v0.2.5
+
+V0.2.5 fixes a cache-pollution bug in session pinning. Requests that supplied no session header previously received a freshly generated session id on every call, so they never hit the pinned memory-block cache and each one evicted a real session's pin from the 64-entry cache — busy headerless traffic made pinning effectively random for well-behaved clients. A generated id is now used only for event provenance: headerless requests compile fresh every time without touching the cache at all, while clients that send `X-Infinitum-Session-ID` (or an alias/metadata session id) are byte-for-byte unaffected. Memory injection itself is unchanged for every client; only the pin cache's bookkeeping changed.
 
 ## What changed in v0.2.4
 
