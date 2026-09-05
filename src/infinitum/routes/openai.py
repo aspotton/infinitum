@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from typing import Any
@@ -70,9 +71,9 @@ def _safe_debug_header(value: str) -> str:
 def _strip_injected_tools(body: dict[str, Any], names: set[str]) -> None:
     """Remove the tool defs we injected from the forwarded body, in place.
 
-    Used by the forced terminal round past the tool-loop cap: with our defs
-    gone the model has no tool left to call, and any stray call is foreign or
-    unrecognized, so classification ends the loop. Client tools and malformed
+    Used by the forced terminal round past the tool-loop cap, alongside
+    tool_choice:"none": our defs gone means a server that keeps calling tools
+    can only reach client tools or nothing at all. Client tools and malformed
     entries are preserved untouched.
     """
     tools = body.get("tools")
@@ -88,6 +89,36 @@ def _strip_injected_tools(body: dict[str, Any], names: set[str]) -> None:
         body["tools"] = kept
     else:
         body.pop("tools", None)
+
+
+def _synthesize_from_tool_results(body: dict[str, Any], model: str) -> dict[str, Any]:
+    """Build a plain assistant chat-completion from the gathered tool results.
+
+    Last-resort fallback when the forced terminal round still returns a blank
+    or tool-call-only response (server ignored tool_choice:"none"). Concatenates
+    the JSON tool results already appended to the transcript (role:"tool") into a
+    single assistant message so the client receives content, never a blank or a
+    dangling tool_call. No extra upstream call.
+    """
+    parts = [
+        str(message.get("content") or "")
+        for message in body.get("messages", [])
+        if message.get("role") == "tool"
+    ]
+    content = "Based on the retrieved memories:\n\n" + "\n\n".join(parts)
+    return {
+        "id": new_id("chatcmpl"),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+    }
 
 
 async def _record_completion(
@@ -280,9 +311,18 @@ async def chat_completions(request: Request) -> Response:
         # reachable on any request (static tool exposure), so the cap can
         # actually fire; the forced round must answer, never blank the client.
         for round_no in range(memory_tools.MAX_ITERATIONS + 1):
-            if round_no == memory_tools.MAX_ITERATIONS:
+            is_forced = round_no == memory_tools.MAX_ITERATIONS
+            if is_forced and ours_injected:
+                # Past the cap: force a terminal ANSWER round. Stripping defs
+                # alone is insufficient for servers with an automatic tool-call
+                # parser (vLLM/Qwen) that re-emit our tool names unprompted.
+                # tool_choice:"none" (OpenAI spec, honored by the verified vLLM
+                # upstream) forbids tool calls so the round must produce text.
+                # Keep our names in ours_active so a stray call that a server
+                # emits anyway is OUR loop-capped call to suppress, not a
+                # foreign tool to forward to the client.
                 _strip_injected_tools(body, ours_injected)
-                ours_active = set()
+                body["tool_choice"] = "none"
             try:
                 iterator = await runtime.upstream.stream_bytes(
                     "chat/completions",
@@ -382,20 +422,31 @@ async def chat_completions(request: Request) -> Response:
         if debug and (ours_injected or tool_rounds):
             debug_headers["x-infinitum-memory-tool-calls"] = str(tool_rounds)
         if final_iterator is None:
-            # Defensive: unreachable since the forced terminal round always
-            # breaks with an iterator. Keep the empty-stream fallback anyway.
+            # Residual: only reachable if the server ignored
+            # tool_choice:"none" AND the forced round emitted a suppressible
+            # all-ours tool-call stream with no content. Keep the empty-stream
+            # fallback; re-streaming synthesis is deliberately not attempted.
             final_iterator = iter(())
         return StreamingResponse(
             final_iterator, media_type="text/event-stream", headers=debug_headers
         )
 
     tool_rounds = 0
+    synthesized = False
     ours_active: set[str] = set(ours_injected)
     for round_no in range(memory_tools.MAX_ITERATIONS + 1):
-        if round_no == memory_tools.MAX_ITERATIONS:
-            # Past the cap: force a terminal answer round (see streaming note).
+        is_forced = round_no == memory_tools.MAX_ITERATIONS
+        if is_forced and ours_injected:
+            # Past the cap: force a terminal ANSWER round. Stripping defs alone
+            # is insufficient for servers with an automatic tool-call parser
+            # (vLLM/Qwen) that re-emit our tool names unprompted.
+            # tool_choice:"none" (OpenAI spec, honored by the verified vLLM
+            # upstream) forbids tool calls so the round must produce text. Keep
+            # our names in ours_active so a stray call that a server emits
+            # anyway is OUR loop-capped call to suppress, not a foreign tool to
+            # forward to the client.
             _strip_injected_tools(body, ours_injected)
-            ours_active = set()
+            body["tool_choice"] = "none"
         try:
             upstream = await runtime.upstream.request(
                 "POST",
@@ -414,6 +465,20 @@ async def chat_completions(request: Request) -> Response:
             parsed = upstream.json()
         except Exception:
             parsed = None  # terminal; records ("", {}) like the old fallback
+
+        if is_forced and parsed is not None:
+            # Defensive: a server that ignored tool_choice:"none" can still
+            # blank the round. Synthesize so the terminal branch below records
+            # and forwards a non-empty answer, never null content or a dangling
+            # tool_call (the calls list below is recomputed from the
+            # synthesized message, which ends the loop).
+            try:
+                forced_blank = not extract_nonstream_assistant(parsed)[0].strip()
+            except Exception:
+                forced_blank = True
+            if forced_blank:
+                parsed = _synthesize_from_tool_results(body, model)
+                synthesized = True
 
         calls = [
             tool_call
@@ -474,6 +539,13 @@ async def chat_completions(request: Request) -> Response:
     if debug and (ours_injected or tool_rounds):
         debug_headers["x-infinitum-memory-tool-calls"] = str(tool_rounds)
 
+    if synthesized:
+        return Response(
+            content=json.dumps(parsed).encode(),
+            status_code=200,
+            media_type="application/json",
+            headers=debug_headers,
+        )
     return Response(
         content=upstream.content,
         status_code=upstream.status_code,

@@ -920,6 +920,135 @@ def test_qa_t_stream_round_cap_forces_answer_not_empty_stream():
             assert assistants[0]["content"] == "PostgreSQL 17."
 
 
+# --- Forced terminal round: tool_choice:"none" + blank-answer synthesis --------
+#
+# Live-verified on vLLM/Qwen: stripping our defs is not enough, the automatic
+# tool-call parser re-emits our tool names and the old forced round forwarded a
+# content:null tool_calls message (non-stream) or a blank SSE (stream).
+
+
+def test_forced_round_sets_tool_choice_none():
+    call = ("infinitum_memory_search", '{"query": "db"}', "call_fc1")
+    replies = [_tool_reply([call]) for _ in range(memory_tools.MAX_ITERATIONS)]
+    replies.append(_completion("PostgreSQL 17 it is."))
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, replies)
+            response = _chat(client, "forced-tc")
+            assert response.status_code == 200
+            message = response.json()["choices"][0]["message"]
+            assert response.json()["choices"][0]["finish_reason"] == "stop"
+            assert message["content"] == "PostgreSQL 17 it is."
+            assert "tool_calls" not in message
+            forced_body = upstream.bodies[-1]
+            assert forced_body["tool_choice"] == "none"
+            forced_names = {t["function"]["name"] for t in forced_body.get("tools", [])}
+            assert not forced_names & set(memory_tools.TOOL_NAMES)
+            events = _events(client, "forced-tc")
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert [e["content"] for e in assistants] == ["PostgreSQL 17 it is."]
+
+
+def test_forced_round_synthesizes_when_tool_choice_ignored():
+    # Server ignores tool_choice:"none": even the forced round comes back as
+    # finish_reason=tool_calls with content=null. The proxy must synthesize an
+    # answer from the already-gathered tool results, never forward the blank
+    # message or a dangling tool_call.
+    call = ("infinitum_memory_search", '{"query": "db"}', "call_fc2")
+    replies = [_tool_reply([call]) for _ in range(memory_tools.MAX_ITERATIONS + 1)]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, replies)
+            response = _chat(client, "forced-synth")
+            assert response.status_code == 200
+            payload = response.json()
+            assert upstream.bodies[-1]["tool_choice"] == "none"
+            choice = payload["choices"][0]
+            assert choice["finish_reason"] == "stop"
+            content = choice["message"]["content"]
+            assert isinstance(content, str) and len(content) > 0
+            assert "tool_calls" not in choice["message"]
+            events = _events(client, "forced-synth")
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1
+            assert len(assistants[0]["content"]) > 0
+
+
+def test_forced_round_stream_not_blank():
+    # Tool-choice-aware SSE fake (mirrors verified vLLM): honors
+    # tool_choice:"none" with a plain answer; otherwise its auto parser keeps
+    # emitting our tool calls. The old forced round stripped defs but sent no
+    # tool_choice, so the client received the stray tool-call stream.
+    tool_stream = [
+        _tool_chunk(0, "call_fc3", "infinitum_memory_search", '{"query": "db"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    answer_stream = [_content_chunk("PostgreSQL 17."), _finish_chunk("stop"), _DONE]
+    bodies: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        chunks = answer_stream if request_body_forces_answer(bodies[-1]) else tool_stream
+
+        async def stream_body():
+            for chunk in chunks:
+                yield chunk
+
+        return httpx.Response(200, content=stream_body())
+
+    def request_body_forces_answer(body: dict) -> bool:
+        return body.get("tool_choice") == "none"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            app.state.runtime.upstream.client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            response = _chat(client, "forced-stream", extra={"stream": True})
+            assert response.status_code == 200
+            text = response.content.decode()
+            assert "PostgreSQL 17." in text
+            assert "tool_calls" not in text
+            assert text.rstrip().endswith("data: [DONE]")
+            assert bodies[-1]["tool_choice"] == "none"
+            events = _events(client, "forced-stream")
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert [e["content"] for e in assistants] == ["PostgreSQL 17."]
+
+
+def test_flag_off_body_unchanged():
+    # tools_enabled=false: the forced-round code must never add a tool_choice
+    # key (byte-identical flag-off invariant).
+    client_tool = {"type": "function", "function": {"name": "get_weather", "parameters": {}}}
+    sent_body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [client_tool],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp, tools_enabled=False)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, [_completion("plain")])
+            response = client.post(
+                "/v1/chat/completions",
+                json=sent_body,
+                headers={"X-Infinitum-Session-ID": "forced-off"},
+            )
+            assert response.status_code == 200
+            assert upstream.calls == 1
+            forwarded = upstream.bodies[0]
+            assert "tool_choice" not in forwarded
+            assert forwarded["tools"] == sent_body["tools"]
+
+
 def test_qa_s_query_from_messages_truncates_tool_blobs():
     with tempfile.TemporaryDirectory() as tmp:
         app = _chat_app(tmp)
