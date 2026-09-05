@@ -16,6 +16,8 @@ Infinitum is a standalone Python 3 memory and context runtime for AI agents and 
 
 Current release: **v0.2.6**.
 
+Full release history lives in [CHANGELOG.md](CHANGELOG.md). Upgrading from v0.1.x? See [the migration guide](docs/MIGRATION_FROM_CONTEXT_RUNTIME.md).
+
 ## Repository
 
 - **Repository name:** `infinitum`
@@ -23,93 +25,6 @@ Current release: **v0.2.6**.
 - **Python distribution:** `infinitum`
 - **Python package:** `infinitum`
 - **CLI:** `infinitum`
-
-## What changed in v0.2.6
-
-V0.2.6 gives the learning worker an optional upstream-awareness mode. When `learning.skip_when_upstream_busy: true` (default `false`, byte-identical behavior when off), the worker no longer starts new learning jobs while Infinitum is actively proxying a request to the upstream; jobs stay pending in the durable queue and run when the proxy goes idle, so a single-GPU local LLM server no longer has a foreground generation and a background extraction/summary call fighting for the same slot. An in-flight memory operation is never interrupted — deferral happens only at job boundaries. `learning.upstream_idle_grace_seconds` (default `0`) optionally keeps learning deferred until the upstream has been continuously idle that long, and any new foreground request restarts the window, so a burst of agent turns is batched into one quiet-period learning pass instead of interleaving with each turn. `/health` now also reports an `active_requests` count.
-
-## What changed in v0.2.5
-
-V0.2.5 fixes a cache-pollution bug in session pinning. Requests that supplied no session header previously received a freshly generated session id on every call, so they never hit the pinned memory-block cache and each one evicted a real session's pin from the 64-entry cache — busy headerless traffic made pinning effectively random for well-behaved clients. A generated id is now used only for event provenance: headerless requests compile fresh every time without touching the cache at all, while clients that send `X-Infinitum-Session-ID` (or an alias/metadata session id) are byte-for-byte unaffected. Memory injection itself is unchanged for every client; only the pin cache's bookkeeping changed.
-
-## What changed in v0.2.4
-
-V0.2.4 adds a reject-and-instruct guard against hallucinated memory-tool calls. Some upstreams run automatic tool-call parsers and emit tool calls on their own, and models sometimes invent memory tool names. A call to an `infinitum_*` name that Infinitum did not expose this request and the client did not define is now rejected server-side instead of forwarded: the model receives an instructive tool result naming the two memory tools that actually exist, and the tool loop continues. That covers model-invented names such as `infinitum_retrieve`, and also Infinitum's own names when an upstream prompt-cache diff drops the tool definitions mid-conversation. Names the client defines are always still forwarded, even when they start with `infinitum_`. The guard covers both paths: streaming never leaks the hallucinated name's bytes to the client, and the non-streaming tool loop rejects the call before anything is forwarded. Model-facing wording now states that the memory tool set is complete and exclusive. With `X-Infinitum-Debug: true`, responses gain `x-infinitum-memory-tool-rejects` alongside the existing call counter. When memory tools are off, the guard is fully dormant and requests behave exactly as before.
-
-## What changed in v0.2.3
-
-V0.2.3 makes the compiled memory block cache-stable for upstream prompt caching. Four changes:
-
-- the memory block is session-pinned; within one session (same resolved user/project context) the injected block is byte-identical across turns until memory or topic state actually changes, tracked by an invalidation watermark over memories and topics;
-- new `context.inject_position` config, default `suffix`, places the memory message immediately before the last user message so the system prompt and conversation history ahead of it stay byte-stable for upstream prompt caches; set `prefix` for strict chat templates that require the system message at index 0 (such as raise_exception Qwen ChatML variants);
-- when `memory.tools_enabled` is on, the two drill-down tool definitions are exposed statically on every memory-enabled request (unless the client defines the same names), so the tools region never flickers;
-- retrieval ranking is deterministic for equal scores by breaking ties on memory id.
-
-Sessions without a session header (`X-Infinitum-Session-ID` or aliases) get a generated id per request used only for event provenance, so those requests never enter the pin cache and pinning only benefits clients that send one.
-
-The memory tool loop now forces a final answer round with Infinitum's tool definitions removed after its 4-round cap, fixing an empty/blank client response when an auto-parsing upstream calls the memory tools repeatedly (worst case 5 upstream calls per request).
-
-## What changed in v0.2.2
-
-V0.2.2 hardens background learning for OpenAI-compatible servers that return structured output through `message.tool_calls` instead of normal `message.content`. This can happen with Qwen-family models behind an automatic tool-call parser even when Infinitum did not provide any tools. Infinitum now accepts only schema-shaped tool/function arguments that match the memory extraction contract, while unrelated tool calls remain ignored.
-
-The extraction and topic-summary prompts now explicitly tell the model not to call tools or functions. Diagnostics include tool-call count and names, and topic summaries can recover a simple `summary`, `text`, or `content` field from tool-call arguments before falling back to deterministic active-memory summaries.
-
-If your upstream supports standard `tool_choice`, the most defensive local-model configuration is:
-
-```yaml
-learning:
-  max_tokens: 2048
-  extra_body:
-    tool_choice: none
-    chat_template_kwargs:
-      enable_thinking: false
-```
-
-`tool_choice: none` addresses the `finish_reason='tool_calls'` case; `enable_thinking: false` addresses reasoning-token consumption. Infinitum v0.2.2 remains resilient if either setting is ignored by the upstream.
-
-## What changed in v0.2.1
-
-V0.2.1 hardens background learning for reasoning-capable/local models. Some OpenAI-compatible servers can return a completion with reasoning tokens but an empty final `message.content`, especially when the completion budget is exhausted before the final answer. Infinitum no longer retries an empty topic-summary response repeatedly. It logs response diagnostics and builds a bounded deterministic summary from active canonical memories, while detailed memories remain authoritative.
-Dirty topic updates left behind by an already-failed summary job are also requeued on startup when Infinitum can recover the model from that job, so an in-place upgrade can repair the pending topic without requiring another conversation to touch it.
-
-It also adds `learning.extra_body` so vendor-specific learning controls can be supplied without affecting foreground proxy requests. For a vLLM/Qwen endpoint that supports the Qwen chat-template switch, for example:
-
-```yaml
-learning:
-  extra_body:
-    tool_choice: none
-    chat_template_kwargs:
-      enable_thinking: false
-```
-
-This is often desirable for extraction/summarization because those jobs need concise structured output rather than long reasoning traces.
-
-## What changed in v0.2.0
-
-V0.2.0 gives the project its permanent **Infinitum** identity while preserving the v0.1.x memory architecture and upgrade path.
-
-- renamed the repository/project from Context Runtime to **Infinitum**;
-- renamed the primary Python package from `context_runtime` to `infinitum`;
-- renamed the primary CLI from `context-runtime` to `infinitum`;
-- changed the canonical configuration environment variable to `INFINITUM_CONFIG`;
-- changed canonical runtime headers from `X-Context-*` to `X-Infinitum-*`;
-- changed the injected memory envelope from `<runtime_memory>` to `<infinitum_memory>`;
-- changed the default new-database filename to `infinitum.db`;
-- retained compatibility aliases for the old CLI, Python namespace, `CONTEXT_RUNTIME_CONFIG`, and `X-Context-*` request headers;
-- when no database path is explicitly configured, an existing `./context-runtime.db` is detected and reused instead of silently creating an empty `./infinitum.db`;
-- keeps the v0.1.4 OpenCode user/project/CWD provenance and soft-affinity behavior;
-- keeps v0.1.3 semantic reinforcement and v0.1.2 bounded incremental topic summaries.
-
-The current release still intentionally uses **one global memory namespace**. User/project/CWD metadata improves provenance and retrieval affinity but is not yet an authorization boundary. Hard scoped memory remains roadmap work.
-
-### Upgrading from v0.1.x
-
-Existing memory databases remain compatible. The safest upgrade is to keep your current `memory.database_path` unchanged. If you relied on the old implicit default and `./context-runtime.db` exists, Infinitum will automatically reuse it unless `./infinitum.db` already exists. No memory rewrite is performed during the rename.
-
-Legacy compatibility is deliberate but secondary: new integrations should use `infinitum`, `INFINITUM_CONFIG`, and `X-Infinitum-*`.
-
-See [`docs/MIGRATION_FROM_CONTEXT_RUNTIME.md`](docs/MIGRATION_FROM_CONTEXT_RUNTIME.md) for a concise in-place upgrade checklist.
 
 ## What it does
 
@@ -320,6 +235,48 @@ memory:
 ```
 
 The long-term roadmap replaces the integer-only evidence model with first-class `memory_observations` records so observation source, independence, evidence type, confidence, and weight are all auditable.
+
+## A sample setup that works for me
+
+The primary maintainer runs a local Qwen model on an NVIDIA DGX Spark, with Infinitum pointing directly at it. This is the working configuration for that single-machine setup:
+
+```yaml
+upstream:
+  base_url: http://127.0.0.1:8889/v1
+  passthrough_authorization: true
+
+memory:
+  database_path: /home/adam/infinitum.db
+  minimum_retrieval_score: 0.30
+  inject_max_memories: 6
+  tools_enabled: true
+
+learning:
+  enabled: true
+  timeout_seconds: 600
+  max_tokens: 1024
+  skip_when_upstream_busy: true
+  upstream_idle_grace_seconds: 5
+
+  topic_summaries: true
+  topic_summary_min_memories: 3
+
+  topic_summary_debounce_seconds: 30
+  topic_summary_update_threshold: 3
+
+  topic_summary_max_changed_memories: 6
+  topic_summary_context_memories: 4
+
+  topic_summary_bootstrap_max_memories: 8
+  topic_summary_max_tokens: 512
+
+  extra_body:
+    tool_choice: none
+    chat_template_kwargs:
+      enable_thinking: false
+```
+
+Your paths, ports, and tuning will differ; every key is documented in the Configuration section below.
 
 ## Install
 
