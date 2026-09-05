@@ -72,11 +72,20 @@ class StreamClassifier:
     the buffer. Content or a foreign function name decides "passthrough" the
     moment it is seen; at end of stream a content-free all-ours tool-call stream
     is "suppress" (run the loop), anything else is "replay" (terminal). Every
-    fed byte is accumulated for verbatim replay.
+    fed byte is accumulated for verbatim replay. With `guard`, hallucinated
+    infinitum_* names (not ours, not client-defined) are neither foreign nor
+    leaked: they decide "suppress" so the caller can reject-instruct them.
     """
 
-    def __init__(self, ours: Iterable[str]) -> None:
+    def __init__(
+        self,
+        ours: Iterable[str],
+        client_names: set[str] | None = None,
+        guard: bool = False,
+    ) -> None:
         self._ours = set(ours)
+        self._client_names = client_names or set()
+        self._guard = guard
         self._line_buf = bytearray()
         self._held: list[bytes] = []
         self._collected = bytearray()
@@ -115,7 +124,17 @@ class StreamClassifier:
         """Resolve the decision at end of stream: suppress (loop) or replay."""
         if self._passthrough or self._content_seen or self._foreign_seen:
             return "passthrough"
-        if classify_tool_calls(reassemble_stream_tool_calls(self._chunks), self._ours):
+        calls = reassemble_stream_tool_calls(self._chunks)
+        if classify_tool_calls(calls, self._ours):
+            return "suppress"
+        # Partition rule (mirror of the non-stream loop): suppress for the
+        # reject round only when every call is ours or a hallucinated
+        # infinitum_* name; `not classified` already proves >=1 rejectable.
+        if self._guard and calls and all(
+            (name := call.get("function", {}).get("name")) in self._ours
+            or is_rejectable_memory_name(name, self._ours, self._client_names)
+            for call in calls
+        ):
             return "suppress"
         return "replay"
 
@@ -152,7 +171,11 @@ class StreamClassifier:
                 flat["index"] = call["index"]
             self._chunks.append(flat)
             if isinstance(name, str) and name and name not in self._ours:
-                self._foreign_seen = True
+                if not (
+                    self._guard
+                    and is_rejectable_memory_name(name, self._ours, self._client_names)
+                ):
+                    self._foreign_seen = True
         reason = choice.get("finish_reason")
         if isinstance(reason, str) and reason:
             self._finish_reason = reason

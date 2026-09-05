@@ -1366,6 +1366,107 @@ def test_debug_header_reject_count_absent_without_rejects():
             assert "x-infinitum-memory-tool-rejects" not in response.headers
 
 
+# --- Hallucination guard: streaming classifier reject path ----------------------
+
+
+def test_stream_reject_no_leak():
+    hallucinated = _tool_chunk(0, "call_sh1", "infinitum_retrieve", '{"query": "db"}')
+    round1 = [hallucinated, _finish_chunk("tool_calls"), _DONE]
+    round2 = [_content_chunk("PostgreSQL 17."), _finish_chunk("stop"), _DONE]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(round1, None), (round2, None)])
+            response = _chat(
+                client, "stream-reject", extra={"stream": True},
+                headers={"X-Infinitum-Debug": "true"},
+            )
+            assert response.status_code == 200
+            text = response.content.decode()
+            # Zero bytes of the hallucinated name reach the client.
+            assert "infinitum_retrieve" not in text
+            assert "tool_calls" not in text
+            assert "PostgreSQL 17." in text
+            assert response.headers["x-infinitum-memory-tool-rejects"] == "1"
+            assert response.headers["x-infinitum-memory-tool-calls"] == "1"
+            assert upstream.calls == 2
+            second = upstream.bodies[1]
+            assistant = [m for m in second["messages"] if m.get("tool_calls")]
+            assert len(assistant) == 1
+            assert assistant[0]["role"] == "assistant"
+            assert assistant[0]["tool_calls"][0]["id"] == "call_sh1"
+            reject_tools = [
+                m
+                for m in _tool_messages(second)
+                if json.loads(m["content"]).get("error", "").startswith("unknown memory tool")
+            ]
+            assert len(reject_tools) == 1
+            assert json.loads(reject_tools[0]["content"]) == REJECT_D2
+            assert reject_tools[0]["tool_call_id"] == "call_sh1"
+            rejected = _rejected_events(_events(client, "stream-reject"))
+            assert len(rejected) == 1
+            assert rejected[0]["metadata"]["name"] == "infinitum_retrieve"
+            assert rejected[0]["metadata"]["tool_call_id"] == "call_sh1"
+
+
+def test_stream_reject_case_variant():
+    # Case-variant hallucinations must not leak: Infinitum_Retrieve is still an
+    # infinitum_-prefixed name the client never defined.
+    hallucinated = _tool_chunk(0, "call_sh2", "Infinitum_Retrieve", '{"query": "db"}')
+    round1 = [hallucinated, _finish_chunk("tool_calls"), _DONE]
+    round2 = [_content_chunk("PostgreSQL 17."), _finish_chunk("stop"), _DONE]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(round1, None), (round2, None)])
+            response = _chat(client, "stream-reject-case", extra={"stream": True})
+            assert response.status_code == 200
+            text = response.content.decode()
+            assert "retrieve" not in text.lower()
+            assert "tool_calls" not in text
+            assert "PostgreSQL 17." in text
+            assert upstream.calls == 2
+            reject_tools = [
+                m
+                for m in _tool_messages(upstream.bodies[1])
+                if json.loads(m["content"]).get("error", "").startswith("unknown memory tool")
+            ]
+            assert len(reject_tools) == 1
+            payload = json.loads(reject_tools[0]["content"])
+            assert payload["error"] == "unknown memory tool 'Infinitum_Retrieve'"
+            assert payload["available_memory_tools"] == sorted(memory_tools.TOOL_NAMES)
+            rejected = _rejected_events(_events(client, "stream-reject-case"))
+            assert len(rejected) == 1
+            assert rejected[0]["metadata"]["name"] == "Infinitum_Retrieve"
+
+
+def test_stream_reject_mixed_foreign_replays():
+    # Rejectable + genuinely foreign name in one stream: the whole stream is
+    # passthrough/replayed verbatim (current contract pinned, not improved).
+    chunks = [
+        _tool_chunk(0, "call_sh3", "infinitum_retrieve", '{"query": "db"}'),
+        _tool_chunk(1, "call_sh4", "get_weather", '{"city": "Oslo"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(chunks, None)])
+            response = _chat(client, "stream-reject-mixed", extra={"stream": True})
+            assert response.status_code == 200
+            assert response.content == b"".join(chunks)
+            assert b"infinitum_retrieve" in response.content
+            assert upstream.calls == 1
+            assert not any(
+                e["event_type"] == "memory.tool_call"
+                for e in _events(client, "stream-reject-mixed")
+            )
+
+
 def test_qa_s_query_from_messages_truncates_tool_blobs():
     with tempfile.TemporaryDirectory() as tmp:
         app = _chat_app(tmp)
