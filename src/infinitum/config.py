@@ -98,7 +98,7 @@ class LearningConfig(BaseModel):
     max_tokens: int = 2048
     # Extra top-level fields merged into background Chat Completions requests.
     # This is useful for OpenAI-compatible servers with vendor-specific knobs,
-    # e.g. vLLM/Qwen chat_template_kwargs to disable thinking for extraction.
+    # e.g. chat_template_kwargs to disable thinking for extraction on compatible servers.
     extra_body: dict[str, Any] = Field(default_factory=dict)
     poll_interval_seconds: float = 1.0
     # When true, the learning worker does not claim new jobs while Infinitum is
