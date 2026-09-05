@@ -179,7 +179,8 @@ async def chat_completions(request: Request) -> Response:
 
     original_messages = body["messages"]
     model = str(body.get("model") or "")
-    session_id = _session_id(request, body)
+    client_session_id = _session_id(request, body)  # str | None - client-supplied only
+    session_id = client_session_id or new_id("ses")  # provenance id for events/audit
     request_context = runtime.request_context.resolve(request.headers)
     request_id = new_id("req")
     user_text = _latest_user(original_messages)
@@ -242,7 +243,7 @@ async def chat_completions(request: Request) -> Response:
     ours_injected: set[str] = set()
     if memory_enabled:
         compiled = await runtime.compiler.compile(
-            original_messages, request_context=request_context, session_id=session_id
+            original_messages, request_context=request_context, session_id=client_session_id
         )
         # Inject our tool defs + hint BEFORE inject(): inject copies the message
         # list and embeds compiled.text at call time, so mutating either after
