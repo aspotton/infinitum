@@ -60,7 +60,7 @@ learning:
   timeout_seconds: 600
   max_tokens: 2048
   # Optional vendor-specific OpenAI-compatible fields for background learning.
-  # For reasoning models behind automatic tool parsers you may want:
+  # For reasoning models you may want:
   # extra_body:
   #   # Useful when an automatic tool parser turns JSON into tool calls.
   #   tool_choice: none

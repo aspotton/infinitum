@@ -185,7 +185,7 @@ Schema:
         """Recover memory JSON from schema-shaped tool/function arguments.
 
         A few OpenAI-compatible model servers run an automatic tool-call parser
-        even when the caller did not provide tools. Some servers' automatic parsers can then
+        even when the caller did not provide tools. Some automatic parsers can then
         emit the requested JSON through ``message.tool_calls`` and leave
         ``message.content`` empty. We only accept arguments that already match
         Infinitum's memory-extraction shape; arbitrary tool calls are ignored.
