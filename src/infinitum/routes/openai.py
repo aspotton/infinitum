@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -64,6 +65,29 @@ def _response_headers(upstream: httpx.Response, extra: dict[str, str] | None = N
 
 def _safe_debug_header(value: str) -> str:
     return value.encode("ascii", errors="ignore").decode("ascii")[:240]
+
+
+def _strip_injected_tools(body: dict[str, Any], names: set[str]) -> None:
+    """Remove the tool defs we injected from the forwarded body, in place.
+
+    Used by the forced terminal round past the tool-loop cap: with our defs
+    gone the model has no tool left to call, and any stray call is foreign or
+    unrecognized, so classification ends the loop. Client tools and malformed
+    entries are preserved untouched.
+    """
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return
+    kept: list[Any] = []
+    for tool in tools:
+        name = tool.get("function", {}).get("name") if isinstance(tool, dict) else None
+        if isinstance(name, str) and name in names:
+            continue
+        kept.append(tool)
+    if kept:
+        body["tools"] = kept
+    else:
+        body.pop("tools", None)
 
 
 async def _record_completion(
@@ -171,17 +195,13 @@ async def chat_completions(request: Request) -> Response:
     ours_injected: set[str] = set()
     if memory_enabled:
         compiled = await runtime.compiler.compile(
-            original_messages, request_context=request_context
+            original_messages, request_context=request_context, session_id=session_id
         )
         # Inject our tool defs + hint BEFORE inject(): inject copies the message
         # list and embeds compiled.text at call time, so mutating either after
-        # this point would be dead.
-        if (
-            memory_enabled
-            and runtime.config.memory.enabled
-            and runtime.config.memory.tools_enabled
-            and compiled.text
-        ):
+        # this point would be dead. Tool defs are exposed statically (flag-only
+        # gate) so the tools region never flaps between turns and stays cacheable.
+        if runtime.config.memory.enabled and runtime.config.memory.tools_enabled:
             ours_injected = set(memory_tools.injected_tool_names(body.get("tools")))
             if ours_injected:
                 body["tools"] = (
@@ -189,10 +209,14 @@ async def chat_completions(request: Request) -> Response:
                     + memory_tools.build_tool_defs(ours_injected)
                 )
                 if compiled.memories:
-                    compiled.text += (
-                        "\n\nDeeper detail is available via the "
+                    # Copy-on-write: compile() may hand back a cached block, so
+                    # never append the hint into the object the cache still holds.
+                    compiled = replace(
+                        compiled,
+                        text=compiled.text
+                        + "\n\nDeeper detail is available via the "
                         + " and ".join(sorted(ours_injected))
-                        + " tools using the memory ids above."
+                        + " tools using the memory ids above.",
                     )
         body["messages"] = runtime.compiler.inject(original_messages, compiled)
     else:
@@ -251,7 +275,14 @@ async def chat_completions(request: Request) -> Response:
         # iteration's bytes ever reach the client.
         tool_rounds = 0
         final_iterator: AsyncIterator[bytes] | None = None
-        for _ in range(memory_tools.MAX_ITERATIONS):
+        ours_active: set[str] = set(ours_injected)
+        # One extra round past the tool-round cap: suppress rounds are now
+        # reachable on any request (static tool exposure), so the cap can
+        # actually fire; the forced round must answer, never blank the client.
+        for round_no in range(memory_tools.MAX_ITERATIONS + 1):
+            if round_no == memory_tools.MAX_ITERATIONS:
+                _strip_injected_tools(body, ours_injected)
+                ours_active = set()
             try:
                 iterator = await runtime.upstream.stream_bytes(
                     "chat/completions",
@@ -269,7 +300,7 @@ async def chat_completions(request: Request) -> Response:
                     headers=debug_headers,
                 )
 
-            classifier = memory_tools.StreamClassifier(ours_injected)
+            classifier = memory_tools.StreamClassifier(ours_active)
             accum = bytearray()
             exhausted = True
             try:
@@ -351,15 +382,20 @@ async def chat_completions(request: Request) -> Response:
         if debug and (ours_injected or tool_rounds):
             debug_headers["x-infinitum-memory-tool-calls"] = str(tool_rounds)
         if final_iterator is None:
-            # Cap exhausted with every round suppressed: dead branch (clients
-            # never invoke our tools directly); emit an empty SSE stream.
+            # Defensive: unreachable since the forced terminal round always
+            # breaks with an iterator. Keep the empty-stream fallback anyway.
             final_iterator = iter(())
         return StreamingResponse(
             final_iterator, media_type="text/event-stream", headers=debug_headers
         )
 
     tool_rounds = 0
-    for _ in range(memory_tools.MAX_ITERATIONS):
+    ours_active: set[str] = set(ours_injected)
+    for round_no in range(memory_tools.MAX_ITERATIONS + 1):
+        if round_no == memory_tools.MAX_ITERATIONS:
+            # Past the cap: force a terminal answer round (see streaming note).
+            _strip_injected_tools(body, ours_injected)
+            ours_active = set()
         try:
             upstream = await runtime.upstream.request(
                 "POST",
@@ -384,7 +420,7 @@ async def chat_completions(request: Request) -> Response:
             for choice in ((parsed or {}).get("choices") or [])[:1]
             for tool_call in (choice.get("message") or {}).get("tool_calls") or []
         ]
-        if parsed is None or not memory_tools.classify_tool_calls(calls, ours_injected):
+        if parsed is None or not memory_tools.classify_tool_calls(calls, ours_active):
             try:
                 assistant_text, assistant_meta = extract_nonstream_assistant(parsed)
             except Exception:
@@ -435,9 +471,6 @@ async def chat_completions(request: Request) -> Response:
             body["messages"] = body["messages"] + [
                 {"role": "tool", "tool_call_id": call.get("id"), "content": result}
             ]
-    else:
-        pass  # cap exhausted: forward the last tool-call response verbatim, unrecorded
-
     if debug and (ours_injected or tool_rounds):
         debug_headers["x-infinitum-memory-tool-calls"] = str(tool_rounds)
 

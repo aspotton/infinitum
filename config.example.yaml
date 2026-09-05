@@ -37,6 +37,10 @@ context:
   reserve_free_tokens: 16384
   max_memory_tokens: 100000
   memory_message_role: system
+  # suffix places the memory block immediately before the last user message so
+  # the system prompt plus conversation history stay prompt-cache stable;
+  # prefix restores the legacy position after the leading system messages.
+  inject_position: suffix
 
 embeddings:
   enabled: false

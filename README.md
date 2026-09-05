@@ -177,6 +177,8 @@ The Context Compiler then:
 
 The configured memory budget is a ceiling, not a target.
 
+The compiled block is built to be cache-stable across turns. `context.inject_position` defaults to `suffix`, placing the memory message immediately before the last user message so the system prompt and the full conversation history ahead of it stay byte-stable for upstream prompt caching (`prefix` restores the legacy position after the leading system messages). When `memory.tools_enabled` is on, the two drill-down tool definitions below are exposed statically on memory-enabled requests unless the client defines tools with the same names, so the tools region never flickers between turns. Within one session (same resolved user/project context) the compiled block is also pinned byte-for-byte until a memory or topic summary actually changes. Caveat: with the default `memory_message_role: system`, strict chat templates that require the system message at index 0 (such as raise_exception Qwen ChatML variants) or providers that reject mid-list system messages must set `inject_position: prefix`.
+
 ### Deep retrieval tools
 
 The compiler injects a bounded memory block per request. When the model needs more than that block shows, optional read-only tools let it drill deeper:
@@ -186,14 +188,14 @@ memory:
   tools_enabled: true  # default: false
 ```
 
-When enabled, and only when a memory block was actually injected and the client has not defined a tool of the same name, Infinitum appends two function tools to the client's tool list:
+When enabled, Infinitum appends two function tools to the client's tool list on every memory-enabled request, as long as the client has not defined a tool of the same name:
 
 - `infinitum_memory_search(query, limit)` — ranked search over active memories (default limit 10, max 50);
 - `infinitum_memory_get(memory_id)` — full current content plus provenance source event ids for one memory.
 
 The tools use the same scorer as injection, so results are ranked identically. They read the same global namespace, and request user/project/CWD context stays a soft affinity, never an access-control filter.
 
-The tool loop runs server-side and is transparent to the client: intermediate tool-call rounds never appear in the client's response or stream, and the client sees only the final answer. Up to 4 tool rounds run per request. Suppressed rounds are recorded as `memory.tool_call` events; only the final assistant message becomes an assistant event. With `X-Infinitum-Debug: true`, the response carries `x-infinitum-memory-tool-calls` with the round count.
+The tool loop runs server-side and is transparent to the client: intermediate tool-call rounds never appear in the client's response or stream, and the client sees only the final answer. Up to 4 tool rounds run per request. If the model keeps calling the memory tools past that cap, Infinitum strips its own tool definitions and makes one final answer-only request, so the client always receives a real answer instead of a blank response. Suppressed rounds are recorded as `memory.tool_call` events; only the final assistant message becomes an assistant event. With `X-Infinitum-Debug: true`, the response carries `x-infinitum-memory-tool-calls` with the round count.
 
 Latency edges worth knowing:
 

@@ -119,5 +119,5 @@ class MemoryRetriever:
                 )
             )
 
-        scored.sort(key=lambda item: item.score, reverse=True)
+        scored.sort(key=lambda item: (-item.score, item.memory.id))
         return scored[:result_limit]

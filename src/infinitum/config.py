@@ -59,8 +59,9 @@ class MemoryConfig(BaseModel):
     reinforce_hint_min_semantic: float = 0.72
     supersede_similarity_floor: float = 0.30
     freshness_half_life_days: float = 120.0
-    # Exposes infinitum_memory_search/infinitum_memory_get to the model when a
-    # memory block is injected; default off for upstream compatibility.
+    # Exposes infinitum_memory_search/infinitum_memory_get to the model on every
+    # memory-enabled request (static exposure for prompt-cache stability);
+    # default off for upstream compatibility.
     tools_enabled: bool = False
 
 
@@ -70,6 +71,9 @@ class ContextConfig(BaseModel):
     reserve_free_tokens: int = 16_384
     max_memory_tokens: int = 100_000
     memory_message_role: Literal["system", "developer"] = "system"
+    # Prefix-cache friendly: "suffix" injects immediately before the last user
+    # message so system + history stay byte-stable; "prefix" is legacy behavior.
+    inject_position: Literal["prefix", "suffix"] = "suffix"
 
 
 class EmbeddingConfig(BaseModel):
