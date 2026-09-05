@@ -217,7 +217,7 @@ For extraction, normal assistant content remains preferred. When it is empty, In
 For topic summaries, Infinitum records non-content diagnostics, then creates a bounded deterministic summary from current active canonical memories. Detailed memories remain authoritative, so this fallback is safe and can later be replaced by the next successful incremental LLM summary. For interaction extraction, empty final content is logged and produces no candidates; the immutable interaction events remain available for future replay/consolidation tooling.
 Because failed summary jobs leave `topic_updates` untouched, startup recovery scans dirty topics and recreates a pending summary job when no pending/running owner exists and the learning model can be recovered from configuration or prior job payload. This lets an upgrade recover topics that previously exhausted their retry count.
 
-`learning.extra_body` allows deployment-specific background controls such as `tool_choice: none` and disabling thinking on a compatible vLLM/Qwen endpoint. These extensions apply only to learning calls; Infinitum still fixes the learning model/messages, forces non-streaming mode, and enforces configured token caps.
+`learning.extra_body` allows deployment-specific background controls such as `tool_choice: none` and disabling thinking on compatible servers exposing such controls. These extensions apply only to learning calls; Infinitum still fixes the learning model/messages, forces non-streaming mode, and enforces configured token caps.
 
 ## Deferring learning under upstream contention
 
