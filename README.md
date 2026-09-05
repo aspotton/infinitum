@@ -14,7 +14,7 @@
 
 Infinitum is a standalone Python 3 memory and context runtime for AI agents and LLM applications. It exposes an OpenAI-compatible API, maintains durable event-sourced memory, learns and consolidates useful long-term context, and injects only the most relevant memory into each request.
 
-Current release: **v0.2.2**.
+Current release: **v0.2.3**.
 
 ## Repository
 
@@ -23,6 +23,19 @@ Current release: **v0.2.2**.
 - **Python distribution:** `infinitum`
 - **Python package:** `infinitum`
 - **CLI:** `infinitum`
+
+## What changed in v0.2.3
+
+V0.2.3 makes the compiled memory block cache-stable for upstream prompt caching. Four changes:
+
+- the memory block is session-pinned; within one session (same resolved user/project context) the injected block is byte-identical across turns until memory or topic state actually changes, tracked by an invalidation watermark over memories and topics;
+- new `context.inject_position` config, default `suffix`, places the memory message immediately before the last user message so the system prompt and conversation history ahead of it stay byte-stable for upstream prompt caches; set `prefix` for strict chat templates that require the system message at index 0 (such as raise_exception Qwen ChatML variants);
+- when `memory.tools_enabled` is on, the two drill-down tool definitions are exposed statically on every memory-enabled request (unless the client defines the same names), so the tools region never flickers;
+- retrieval ranking is deterministic for equal scores by breaking ties on memory id.
+
+Sessions without a session header (`X-Infinitum-Session-ID` or aliases) get a generated id per request, so pinning only benefits clients that send one.
+
+The memory tool loop now forces a final answer round with Infinitum's tool definitions removed after its 4-round cap, fixing an empty/blank client response when an auto-parsing upstream calls the memory tools repeatedly (worst case 5 upstream calls per request).
 
 ## What changed in v0.2.2
 

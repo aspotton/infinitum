@@ -280,6 +280,8 @@ event_get(event_id)
 
 ### 2.2 Progressive context
 
+**Status note:** cache-stable injection (session pinning, static tool exposure, suffix injection position) shipped in v0.2.3.
+
 The compiler should be able to give the model:
 
 - authoritative/current summaries;
