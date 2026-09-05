@@ -14,7 +14,7 @@
 
 Infinitum is a standalone Python 3 memory and context runtime for AI agents and LLM applications. It exposes an OpenAI-compatible API, maintains durable event-sourced memory, learns and consolidates useful long-term context, and injects only the most relevant memory into each request.
 
-Current release: **v0.2.3**.
+Current release: **v0.2.4**.
 
 ## Repository
 
@@ -23,6 +23,10 @@ Current release: **v0.2.3**.
 - **Python distribution:** `infinitum`
 - **Python package:** `infinitum`
 - **CLI:** `infinitum`
+
+## What changed in v0.2.4
+
+V0.2.4 adds a reject-and-instruct guard against hallucinated memory-tool calls. Some upstreams run automatic tool-call parsers and emit tool calls on their own, and models sometimes invent memory tool names. A call to an `infinitum_*` name that Infinitum did not expose this request and the client did not define is now rejected server-side instead of forwarded: the model receives an instructive tool result naming the two memory tools that actually exist, and the tool loop continues. That covers model-invented names such as `infinitum_retrieve`, and also Infinitum's own names when an upstream prompt-cache diff drops the tool definitions mid-conversation. Names the client defines are always still forwarded, even when they start with `infinitum_`. The guard covers both paths: streaming never leaks the hallucinated name's bytes to the client, and the non-streaming tool loop rejects the call before anything is forwarded. Model-facing wording now states that the memory tool set is complete and exclusive. With `X-Infinitum-Debug: true`, responses gain `x-infinitum-memory-tool-rejects` alongside the existing call counter. When memory tools are off, the guard is fully dormant and requests behave exactly as before.
 
 ## What changed in v0.2.3
 
