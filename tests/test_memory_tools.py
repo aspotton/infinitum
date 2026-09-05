@@ -234,6 +234,107 @@ def test_injected_names_ignores_malformed_entries():
     assert memory_tools.injected_tool_names(["junk", 42]) == list(memory_tools.TOOL_NAMES)
 
 
+# --- client_tool_names --------------------------------------------------------
+
+
+def test_client_tool_names_none_and_empty():
+    assert memory_tools.client_tool_names(None) == set()
+    assert memory_tools.client_tool_names([]) == set()
+
+
+def test_client_tool_names_collects_only_function_names():
+    tools = [
+        {"type": "function", "function": {"name": "web_search"}},
+        {"type": "function", "function": {"name": 42}},
+        {"function": {}},
+        {"function": None},
+        "junk",
+        42,
+        None,
+        {"name": "flat_name"},
+    ]
+    assert memory_tools.client_tool_names(tools) == {"web_search"}
+
+
+def test_injected_names_uses_client_tool_names():
+    client_tools = [{"type": "function", "function": {"name": "infinitum_memory_get"}}]
+    assert memory_tools.injected_tool_names(client_tools) == ["infinitum_memory_search"]
+
+
+# --- is_rejectable_memory_name ------------------------------------------------
+
+
+def test_reject_hallucinated_infinitum_name():
+    ours = set(memory_tools.TOOL_NAMES)
+    assert memory_tools.is_rejectable_memory_name("infinitum_retrieve", ours, set()) is True
+
+
+def test_reject_exposed_names_are_false():
+    ours = set(memory_tools.TOOL_NAMES)
+    for name in memory_tools.TOOL_NAMES:
+        assert memory_tools.is_rejectable_memory_name(name, ours, set()) is False
+
+
+def test_reject_client_defined_infinitum_name_is_false():
+    ours = set(memory_tools.TOOL_NAMES)
+    client = {"infinitum_whatever"}
+    assert memory_tools.is_rejectable_memory_name("infinitum_whatever", ours, client) is False
+
+
+def test_reject_foreign_and_nameless_are_false():
+    ours = set(memory_tools.TOOL_NAMES)
+    for name in ("web_search", "", None, 123):
+        assert memory_tools.is_rejectable_memory_name(name, ours, set()) is False
+
+
+def test_reject_prefix_check_is_case_insensitive():
+    ours = set(memory_tools.TOOL_NAMES)
+    assert memory_tools.is_rejectable_memory_name("Infinitum_Retrieve", ours, set()) is True
+
+
+# --- build_reject_result ------------------------------------------------------
+
+
+def test_build_reject_result_round_trip():
+    exposed = list(memory_tools.TOOL_NAMES)
+    parsed = json.loads(memory_tools.build_reject_result("infinitum_retrieve", exposed))
+    assert parsed == {
+        "error": "unknown memory tool 'infinitum_retrieve'",
+        "available_memory_tools": exposed,
+        "hint": "answer from the results above, or call one of these tools",
+    }
+
+
+HINT_EXCLUSIVITY_CLAUSE = (
+    " Those are the only memory tools that exist; use them for any memory"
+    " lookup; never invent another memory tool name."
+)
+DEFS_COMPLETE_SET_CLAUSE = (
+    " This is the complete set of memory tools: infinitum_memory_search"
+    " and infinitum_memory_get; never call another memory tool name."
+)
+
+
+def test_tool_def_descriptions_carry_complete_set_clause():
+    defs = memory_tools.build_tool_defs(list(memory_tools.TOOL_NAMES))
+    assert len(defs) == 2
+    for tool_def in defs:
+        assert DEFS_COMPLETE_SET_CLAUSE in tool_def["function"]["description"]
+
+
+def test_compiled_block_hint_carries_exclusivity_clause():
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, [_completion("plain")])
+            response = _chat(client, "hint-excl")
+            assert response.status_code == 200
+            assert upstream.calls == 1
+            contents = [str(m.get("content", "")) for m in upstream.bodies[0]["messages"]]
+            assert any(HINT_EXCLUSIVITY_CLAUSE in c for c in contents)
+
+
 def test_build_tool_defs_order_and_schema():
     defs = memory_tools.build_tool_defs(list(memory_tools.TOOL_NAMES))
     assert [d["function"]["name"] for d in defs] == list(memory_tools.TOOL_NAMES)
@@ -1047,6 +1148,323 @@ def test_flag_off_body_unchanged():
             forwarded = upstream.bodies[0]
             assert "tool_choice" not in forwarded
             assert forwarded["tools"] == sent_body["tools"]
+
+
+# --- Hallucination guard: reject-and-instruct in the non-stream tool loop ------
+
+REJECT_D2 = {
+    "error": "unknown memory tool 'infinitum_retrieve'",
+    "available_memory_tools": ["infinitum_memory_get", "infinitum_memory_search"],
+    "hint": "answer from the results above, or call one of these tools",
+}
+HALLUCINATED = ("infinitum_retrieve", '{"query": "db"}', "call_hal")
+
+
+def _rejected_events(events: list[dict]) -> list[dict]:
+    return [
+        e
+        for e in events
+        if e["event_type"] == "memory.tool_call" and e["metadata"].get("rejected") is True
+    ]
+
+
+def _tool_messages(body: dict) -> list[dict]:
+    return [m for m in body["messages"] if m.get("role") == "tool"]
+
+
+def test_reject_hallucinated_retrieve_mid_loop():
+    get_call = ("infinitum_memory_get", '{"memory_id": "mem_x"}', "call_r1")
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp, learning_enabled=True)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            enqueued: list[tuple[str, dict]] = []
+
+            async def spy(job_type: str, payload: dict) -> str:
+                enqueued.append((job_type, payload))
+                return "job-spy"
+
+            app.state.runtime.db.enqueue_job = spy
+            upstream = _ScriptedUpstream(
+                app.state.runtime,
+                [
+                    _tool_reply([get_call]),
+                    _tool_reply([HALLUCINATED]),
+                    _completion("PostgreSQL 17."),
+                ],
+            )
+            response = _chat(client, "reject-mid")
+            choice = response.json()["choices"][0]
+            assert choice["finish_reason"] == "stop"
+            assert choice["message"]["content"] == "PostgreSQL 17."
+            assert "tool_calls" not in choice["message"]
+            assert upstream.calls == 3
+            reject_tools = [
+                m
+                for m in _tool_messages(upstream.bodies[2])
+                if json.loads(m["content"]).get("error", "").startswith("unknown memory tool")
+            ]
+            assert len(reject_tools) == 1
+            assert json.loads(reject_tools[0]["content"]) == REJECT_D2
+            assert reject_tools[0]["tool_call_id"] == "call_hal"
+            rejected = _rejected_events(_events(client, "reject-mid"))
+            assert len(rejected) == 1
+            assert rejected[0]["metadata"]["name"] == "infinitum_retrieve"
+            assert rejected[0]["metadata"]["tool_call_id"] == "call_hal"
+            assert json.loads(rejected[0]["metadata"]["result"]) == REJECT_D2
+            learn_jobs = [payload for kind, payload in enqueued if kind == "learn_interaction"]
+            assert len(learn_jobs) == 1
+
+
+def test_reject_with_no_defs_this_round():
+    search_call = ("infinitum_memory_search", '{"query": "db"}', "call_nd1")
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(
+                app.state.runtime,
+                [_tool_reply([search_call]), _tool_reply([HALLUCINATED]), _completion("answered")],
+            )
+            response = _chat(client, "reject-nodefs")
+            assert response.json()["choices"][0]["message"]["content"] == "answered"
+            assert upstream.calls == 3
+            loop1_names = {t["function"]["name"] for t in upstream.bodies[0]["tools"]}
+            assert loop1_names == set(memory_tools.TOOL_NAMES)
+            assert json.loads(_tool_messages(upstream.bodies[2])[-1]["content"]) == REJECT_D2
+            assert len(_rejected_events(_events(client, "reject-nodefs"))) == 1
+
+
+def test_reject_sibling_executes():
+    search_call = ("infinitum_memory_search", '{"query": "database"}', "call_sib1")
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(
+                app.state.runtime,
+                [_tool_reply([search_call, HALLUCINATED]), _completion("sibling done")],
+            )
+            response = _chat(client, "reject-sibling")
+            assert response.json()["choices"][0]["message"]["content"] == "sibling done"
+            assert "tool_calls" not in response.json()["choices"][0]["message"]
+            assert upstream.calls == 2
+            tools = _tool_messages(upstream.bodies[1])
+            assert len(tools) == 2
+            assert json.loads(tools[0]["content"])["results"]
+            assert json.loads(tools[1]["content"]) == REJECT_D2
+            events = _events(client, "reject-sibling")
+            tool_events = [e for e in events if e["event_type"] == "memory.tool_call"]
+            assert len(tool_events) == 2
+            assert len(_rejected_events(events)) == 1
+
+
+def test_client_shadowed_memory_name_forwards():
+    client_search = {
+        "type": "function",
+        "function": {"name": "infinitum_memory_search", "parameters": {}},
+    }
+    reply = _tool_reply([("infinitum_memory_search", '{"query": "x"}', "call_shadow")])
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, [reply])
+            response = _chat(client, "reject-shadow", extra={"tools": [client_search]})
+            assert response.json() == reply
+            assert upstream.calls == 1
+            assert not any(
+                e["event_type"] == "memory.tool_call" for e in _events(client, "reject-shadow")
+            )
+
+
+def test_reject_mixed_with_client_tool_forwards():
+    client_tool = {"type": "function", "function": {"name": "get_weather", "parameters": {}}}
+    reply = _tool_reply(
+        [
+            ("infinitum_memory_search", '{"query": "db"}', "call_mx1"),
+            ("get_weather", '{"city": "Oslo"}', "call_mx2"),
+            HALLUCINATED,
+        ]
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, [reply])
+            response = _chat(client, "reject-mixed", extra={"tools": [client_tool]})
+            assert response.json() == reply
+            assert upstream.calls == 1
+            assert not any(
+                e["event_type"] == "memory.tool_call" for e in _events(client, "reject-mixed")
+            )
+
+
+def test_reject_skipped_on_forced_round():
+    replies = [
+        _tool_reply([("infinitum_retrieve", '{"query": "db"}', f"call_f{i}")])
+        for i in range(memory_tools.MAX_ITERATIONS + 1)
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, replies)
+            response = _chat(client, "reject-forced")
+            assert upstream.calls == memory_tools.MAX_ITERATIONS + 1
+            assert upstream.bodies[-1]["tool_choice"] == "none"
+            choice = response.json()["choices"][0]
+            assert choice["finish_reason"] == "stop"
+            assert choice["message"]["content"]
+            assert "tool_calls" not in choice["message"]
+            rejected = _rejected_events(_events(client, "reject-forced"))
+            assert len(rejected) == memory_tools.MAX_ITERATIONS
+
+
+def test_memory_off_header_forwards_hallucination_verbatim():
+    reply = _tool_reply([HALLUCINATED])
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, [reply])
+            response = _chat(client, "reject-off", headers={"X-Infinitum-Memory": "off"})
+            assert response.json() == reply
+            assert upstream.calls == 1
+            assert "tools" not in upstream.bodies[0]
+            assert not any(
+                e["event_type"] == "memory.tool_call" for e in _events(client, "reject-off")
+            )
+
+
+def test_debug_header_reject_count_present():
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            _ScriptedUpstream(
+                app.state.runtime, [_tool_reply([HALLUCINATED]), _completion("done")]
+            )
+            response = _chat(client, "reject-dbg", headers={"X-Infinitum-Debug": "true"})
+            assert response.status_code == 200
+            assert response.headers["x-infinitum-memory-tool-rejects"] == "1"
+            assert response.headers["x-infinitum-memory-tool-calls"] == "1"
+
+
+def test_debug_header_reject_count_absent_without_rejects():
+    search_call = ("infinitum_memory_search", '{"query": "db"}', "call_nr")
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            _ScriptedUpstream(
+                app.state.runtime, [_tool_reply([search_call]), _completion("done")]
+            )
+            response = _chat(client, "reject-nodbg", headers={"X-Infinitum-Debug": "true"})
+            assert response.status_code == 200
+            assert response.headers["x-infinitum-memory-tool-calls"] == "1"
+            assert "x-infinitum-memory-tool-rejects" not in response.headers
+
+
+# --- Hallucination guard: streaming classifier reject path ----------------------
+
+
+def test_stream_reject_no_leak():
+    hallucinated = _tool_chunk(0, "call_sh1", "infinitum_retrieve", '{"query": "db"}')
+    round1 = [hallucinated, _finish_chunk("tool_calls"), _DONE]
+    round2 = [_content_chunk("PostgreSQL 17."), _finish_chunk("stop"), _DONE]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(round1, None), (round2, None)])
+            response = _chat(
+                client, "stream-reject", extra={"stream": True},
+                headers={"X-Infinitum-Debug": "true"},
+            )
+            assert response.status_code == 200
+            text = response.content.decode()
+            # Zero bytes of the hallucinated name reach the client.
+            assert "infinitum_retrieve" not in text
+            assert "tool_calls" not in text
+            assert "PostgreSQL 17." in text
+            assert response.headers["x-infinitum-memory-tool-rejects"] == "1"
+            assert response.headers["x-infinitum-memory-tool-calls"] == "1"
+            assert upstream.calls == 2
+            second = upstream.bodies[1]
+            assistant = [m for m in second["messages"] if m.get("tool_calls")]
+            assert len(assistant) == 1
+            assert assistant[0]["role"] == "assistant"
+            assert assistant[0]["tool_calls"][0]["id"] == "call_sh1"
+            reject_tools = [
+                m
+                for m in _tool_messages(second)
+                if json.loads(m["content"]).get("error", "").startswith("unknown memory tool")
+            ]
+            assert len(reject_tools) == 1
+            assert json.loads(reject_tools[0]["content"]) == REJECT_D2
+            assert reject_tools[0]["tool_call_id"] == "call_sh1"
+            rejected = _rejected_events(_events(client, "stream-reject"))
+            assert len(rejected) == 1
+            assert rejected[0]["metadata"]["name"] == "infinitum_retrieve"
+            assert rejected[0]["metadata"]["tool_call_id"] == "call_sh1"
+
+
+def test_stream_reject_case_variant():
+    # Case-variant hallucinations must not leak: Infinitum_Retrieve is still an
+    # infinitum_-prefixed name the client never defined.
+    hallucinated = _tool_chunk(0, "call_sh2", "Infinitum_Retrieve", '{"query": "db"}')
+    round1 = [hallucinated, _finish_chunk("tool_calls"), _DONE]
+    round2 = [_content_chunk("PostgreSQL 17."), _finish_chunk("stop"), _DONE]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(round1, None), (round2, None)])
+            response = _chat(client, "stream-reject-case", extra={"stream": True})
+            assert response.status_code == 200
+            text = response.content.decode()
+            assert "retrieve" not in text.lower()
+            assert "tool_calls" not in text
+            assert "PostgreSQL 17." in text
+            assert upstream.calls == 2
+            reject_tools = [
+                m
+                for m in _tool_messages(upstream.bodies[1])
+                if json.loads(m["content"]).get("error", "").startswith("unknown memory tool")
+            ]
+            assert len(reject_tools) == 1
+            payload = json.loads(reject_tools[0]["content"])
+            assert payload["error"] == "unknown memory tool 'Infinitum_Retrieve'"
+            assert payload["available_memory_tools"] == sorted(memory_tools.TOOL_NAMES)
+            rejected = _rejected_events(_events(client, "stream-reject-case"))
+            assert len(rejected) == 1
+            assert rejected[0]["metadata"]["name"] == "Infinitum_Retrieve"
+
+
+def test_stream_reject_mixed_foreign_replays():
+    # Rejectable + genuinely foreign name in one stream: the whole stream is
+    # passthrough/replayed verbatim (current contract pinned, not improved).
+    chunks = [
+        _tool_chunk(0, "call_sh3", "infinitum_retrieve", '{"query": "db"}'),
+        _tool_chunk(1, "call_sh4", "get_weather", '{"city": "Oslo"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(chunks, None)])
+            response = _chat(client, "stream-reject-mixed", extra={"stream": True})
+            assert response.status_code == 200
+            assert response.content == b"".join(chunks)
+            assert b"infinitum_retrieve" in response.content
+            assert upstream.calls == 1
+            assert not any(
+                e["event_type"] == "memory.tool_call"
+                for e in _events(client, "stream-reject-mixed")
+            )
 
 
 def test_qa_s_query_from_messages_truncates_tool_blobs():

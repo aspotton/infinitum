@@ -223,6 +223,16 @@ async def chat_completions(request: Request) -> Response:
         "on", "true", "1"
     }
 
+    # Hallucination-guard state, computed once per request BEFORE any def
+    # injection so client_names reflects the original inbound tool list.
+    client_names = memory_tools.client_tool_names(body.get("tools"))
+    guard_active = (
+        memory_enabled
+        and runtime.config.memory.enabled
+        and runtime.config.memory.tools_enabled
+    )
+    reject_count = 0
+
     ours_injected: set[str] = set()
     if memory_enabled:
         compiled = await runtime.compiler.compile(
@@ -247,7 +257,10 @@ async def chat_completions(request: Request) -> Response:
                         text=compiled.text
                         + "\n\nDeeper detail is available via the "
                         + " and ".join(sorted(ours_injected))
-                        + " tools using the memory ids above.",
+                        + " tools using the memory ids above."
+                        + " Those are the only memory tools that exist; use them"
+                        + " for any memory lookup; never invent another memory"
+                        + " tool name.",
                     )
         body["messages"] = runtime.compiler.inject(original_messages, compiled)
     else:
@@ -340,7 +353,9 @@ async def chat_completions(request: Request) -> Response:
                     headers=debug_headers,
                 )
 
-            classifier = memory_tools.StreamClassifier(ours_active)
+            classifier = memory_tools.StreamClassifier(
+                ours_active, client_names=client_names, guard=guard_active
+            )
             accum = bytearray()
             exhausted = True
             try:
@@ -393,10 +408,21 @@ async def chat_completions(request: Request) -> Response:
             assistant_message["tool_calls"] = calls
             body["messages"] = body["messages"] + [assistant_message]
             for call in calls:
-                arguments = call["function"].get("arguments", "")
-                result = await memory_tools.execute(
-                    call["function"]["name"], arguments, runtime, request_context
-                )
+                function = call.get("function") or {}
+                name = function.get("name")
+                arguments = function.get("arguments", "")
+                extra: dict[str, Any] = {}
+                if name in ours_active:
+                    result = await memory_tools.execute(
+                        name, arguments, runtime, request_context
+                    )
+                else:
+                    # Hallucinated memory-tool name: NEVER forwarded to the
+                    # client. The model is told the real tool set and the loop
+                    # continues (same rule as the non-stream path).
+                    result = memory_tools.build_reject_result(name, sorted(ours_injected))
+                    reject_count += 1
+                    extra = {"rejected": True, "result": result}
                 await runtime.db.add_event(
                     Event(
                         session_id=session_id,
@@ -408,10 +434,11 @@ async def chat_completions(request: Request) -> Response:
                         role="tool",
                         content=arguments,
                         metadata={
-                            "name": call["function"]["name"],
+                            "name": name,
                             "result_chars": len(result),
                             "tool_call_id": call.get("id"),
                             "assistant_message": assistant_message,
+                            **extra,
                         },
                     )
                 )
@@ -421,6 +448,8 @@ async def chat_completions(request: Request) -> Response:
 
         if debug and (ours_injected or tool_rounds):
             debug_headers["x-infinitum-memory-tool-calls"] = str(tool_rounds)
+        if debug and reject_count:
+            debug_headers["x-infinitum-memory-tool-rejects"] = str(reject_count)
         if final_iterator is None:
             # Residual: only reachable if the server ignored
             # tool_choice:"none" AND the forced round emitted a suppressible
@@ -485,7 +514,23 @@ async def chat_completions(request: Request) -> Response:
             for choice in ((parsed or {}).get("choices") or [])[:1]
             for tool_call in (choice.get("message") or {}).get("tool_calls") or []
         ]
-        if parsed is None or not memory_tools.classify_tool_calls(calls, ours_active):
+        classified = parsed is not None and memory_tools.classify_tool_calls(calls, ours_active)
+        # Partition rule: a non-forced round is a REJECT round only when every
+        # call is one of ours or a hallucinated infinitum_* name. Any
+        # client-defined/foreign name keeps the terminal-forward contract
+        # verbatim (never swallow a client's tool contract).
+        reject_round = (
+            not classified
+            and guard_active
+            and not is_forced
+            and bool(calls)
+            and all(
+                (name := (call.get("function") or {}).get("name")) in ours_active
+                or memory_tools.is_rejectable_memory_name(name, ours_active, client_names)
+                for call in calls
+            )
+        )
+        if not (classified or reject_round):
             try:
                 assistant_text, assistant_meta = extract_nonstream_assistant(parsed)
             except Exception:
@@ -511,10 +556,18 @@ async def chat_completions(request: Request) -> Response:
         }
         body["messages"] = body["messages"] + [assistant_message]
         for call in calls:
-            arguments = call["function"].get("arguments", "")
-            result = await memory_tools.execute(
-                call["function"]["name"], arguments, runtime, request_context
-            )
+            function = call.get("function") or {}
+            name = function.get("name")
+            arguments = function.get("arguments", "")
+            extra: dict[str, Any] = {}
+            if name in ours_active:
+                result = await memory_tools.execute(name, arguments, runtime, request_context)
+            else:
+                # Hallucinated memory-tool name: NEVER forwarded to the client.
+                # The model is told the real tool set and the loop continues.
+                result = memory_tools.build_reject_result(name, sorted(ours_injected))
+                reject_count += 1
+                extra = {"rejected": True, "result": result}
             await runtime.db.add_event(
                 Event(
                     session_id=session_id,
@@ -526,10 +579,11 @@ async def chat_completions(request: Request) -> Response:
                     role="tool",
                     content=arguments,
                     metadata={
-                        "name": call["function"]["name"],
+                        "name": name,
                         "result_chars": len(result),
                         "tool_call_id": call.get("id"),
                         "assistant_message": assistant_message,
+                        **extra,
                     },
                 )
             )
@@ -538,6 +592,8 @@ async def chat_completions(request: Request) -> Response:
             ]
     if debug and (ours_injected or tool_rounds):
         debug_headers["x-infinitum-memory-tool-calls"] = str(tool_rounds)
+    if debug and reject_count:
+        debug_headers["x-infinitum-memory-tool-rejects"] = str(reject_count)
 
     if synthesized:
         return Response(

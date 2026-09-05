@@ -68,6 +68,9 @@ Use these canonical names in new code/docs:
 - `X-Infinitum-Debug`
 - `<infinitum_memory>...</infinitum_memory>`
 - `infinitum_memory_search` / `infinitum_memory_get` (read-only drill-down tool names, not headers; gated by `memory.tools_enabled`)
+- `x-infinitum-memory-tool-rejects` (debug-only response header; count of rejected hallucinated memory-tool calls)
+
+A tool call whose name starts with `infinitum_` but was not exposed this request and is not client-defined is a hallucination: reject it server-side with an instructive tool result, never forward it to the client, and let the loop continue.
 
 Legacy `X-Context-*` headers remain accepted but should be lower priority than canonical Infinitum headers. Runtime-only headers must be stripped before normal upstream forwarding. Headroom forwarding, when explicitly enabled, should be generated from the already-resolved request context rather than blindly forwarding inbound identity-like headers.
 

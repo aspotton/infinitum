@@ -14,7 +14,7 @@
 
 Infinitum is a standalone Python 3 memory and context runtime for AI agents and LLM applications. It exposes an OpenAI-compatible API, maintains durable event-sourced memory, learns and consolidates useful long-term context, and injects only the most relevant memory into each request.
 
-Current release: **v0.2.3**.
+Current release: **v0.2.4**.
 
 ## Repository
 
@@ -23,6 +23,10 @@ Current release: **v0.2.3**.
 - **Python distribution:** `infinitum`
 - **Python package:** `infinitum`
 - **CLI:** `infinitum`
+
+## What changed in v0.2.4
+
+V0.2.4 adds a reject-and-instruct guard against hallucinated memory-tool calls. Some upstreams run automatic tool-call parsers and emit tool calls on their own, and models sometimes invent memory tool names. A call to an `infinitum_*` name that Infinitum did not expose this request and the client did not define is now rejected server-side instead of forwarded: the model receives an instructive tool result naming the two memory tools that actually exist, and the tool loop continues. That covers model-invented names such as `infinitum_retrieve`, and also Infinitum's own names when an upstream prompt-cache diff drops the tool definitions mid-conversation. Names the client defines are always still forwarded, even when they start with `infinitum_`. The guard covers both paths: streaming never leaks the hallucinated name's bytes to the client, and the non-streaming tool loop rejects the call before anything is forwarded. Model-facing wording now states that the memory tool set is complete and exclusive. With `X-Infinitum-Debug: true`, responses gain `x-infinitum-memory-tool-rejects` alongside the existing call counter. When memory tools are off, the guard is fully dormant and requests behave exactly as before.
 
 ## What changed in v0.2.3
 
@@ -208,7 +212,7 @@ When enabled, Infinitum appends two function tools to the client's tool list on 
 
 The tools use the same scorer as injection, so results are ranked identically. They read the same global namespace, and request user/project/CWD context stays a soft affinity, never an access-control filter.
 
-The tool loop runs server-side and is transparent to the client: intermediate tool-call rounds never appear in the client's response or stream, and the client sees only the final answer. Up to 4 tool rounds run per request. If the model keeps calling the memory tools past that cap, Infinitum makes one final forced answer round: its own tool definitions are removed and the standard `tool_choice: "none"` parameter is sent, so servers with automatic tool-call parsers (vLLM/Qwen) must answer in text instead of re-emitting the tool calls. If a server ignores `tool_choice` and the forced round still comes back blank, the non-streaming path synthesizes an assistant answer from the already-gathered tool results rather than forwarding a null-content message or a dangling tool call. Suppressed rounds are recorded as `memory.tool_call` events; only the final assistant message becomes an assistant event. With `X-Infinitum-Debug: true`, the response carries `x-infinitum-memory-tool-calls` with the round count.
+The tool loop runs server-side and is transparent to the client: intermediate tool-call rounds never appear in the client's response or stream, and the client sees only the final answer. That transparency is now unconditional for memory-named tool calls: a hallucinated `infinitum_*` call is answered server-side and never forwarded, per the parser-hazard note below. Up to 4 tool rounds run per request. If the model keeps calling the memory tools past that cap, Infinitum makes one final forced answer round: its own tool definitions are removed and the standard `tool_choice: "none"` parameter is sent, so servers with automatic tool-call parsers (vLLM/Qwen) must answer in text instead of re-emitting the tool calls. If a server ignores `tool_choice` and the forced round still comes back blank, the non-streaming path synthesizes an assistant answer from the already-gathered tool results rather than forwarding a null-content message or a dangling tool call. Suppressed rounds are recorded as `memory.tool_call` events, and rejected calls are recorded the same way with a `rejected` provenance flag plus the exact instructive result the model was told; only the final assistant message becomes an assistant event. With `X-Infinitum-Debug: true`, the response carries `x-infinitum-memory-tool-calls` with the round count and, when calls were rejected, `x-infinitum-memory-tool-rejects` with the rejected-call count.
 
 Latency edges worth knowing:
 
@@ -216,7 +220,7 @@ Latency edges worth knowing:
 - Each tool round is a full extra upstream round-trip. A long loop multiplies upstream latency and a client-side timeout can fire mid-loop.
 - If your upstream rejects or mishandles tool definitions, turn the flag off; requests then behave exactly as before.
 
-Parser-hazard note: some upstreams run automatic tool-call parsers and emit tool calls on their own. Any tool call whose function name is not one of the two Infinitum names is never executed or looped. It is treated as terminal and forwarded to the client verbatim.
+Parser-hazard note: some upstreams run automatic tool-call parsers and emit tool calls on their own. A call to an `infinitum_*` name that Infinitum did not expose this request is rejected server-side: the model receives an instructive tool result listing the memory tools that actually exist, and the loop continues without the client seeing anything. That covers names Infinitum never had, such as `infinitum_retrieve`, and also Infinitum's own names when an upstream prompt-cache diff drops the tool definitions mid-conversation. Any other foreign name stays terminal and is forwarded to the client verbatim. Names the client defines belong to the client: a client tool is forwarded even if its name starts with `infinitum_`.
 
 ## Learning
 
