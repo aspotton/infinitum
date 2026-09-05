@@ -14,7 +14,7 @@
 
 Infinitum is a standalone Python 3 memory and context runtime for AI agents and LLM applications. It exposes an OpenAI-compatible API, maintains durable event-sourced memory, learns and consolidates useful long-term context, and injects only the most relevant memory into each request.
 
-Current release: **v0.2.5**.
+Current release: **v0.2.6**.
 
 ## Repository
 
@@ -23,6 +23,10 @@ Current release: **v0.2.5**.
 - **Python distribution:** `infinitum`
 - **Python package:** `infinitum`
 - **CLI:** `infinitum`
+
+## What changed in v0.2.6
+
+V0.2.6 gives the learning worker an optional upstream-awareness mode. When `learning.skip_when_upstream_busy: true` (default `false`, byte-identical behavior when off), the worker no longer starts new learning jobs while Infinitum is actively proxying a request to the upstream; jobs stay pending in the durable queue and run when the proxy goes idle, so a single-GPU local LLM server no longer has a foreground generation and a background extraction/summary call fighting for the same slot. An in-flight memory operation is never interrupted — deferral happens only at job boundaries. `learning.upstream_idle_grace_seconds` (default `0`) optionally keeps learning deferred until the upstream has been continuously idle that long, and any new foreground request restarts the window, so a burst of agent turns is batched into one quiet-period learning pass instead of interleaving with each turn. `/health` now also reports an `active_requests` count.
 
 ## What changed in v0.2.5
 
