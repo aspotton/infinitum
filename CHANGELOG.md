@@ -10,6 +10,31 @@
 - Both options default to off, so unset configurations keep byte-identical prior behavior.
 - Added regression tests for the defer/drain paths and idle-grace windows; the full suite now covers 135 tests.
 
+## 0.2.5
+
+- Fixed a cache-pollution bug in session pinning: headerless requests previously generated a fresh session id per call, never hit the pin cache, and evicted real sessions' pins from the 64-entry cache.
+- A generated session id is now used only for event provenance; headerless requests compile fresh every time without touching the cache.
+- Clients that send `X-Infinitum-Session-ID` (or an alias/metadata session id) are byte-for-byte unaffected.
+- Memory injection itself is unchanged for every client; only the pin cache's bookkeeping changed.
+
+## 0.2.4
+
+- Added a reject-and-instruct guard for hallucinated memory-tool calls: an `infinitum_*` call that Infinitum did not expose and the client did not define is rejected server-side with an instructive tool result naming the two real memory tools, and the tool loop continues.
+- Covers model-invented names such as `infinitum_retrieve`, and Infinitum's own names when an upstream prompt-cache diff drops the tool definitions mid-conversation.
+- Names the client defines are always still forwarded, even when they start with `infinitum_`.
+- Streaming never leaks the hallucinated name's bytes to the client; the non-streaming tool loop rejects the call before anything is forwarded.
+- Model-facing wording now states that the memory tool set is complete and exclusive.
+- With `X-Infinitum-Debug: true`, responses gain `x-infinitum-memory-tool-rejects` alongside the existing call counter.
+- The guard is fully dormant when memory tools are off.
+
+## 0.2.3
+
+- Made the compiled memory block cache-stable for upstream prompt caching: the block is session-pinned and byte-identical across turns until memory or topic state changes, tracked by an invalidation watermark over memories and topics.
+- Added `context.inject_position` config, default `suffix`, placing the memory message immediately before the last user message; set `prefix` for strict chat templates that require the system message at index 0.
+- The two drill-down tool definitions are now exposed statically on every memory-enabled request when `memory.tools_enabled` is on (unless the client defines the same names), so the tools region never flickers.
+- Retrieval ranking breaks ties on memory id for deterministic ordering at equal scores.
+- The memory tool loop now forces a final answer round with Infinitum's tool definitions removed after its 4-round cap.
+
 ## 0.2.2
 
 - Fixed lost memory-learning turns when an OpenAI-compatible server returns `finish_reason="tool_calls"` with empty assistant content.
@@ -25,7 +50,7 @@
 - Fixed repeated topic-summary job failures when an OpenAI-compatible learning model returns an empty final `message.content`.
 - Empty topic-summary output now degrades to a bounded deterministic summary of active canonical memories instead of retrying the same doomed job up to `learning.max_attempts` times.
 - Added non-content diagnostics for empty learning responses (`finish_reason`, reasoning character count, and completion-token usage when available).
-- Added `learning.extra_body` for vendor-specific OpenAI-compatible background-learning controls. This can be used with servers such as vLLM/Qwen to disable reasoning/thinking for memory extraction and topic summarization.
+- Added `learning.extra_body` for vendor-specific OpenAI-compatible background-learning controls. This can be used with some OpenAI-compatible servers that expose chat-template controls, to disable reasoning/thinking for memory extraction and topic summarization.
 - Added `learning.topic_summary_fallback_memories` to bound deterministic fallback summaries.
 - On startup, dirty topic state left behind by an older failed summary job is requeued automatically when its learning model can be recovered, so upgrading fixes existing failed topics without waiting for a new interaction.
 - Memory extraction now uses the same robust assistant-content parser as normal non-streaming responses and treats empty final content as a logged no-op rather than a retry storm.
