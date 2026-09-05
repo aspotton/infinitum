@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 from .compiler import ContextCompiler
@@ -16,13 +17,17 @@ from .upstream import UpstreamClient
 class ActiveRequestCounter:
     """Count of foreground requests actively forwarded to the upstream.
 
-    Single event loop, no awaits between increment and read, so a plain int
-    suffices. Decrement saturates at zero so a double-decrement can never
-    permanently starve deferral that reads this value.
+    ``last_busy`` stamps the most recent foreground activity so the
+    idle-grace window can defer learning until the upstream has been quiet
+    long enough. Single event loop, no awaits between increment and read, so
+    a plain int suffices. Decrement saturates at zero so a double-decrement
+    can never permanently starve deferral that reads this value, and a
+    no-op decrement at zero does not fake activity.
     """
 
     def __init__(self) -> None:
         self._n = 0
+        self.last_busy = time.monotonic()
 
     @property
     def value(self) -> int:
@@ -30,9 +35,12 @@ class ActiveRequestCounter:
 
     def increment(self) -> None:
         self._n += 1
+        self.last_busy = time.monotonic()
 
     def decrement(self) -> None:
-        self._n = max(0, self._n - 1)
+        if self._n:
+            self._n -= 1
+            self.last_busy = time.monotonic()
 
 
 @dataclass(slots=True)

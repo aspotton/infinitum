@@ -104,6 +104,11 @@ class LearningConfig(BaseModel):
     # When true, the learning worker does not claim new jobs while Infinitum is
     # actively proxying a request to the upstream. Jobs stay pending, not lost.
     skip_when_upstream_busy: bool = False
+    # After the upstream goes idle, wait this long before starting a deferred
+    # learning job; any new foreground request restarts the window. 0 disables
+    # the grace period (claim as soon as the counter drains). Only meaningful
+    # when skip_when_upstream_busy is true.
+    upstream_idle_grace_seconds: float = 0.0
     max_attempts: int = 5
     topic_summaries: bool = True
     topic_summary_min_memories: int = 3
