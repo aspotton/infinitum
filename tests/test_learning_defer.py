@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from infinitum.app import create_app
-from infinitum.config import AppConfig
+from infinitum.config import AppConfig, LearningConfig
 from infinitum.database import Database
 from infinitum.routes.openai import _counted
 from infinitum.runtime import ActiveRequestCounter, build_runtime
@@ -32,13 +32,16 @@ JOB_PAYLOAD = {
 }
 
 
-def _defer_config(tmp: str, *, skip: bool) -> AppConfig:
+def _defer_config(
+    tmp: str, *, skip: bool, grace: float = 0.0, poll: float = 0.05
+) -> AppConfig:
     cfg = AppConfig()
     cfg.memory.database_path = f"{tmp}/runtime.db"
     cfg.learning.enabled = True
     cfg.learning.topic_summaries = False  # keep the queue free of summary jobs
-    cfg.learning.poll_interval_seconds = 0.05
+    cfg.learning.poll_interval_seconds = poll
     cfg.learning.skip_when_upstream_busy = skip
+    cfg.learning.upstream_idle_grace_seconds = grace
     cfg.upstream.passthrough_authorization = False
     return cfg
 
@@ -288,3 +291,89 @@ async def test_health_exposes_active_requests():
         finally:
             await rt.upstream.close()
             await rt.db.close()
+
+
+@pytest.mark.asyncio
+async def test_grace_defers_claim_until_window_passes():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _defer_config(tmp, skip=True, grace=0.3, poll=0.02)
+        rt = await build_runtime(cfg)
+        try:
+            learn = AsyncMock(return_value=None)
+            rt.learner.learn = learn
+            job_id = await rt.db.enqueue_job("learn_interaction", JOB_PAYLOAD)
+
+            rt.active_requests.increment()
+            rt.worker.start()
+            await asyncio.sleep(0.05)
+            rt.active_requests.decrement()  # counter drains; grace window starts
+            # Still inside the window: the drained counter alone must not
+            # re-enable claiming.
+            await asyncio.sleep(0.15)
+            row = await _job_row(rt.db, job_id)
+            assert row["status"] == "pending"
+            assert learn.await_count == 0
+            # The window expires ~0.1s from now; the poll loop claims then.
+            await _wait_for_job_done(rt.db, job_id)
+            assert learn.await_count == 1
+        finally:
+            await rt.worker.stop()
+            await rt.db.close()
+
+
+@pytest.mark.asyncio
+async def test_traffic_during_grace_restarts_window():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _defer_config(tmp, skip=True, grace=0.3, poll=0.02)
+        rt = await build_runtime(cfg)
+        try:
+            learn = AsyncMock(return_value=None)
+            rt.learner.learn = learn
+            job_id = await rt.db.enqueue_job("learn_interaction", JOB_PAYLOAD)
+
+            rt.active_requests.increment()
+            rt.worker.start()
+            await asyncio.sleep(0.05)
+            rt.active_requests.decrement()  # idle; window A starts
+            await asyncio.sleep(0.15)
+            # A request comes and goes inside window A, restarting the
+            # window from THIS activity, not window A's start.
+            rt.active_requests.increment()
+            rt.active_requests.decrement()
+            await asyncio.sleep(0.15)  # > 0.3s after window A, ~0.15s after B
+            row = await _job_row(rt.db, job_id)
+            assert row["status"] == "pending"
+            assert learn.await_count == 0
+            await _wait_for_job_done(rt.db, job_id)
+            assert learn.await_count == 1
+        finally:
+            await rt.worker.stop()
+            await rt.db.close()
+
+
+@pytest.mark.asyncio
+async def test_grace_zero_claims_once_counter_drains():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _defer_config(tmp, skip=True, grace=0.0)
+        rt = await build_runtime(cfg)
+        try:
+            learn = AsyncMock(return_value=None)
+            rt.learner.learn = learn
+            job_id = await rt.db.enqueue_job("learn_interaction", JOB_PAYLOAD)
+
+            rt.active_requests.increment()
+            rt.worker.start()
+            await asyncio.sleep(0.1)
+            assert (await _job_row(rt.db, job_id))["status"] == "pending"
+            rt.active_requests.decrement()
+            # Grace 0 must claim promptly on the next poll, with no window.
+            await _wait_for_job_done(rt.db, job_id, timeout=1.0)
+            assert learn.await_count == 1
+        finally:
+            await rt.worker.stop()
+            await rt.db.close()
+
+
+def test_upstream_idle_grace_default_is_zero():
+    assert LearningConfig().upstream_idle_grace_seconds == 0.0
+    assert AppConfig().learning.upstream_idle_grace_seconds == 0.0
