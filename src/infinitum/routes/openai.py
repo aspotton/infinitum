@@ -23,7 +23,13 @@ def _runtime(request: Request) -> Runtime:
     return request.app.state.runtime
 
 
-def _session_id(request: Request, body: dict[str, Any]) -> str:
+def _session_id(request: Request, body: dict[str, Any]) -> str | None:
+    """Return the client-supplied session id, or None when the client sent none.
+
+    A None return means "no client session"; callers that need an id must
+    generate a provenance-only id themselves rather than treating a generated
+    id as if the client had pinned a session.
+    """
     # OpenCode's OpenAI-compatible provider path commonly supplies X-Session-Id
     # / x-session-affinity; its own provider uses x-opencode-session. Prefer the
     # canonical Infinitum header. The former x-context-* name remains accepted
@@ -44,7 +50,7 @@ def _session_id(request: Request, body: dict[str, Any]) -> str:
             return str(metadata["infinitum_session_id"])
         if metadata.get("context_session_id"):
             return str(metadata["context_session_id"])
-    return new_id("ses")
+    return None
 
 
 def _latest_user(messages: list[dict[str, Any]]) -> str:
@@ -173,7 +179,8 @@ async def chat_completions(request: Request) -> Response:
 
     original_messages = body["messages"]
     model = str(body.get("model") or "")
-    session_id = _session_id(request, body)
+    client_session_id = _session_id(request, body)  # str | None - client-supplied only
+    session_id = client_session_id or new_id("ses")  # provenance id for events/audit
     request_context = runtime.request_context.resolve(request.headers)
     request_id = new_id("req")
     user_text = _latest_user(original_messages)
@@ -236,7 +243,7 @@ async def chat_completions(request: Request) -> Response:
     ours_injected: set[str] = set()
     if memory_enabled:
         compiled = await runtime.compiler.compile(
-            original_messages, request_context=request_context, session_id=session_id
+            original_messages, request_context=request_context, session_id=client_session_id
         )
         # Inject our tool defs + hint BEFORE inject(): inject copies the message
         # list and embeds compiled.text at call time, so mutating either after
