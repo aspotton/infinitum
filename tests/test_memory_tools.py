@@ -234,6 +234,77 @@ def test_injected_names_ignores_malformed_entries():
     assert memory_tools.injected_tool_names(["junk", 42]) == list(memory_tools.TOOL_NAMES)
 
 
+# --- client_tool_names --------------------------------------------------------
+
+
+def test_client_tool_names_none_and_empty():
+    assert memory_tools.client_tool_names(None) == set()
+    assert memory_tools.client_tool_names([]) == set()
+
+
+def test_client_tool_names_collects_only_function_names():
+    tools = [
+        {"type": "function", "function": {"name": "web_search"}},
+        {"type": "function", "function": {"name": 42}},
+        {"function": {}},
+        {"function": None},
+        "junk",
+        42,
+        None,
+        {"name": "flat_name"},
+    ]
+    assert memory_tools.client_tool_names(tools) == {"web_search"}
+
+
+def test_injected_names_uses_client_tool_names():
+    client_tools = [{"type": "function", "function": {"name": "infinitum_memory_get"}}]
+    assert memory_tools.injected_tool_names(client_tools) == ["infinitum_memory_search"]
+
+
+# --- is_rejectable_memory_name ------------------------------------------------
+
+
+def test_reject_hallucinated_infinitum_name():
+    ours = set(memory_tools.TOOL_NAMES)
+    assert memory_tools.is_rejectable_memory_name("infinitum_retrieve", ours, set()) is True
+
+
+def test_reject_exposed_names_are_false():
+    ours = set(memory_tools.TOOL_NAMES)
+    for name in memory_tools.TOOL_NAMES:
+        assert memory_tools.is_rejectable_memory_name(name, ours, set()) is False
+
+
+def test_reject_client_defined_infinitum_name_is_false():
+    ours = set(memory_tools.TOOL_NAMES)
+    client = {"infinitum_whatever"}
+    assert memory_tools.is_rejectable_memory_name("infinitum_whatever", ours, client) is False
+
+
+def test_reject_foreign_and_nameless_are_false():
+    ours = set(memory_tools.TOOL_NAMES)
+    for name in ("web_search", "", None, 123):
+        assert memory_tools.is_rejectable_memory_name(name, ours, set()) is False
+
+
+def test_reject_prefix_check_is_case_insensitive():
+    ours = set(memory_tools.TOOL_NAMES)
+    assert memory_tools.is_rejectable_memory_name("Infinitum_Retrieve", ours, set()) is True
+
+
+# --- build_reject_result ------------------------------------------------------
+
+
+def test_build_reject_result_round_trip():
+    exposed = list(memory_tools.TOOL_NAMES)
+    parsed = json.loads(memory_tools.build_reject_result("infinitum_retrieve", exposed))
+    assert parsed == {
+        "error": "unknown memory tool 'infinitum_retrieve'",
+        "available_memory_tools": exposed,
+        "hint": "answer from the results above, or call one of these tools",
+    }
+
+
 def test_build_tool_defs_order_and_schema():
     defs = memory_tools.build_tool_defs(list(memory_tools.TOOL_NAMES))
     assert [d["function"]["name"] for d in defs] == list(memory_tools.TOOL_NAMES)

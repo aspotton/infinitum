@@ -180,22 +180,56 @@ class ToolRuntime(Protocol):
     def db(self) -> Any: ...
 
 
+def client_tool_names(tools: list[dict] | None) -> set[str]:
+    """Collect the `function.name` strings a client request defines.
+
+    Malformed entries (non-dicts, missing keys, non-string names) are ignored.
+    """
+    names: set[str] = set()
+    if isinstance(tools, list):
+        for tool in tools:
+            try:
+                name = tool["function"]["name"]
+            except (TypeError, KeyError, IndexError):
+                continue
+            if isinstance(name, str):
+                names.add(name)
+    return names
+
+
 def injected_tool_names(body_tools: Any) -> list[str]:
     """Return our tool names safe to inject (not already defined by the client).
 
     Malformed entries in the client's tools list are ignored. We never overwrite
     or shadow a client tool of the same name.
     """
-    client_names: set[str] = set()
-    if isinstance(body_tools, list):
-        for tool in body_tools:
-            try:
-                name = tool["function"]["name"]
-            except (TypeError, KeyError, IndexError):
-                continue
-            if isinstance(name, str):
-                client_names.add(name)
+    client_names = client_tool_names(body_tools)
     return [name for name in TOOL_NAMES if name not in client_names]
+
+
+def is_rejectable_memory_name(
+    name: object, ours: set[str], client_names: set[str]
+) -> bool:
+    """True for hallucinated Infinitum tool names: our prefix, not exposed
+    this round, not defined by the client. Nameless/None calls never reject."""
+    return (
+        isinstance(name, str)
+        and name.lower().startswith("infinitum_")
+        and name not in ours
+        and name not in client_names
+    )
+
+
+def build_reject_result(name: str, exposed: list[str]) -> str:
+    """Tool-result JSON telling the model the memory tool name does not exist."""
+    return json.dumps(
+        {
+            "error": f"unknown memory tool '{name}'",
+            "available_memory_tools": exposed,
+            "hint": "answer from the results above, or call one of these tools",
+        },
+        ensure_ascii=False,
+    )
 
 
 def build_tool_defs(names: Sequence[str]) -> list[dict[str, Any]]:
