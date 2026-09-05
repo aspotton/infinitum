@@ -247,7 +247,10 @@ async def chat_completions(request: Request) -> Response:
                         text=compiled.text
                         + "\n\nDeeper detail is available via the "
                         + " and ".join(sorted(ours_injected))
-                        + " tools using the memory ids above.",
+                        + " tools using the memory ids above."
+                        + " Those are the only memory tools that exist; use them"
+                        + " for any memory lookup; never invent another memory"
+                        + " tool name.",
                     )
         body["messages"] = runtime.compiler.inject(original_messages, compiled)
     else:

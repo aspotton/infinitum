@@ -24,6 +24,8 @@ TOOL_DEFS: dict[str, dict[str, Any]] = {
             "description": (
                 "Read-only drill-down search over persistent memory. "
                 "Returns ranked memories with ids, types, topics, and content."
+                " This is the complete set of memory tools: infinitum_memory_search"
+                " and infinitum_memory_get; never call another memory tool name."
             ),
             "parameters": {
                 "type": "object",
@@ -47,6 +49,8 @@ TOOL_DEFS: dict[str, dict[str, Any]] = {
             "description": (
                 "Read-only drill-down fetch of one persistent memory by id, "
                 "including provenance event ids."
+                " This is the complete set of memory tools: infinitum_memory_search"
+                " and infinitum_memory_get; never call another memory tool name."
             ),
             "parameters": {
                 "type": "object",

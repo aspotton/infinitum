@@ -305,6 +305,36 @@ def test_build_reject_result_round_trip():
     }
 
 
+HINT_EXCLUSIVITY_CLAUSE = (
+    " Those are the only memory tools that exist; use them for any memory"
+    " lookup; never invent another memory tool name."
+)
+DEFS_COMPLETE_SET_CLAUSE = (
+    " This is the complete set of memory tools: infinitum_memory_search"
+    " and infinitum_memory_get; never call another memory tool name."
+)
+
+
+def test_tool_def_descriptions_carry_complete_set_clause():
+    defs = memory_tools.build_tool_defs(list(memory_tools.TOOL_NAMES))
+    assert len(defs) == 2
+    for tool_def in defs:
+        assert DEFS_COMPLETE_SET_CLAUSE in tool_def["function"]["description"]
+
+
+def test_compiled_block_hint_carries_exclusivity_clause():
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, [_completion("plain")])
+            response = _chat(client, "hint-excl")
+            assert response.status_code == 200
+            assert upstream.calls == 1
+            contents = [str(m.get("content", "")) for m in upstream.bodies[0]["messages"]]
+            assert any(HINT_EXCLUSIVITY_CLAUSE in c for c in contents)
+
+
 def test_build_tool_defs_order_and_schema():
     defs = memory_tools.build_tool_defs(list(memory_tools.TOOL_NAMES))
     assert [d["function"]["name"] for d in defs] == list(memory_tools.TOOL_NAMES)
