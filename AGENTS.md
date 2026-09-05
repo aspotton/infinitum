@@ -127,6 +127,10 @@ learning.py:LearningWorker._run → db.claim_job (jobs table, SQLite)
 
 Key symbols: `build_runtime` (runtime.py), `create_app` (app.py), `chat_completions` (routes/openai.py), `ContextCompiler.compile/inject` (compiler.py), `MemoryRetriever.search` (retrieval.py), `MemoryLearner.learn/_apply` (learning.py), `LearningWorker` (learning.py), durable job queue `enqueue_job/claim_job/finish_job/fail_job` (database.py).
 
+## Release notes
+
+All release changes, new-version descriptions, and feature narratives belong in `CHANGELOG.md`. The README keeps only the single `Current release: vX.Y.Z` line plus a pointer to the changelog — do not add or update version-release prose in README. Write entries in CHANGELOG.md's dash-bullet style and keep them vendor-neutral: describe server behaviors generically (for example, "OpenAI-compatible servers with automatic tool-call parsers") instead of naming specific vendor stacks.
+
 ## Testing
 
 Run from the repository root:
