@@ -18,7 +18,7 @@ flowchart TD
     K --> L[Queue durable learning job]
 ```
 
-The compiled block is designed to be cache-stable. Within one session the block is pinned byte-for-byte and only invalidated when memory or topic state actually changes, tracked by a watermark over the memories and topics tables. The memory message is injected immediately before the last user message by default (`context.inject_position: suffix`), leaving the system prompt and the conversation history ahead of it byte-identical for upstream prompt caches; `inject_position: prefix` restores injection after the leading system messages for strict chat templates.
+The compiled block is designed to be cache-stable. Within one session the block is pinned byte-for-byte and only invalidated when memory or topic state actually changes, tracked by a watermark over the memories and topics tables. The pin applies only when the client supplies a session id (session header or request metadata); a request without one is compiled fresh under a generated, provenance-only id and never enters the block cache. The memory message is injected immediately before the last user message by default (`context.inject_position: suffix`), leaving the system prompt and the conversation history ahead of it byte-identical for upstream prompt caches; `inject_position: prefix` restores injection after the leading system messages for strict chat templates.
 
 ## Server-side memory tool loop
 

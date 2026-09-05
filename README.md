@@ -37,7 +37,7 @@ V0.2.3 makes the compiled memory block cache-stable for upstream prompt caching.
 - when `memory.tools_enabled` is on, the two drill-down tool definitions are exposed statically on every memory-enabled request (unless the client defines the same names), so the tools region never flickers;
 - retrieval ranking is deterministic for equal scores by breaking ties on memory id.
 
-Sessions without a session header (`X-Infinitum-Session-ID` or aliases) get a generated id per request, so pinning only benefits clients that send one.
+Sessions without a session header (`X-Infinitum-Session-ID` or aliases) get a generated id per request used only for event provenance, so those requests never enter the pin cache and pinning only benefits clients that send one.
 
 The memory tool loop now forces a final answer round with Infinitum's tool definitions removed after its 4-round cap, fixing an empty/blank client response when an auto-parsing upstream calls the memory tools repeatedly (worst case 5 upstream calls per request).
 
