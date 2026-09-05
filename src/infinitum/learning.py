@@ -4,7 +4,8 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any
+import time
+from typing import TYPE_CHECKING, Any
 
 from .config import AppConfig
 from .database import Database
@@ -13,6 +14,9 @@ from .models import Memory, MemoryCandidate, RequestContext, TopicSummary
 from .retrieval import MemoryRetriever
 from .text import compact_whitespace, lexical_similarity
 from .upstream import UpstreamClient, extract_nonstream_assistant
+
+if TYPE_CHECKING:
+    from .runtime import ActiveRequestCounter
 
 log = logging.getLogger(__name__)
 
@@ -555,10 +559,17 @@ Small current-topic context sample:
 
 
 class LearningWorker:
-    def __init__(self, db: Database, learner: MemoryLearner, config: AppConfig):
+    def __init__(
+        self,
+        db: Database,
+        learner: MemoryLearner,
+        config: AppConfig,
+        active_requests: ActiveRequestCounter | None = None,
+    ):
         self.db = db
         self.learner = learner
         self.config = config
+        self._active_requests = active_requests
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
@@ -576,6 +587,27 @@ class LearningWorker:
 
     async def _run(self) -> None:
         while not self._stop.is_set():
+            # Defer job START only; a check->claim race with a request
+            # starting right now is harmless. The queue is durable, so the
+            # skipped work runs on a later poll once the upstream has been
+            # idle for the full grace window.
+            counter = self._active_requests
+            if self.config.learning.skip_when_upstream_busy and counter is not None:
+                grace = self.config.learning.upstream_idle_grace_seconds
+                busy = counter.value > 0 or (
+                    grace > 0
+                    and time.monotonic() - counter.last_busy < grace
+                )
+                if busy:
+                    log.debug("deferring learning job start; upstream busy or within idle grace")
+                    try:
+                        await asyncio.wait_for(
+                            self._stop.wait(),
+                            timeout=self.config.learning.poll_interval_seconds,
+                        )
+                    except TimeoutError:
+                        pass
+                    continue
             job = await self.db.claim_job()
             if not job:
                 try:

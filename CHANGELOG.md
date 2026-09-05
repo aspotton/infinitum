@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.6
+
+- Added `learning.skip_when_upstream_busy` (default `false`): the learning worker no longer claims new jobs while Infinitum is actively proxying a request to the upstream.
+- Added `learning.upstream_idle_grace_seconds` (default `0`): keeps learning deferred until the upstream has been continuously idle for that long after traffic drains; any new foreground request restarts the window.
+- Deferral happens only at job boundaries — an in-flight extraction or topic-summary operation is never interrupted.
+- Deferred learning work stays in the durable job queue, so nothing is lost while the worker waits for the upstream to go idle.
+- `GET /health` now reports a live `active_requests` count showing why the learning worker is idle.
+- Both options default to off, so unset configurations keep byte-identical prior behavior.
+- Added regression tests for the defer/drain paths and idle-grace windows; the full suite now covers 135 tests.
+
 ## 0.2.2
 
 - Fixed lost memory-learning turns when an OpenAI-compatible server returns `finish_reason="tool_calls"` with empty assistant content.

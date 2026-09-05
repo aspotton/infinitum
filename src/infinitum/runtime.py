@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 from .compiler import ContextCompiler
 from .config import AppConfig
@@ -11,6 +12,35 @@ from .request_context import RequestContextResolver
 from .retrieval import MemoryRetriever
 from .tokenizer import TokenCounter
 from .upstream import UpstreamClient
+
+
+class ActiveRequestCounter:
+    """Count of foreground requests actively forwarded to the upstream.
+
+    ``last_busy`` stamps the most recent foreground activity so the
+    idle-grace window can defer learning until the upstream has been quiet
+    long enough. Single event loop, no awaits between increment and read, so
+    a plain int suffices. Decrement saturates at zero so a double-decrement
+    can never permanently starve deferral that reads this value, and a
+    no-op decrement at zero does not fake activity.
+    """
+
+    def __init__(self) -> None:
+        self._n = 0
+        self.last_busy = time.monotonic()
+
+    @property
+    def value(self) -> int:
+        return self._n
+
+    def increment(self) -> None:
+        self._n += 1
+        self.last_busy = time.monotonic()
+
+    def decrement(self) -> None:
+        if self._n:
+            self._n -= 1
+            self.last_busy = time.monotonic()
 
 
 @dataclass(slots=True)
@@ -24,6 +54,7 @@ class Runtime:
     compiler: ContextCompiler
     learner: MemoryLearner
     worker: LearningWorker
+    active_requests: ActiveRequestCounter = field(default_factory=ActiveRequestCounter)
 
 
 async def build_runtime(config: AppConfig) -> Runtime:
@@ -37,7 +68,8 @@ async def build_runtime(config: AppConfig) -> Runtime:
     learner = MemoryLearner(db, retriever, embeddings, upstream, config)
     if config.learning.enabled and config.learning.topic_summaries:
         await db.recover_dirty_topic_summary_jobs(default_model=config.learning.model)
-    worker = LearningWorker(db, learner, config)
+    active_requests = ActiveRequestCounter()
+    worker = LearningWorker(db, learner, config, active_requests)
     return Runtime(
         config,
         db,
@@ -48,4 +80,5 @@ async def build_runtime(config: AppConfig) -> Runtime:
         compiler,
         learner,
         worker,
+        active_requests,
     )

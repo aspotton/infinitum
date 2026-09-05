@@ -38,16 +38,20 @@ Preserve these unless a deliberate architecture change is documented and tested:
 
 Primary code lives in `src/infinitum/`.
 
-- `app.py` — FastAPI application construction/lifespan
+- `runtime.py` — DI hub: `build_runtime()` constructs Database, EmbeddingClient, UpstreamClient, Retriever, Compiler, Learner, RequestContextResolver, TokenCounter; also runs startup dirty-topic recovery. Routes access this via `app.state.runtime`.
+- `app.py` — thin FastAPI construction/lifespan (starts/stops the learning worker)
+- `__main__.py` — `infinitum` CLI entrypoint (argparse + `INFINITUM_CONFIG` + uvicorn factory)
 - `routes/openai.py` — OpenAI-compatible proxy endpoints and per-request controls
 - `routes/memory.py` — memory management/search endpoints
 - `routes/admin.py` — health, event, topic, and request-context diagnostics
-- `config.py` — configuration models and loading
-- `database.py` — SQLite schema, persistence, durable jobs, provenance
+- `config.py` — configuration models and loading (incl. legacy-DB reuse)
+- `database.py` — SQLite schema, persistence, durable jobs, provenance (largest module)
 - `request_context.py` — user/project/CWD header resolution
 - `retrieval.py` — hybrid scoring and context affinity
 - `compiler.py` — token-aware memory selection/rendering/injection
 - `learning.py` — extraction, reinforcement, supersession, incremental topic summaries, worker
+- `text.py` — shared scoring primitives: normalization, lexical/topic similarity, freshness decay (used by retrieval and reinforcement guards)
+- `tokenizer.py` — `TokenCounter` feeding the compiler token budget
 - `embeddings.py` — OpenAI-compatible embedding client
 - `upstream.py` — transparent OpenAI-compatible upstream transport
 - `models.py` — event/memory/request-context models
@@ -97,6 +101,32 @@ Topic summaries are incremental: dirty topic deltas are coalesced, then an exist
 
 An empty final response from a reasoning/local model must not create a retry storm. Topic summaries should degrade to a bounded deterministic active-memory representation; detailed memories remain authoritative. Vendor-specific background request knobs belong under `learning.extra_body`, never in foreground proxy requests.
 
+Background learning may optionally defer job start while foreground proxy requests are in flight via `learning.skip_when_upstream_busy`; deferred work stays in the durable job queue (deferred, not dropped) and consumes no attempt count. Additionally, `learning.upstream_idle_grace_seconds` (default 0) keeps claims deferred until the upstream has been continuously idle for that long since the last foreground activity, with any new request restarting the window. The active-request counter lives in `runtime.py` and is instrumented only in `routes/openai.py` around proxied upstream calls; the learner's own upstream calls bypass it by design, so the worker cannot starve itself.
+
+## Code map
+
+Foreground path:
+
+```
+pyproject [project.scripts] → __main__.py:main → uvicorn(create_app)
+app.py:create_app → runtime.py:build_runtime → app.state.runtime; worker.start()
+routes/openai.py:chat_completions → request_context.resolve → compiler.compile
+  → retrieval.search → compiler.inject → db.add_request_memory → upstream
+  → _record_completion → db.add_event + db.enqueue_job("learn_interaction")
+```
+
+Background path:
+
+```
+learning.py:LearningWorker._run → db.claim_job (jobs table, SQLite)
+  → MemoryLearner.learn → retriever.search (bounded nearby set)
+  → LLM proposes → _apply (deterministic guards; text.py similarity) → db.mark_topic_dirty
+  → refresh_topic_summary → _deterministic_topic_fallback on empty output
+  → db.finish_job / db.fail_job (backoff 2**attempts, capped 60s)
+```
+
+Key symbols: `build_runtime` (runtime.py), `create_app` (app.py), `chat_completions` (routes/openai.py), `ContextCompiler.compile/inject` (compiler.py), `MemoryRetriever.search` (retrieval.py), `MemoryLearner.learn/_apply` (learning.py), `LearningWorker` (learning.py), durable job queue `enqueue_job/claim_job/finish_job/fail_job` (database.py).
+
 ## Testing
 
 Run from the repository root:
@@ -112,6 +142,8 @@ ruff check .
 ```
 
 Any change to request headers, database migration, reinforcement, retrieval limits, streaming, or background learning should include or update focused tests.
+
+Test conventions: flat `tests/` (12 files, no conftest, no shared helpers). DB isolation via `tempfile.TemporaryDirectory()`; upstream faked either by `httpx.MockTransport` handler (foreground proxy) or `AsyncMock` on `learning_chat_completion`/`retriever.search` (background). Tests construct `AppConfig()` directly, mutate fields, call `create_app(cfg)`, and wrap in `TestClient`.
 
 Before packaging a release, verify at minimum:
 

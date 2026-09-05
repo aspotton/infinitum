@@ -69,6 +69,15 @@ learning:
   extra_body: {}
   poll_interval_seconds: 1.0
   max_attempts: 5
+  # When true, the learning worker delays STARTING background jobs while a
+  # foreground request is actively being proxied upstream. Jobs stay pending in
+  # the durable queue and run once the proxy is idle. Default false: learning
+  # may run concurrently with proxy traffic.
+  skip_when_upstream_busy: false
+  # After the upstream goes idle, defer claims until it has been continuously
+  # idle this long; any new foreground request restarts the window. 0 disables
+  # the grace period. Requires skip_when_upstream_busy: true.
+  upstream_idle_grace_seconds: 0.0
 
   # Topic summaries are incremental in v0.2.x (introduced in v0.1.2). Memory changes are accumulated
   # and summarized once after a quiet period, or sooner after enough changes.

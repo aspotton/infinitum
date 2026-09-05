@@ -74,6 +74,25 @@ def _safe_debug_header(value: str) -> str:
     return value.encode("ascii", errors="ignore").decode("ascii")[:240]
 
 
+async def _counted(stream: AsyncIterator[bytes], counter: Any) -> AsyncIterator[bytes]:
+    # Decrement via generator finally: covers normal [DONE] completion, client
+    # disconnect (GeneratorExit from the ASGI server's aclose()), and mid-stream
+    # errors. Runs after the inner on_complete -> enqueue, so the follow-up
+    # learning job is queued while the counter is still held.
+    try:
+        async for chunk in stream:
+            yield chunk
+    finally:
+        counter.decrement()
+
+
+async def _empty_stream() -> AsyncIterator[bytes]:
+    # Async no-op stream: _counted's `async for` cannot wrap the sync
+    # iter(()) residual fallback, so the residual path hands over this instead.
+    if False:
+        yield b""
+
+
 def _strip_injected_tools(body: dict[str, Any], names: set[str]) -> None:
     """Remove the tool defs we injected from the forwarded body, in place.
 
@@ -170,6 +189,7 @@ async def _record_completion(
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> Response:
     runtime = _runtime(request)
+    counter = runtime.active_requests
     try:
         body = await request.json()
     except Exception as exc:
@@ -324,95 +344,253 @@ async def chat_completions(request: Request) -> Response:
         # finally: suppressed iterations never reach a generator, so they never
         # record. The loop runs inside the handler; only the terminal
         # iteration's bytes ever reach the client.
+        counter.increment()
+        handed_off = False
+        try:
+            tool_rounds = 0
+            final_iterator: AsyncIterator[bytes] | None = None
+            ours_active: set[str] = set(ours_injected)
+            # One extra round past the tool-round cap: suppress rounds are now
+            # reachable on any request (static tool exposure), so the cap can
+            # actually fire; the forced round must answer, never blank the client.
+            for round_no in range(memory_tools.MAX_ITERATIONS + 1):
+                is_forced = round_no == memory_tools.MAX_ITERATIONS
+                if is_forced and ours_injected:
+                    # Past the cap: force a terminal ANSWER round. Stripping defs
+                    # alone is insufficient for servers with an automatic tool-call
+                    # parser (vLLM/Qwen) that re-emit our tool names unprompted.
+                    # tool_choice:"none" (OpenAI spec, honored by the verified vLLM
+                    # upstream) forbids tool calls so the round must produce text.
+                    # Keep our names in ours_active so a stray call that a server
+                    # emits anyway is OUR loop-capped call to suppress, not a
+                    # foreign tool to forward to the client.
+                    _strip_injected_tools(body, ours_injected)
+                    body["tool_choice"] = "none"
+                try:
+                    iterator = await runtime.upstream.stream_bytes(
+                        "chat/completions",
+                        body,
+                        request.headers,
+                        None,
+                        request_context=request_context,
+                    )
+                except httpx.HTTPStatusError as exc:
+                    response = exc.response
+                    return Response(
+                        content=response.content,
+                        status_code=response.status_code,
+                        media_type=response.headers.get("content-type", "application/json"),
+                        headers=debug_headers,
+                    )
+
+                classifier = memory_tools.StreamClassifier(
+                    ours_active, client_names=client_names, guard=guard_active
+                )
+                accum = bytearray()
+                exhausted = True
+                try:
+                    async for chunk in iterator:
+                        accum.extend(chunk)
+                        classifier.feed(chunk)
+                        if classifier.decide() == "passthrough":
+                            exhausted = False
+                            break
+                except httpx.RequestError as exc:
+                    raise HTTPException(502, f"upstream connection failed: {exc}") from exc
+
+                decision = "passthrough" if not exhausted else classifier.finish()
+                if decision in ("passthrough", "replay"):
+                    live: AsyncIterator[bytes] | None = iterator
+                    if decision == "replay":
+                        # Drain the rest here (its finally closes the upstream
+                        # response); the full bytes replay from accum below.
+                        try:
+                            async for chunk in iterator:
+                                accum.extend(chunk)
+                        except httpx.RequestError as exc:
+                            raise HTTPException(
+                                502, f"upstream connection failed: {exc}"
+                            ) from exc
+                        live = None
+
+                    async def stream_out(
+                        accum=accum, live=live
+                    ) -> AsyncIterator[bytes]:  # default-args pin this iteration's state
+                        try:
+                            if accum:
+                                yield bytes(accum)
+                            if live is not None:
+                                async for chunk in live:
+                                    accum.extend(chunk)
+                                    yield chunk
+                        finally:
+                            await completed(bytes(accum))
+
+                    final_iterator = stream_out()
+                    break
+
+                tool_rounds += 1
+                calls = memory_tools.reassemble_stream_tool_calls(classifier.calls)
+                assistant_content, _ = extract_stream_assistant(classifier.collected_bytes())
+                assistant_message: dict[str, Any] = {"role": "assistant"}
+                if assistant_content:
+                    assistant_message["content"] = assistant_content
+                assistant_message["tool_calls"] = calls
+                body["messages"] = body["messages"] + [assistant_message]
+                for call in calls:
+                    function = call.get("function") or {}
+                    name = function.get("name")
+                    arguments = function.get("arguments", "")
+                    extra: dict[str, Any] = {}
+                    if name in ours_active:
+                        result = await memory_tools.execute(
+                            name, arguments, runtime, request_context
+                        )
+                    else:
+                        # Hallucinated memory-tool name: NEVER forwarded to the
+                        # client. The model is told the real tool set and the loop
+                        # continues (same rule as the non-stream path).
+                        result = memory_tools.build_reject_result(name, sorted(ours_injected))
+                        reject_count += 1
+                        extra = {"rejected": True, "result": result}
+                    await runtime.db.add_event(
+                        Event(
+                            session_id=session_id,
+                            user_id=request_context.user_id,
+                            project_id=request_context.project_id,
+                            cwd=request_context.cwd,
+                            request_id=request_id,
+                            event_type="memory.tool_call",
+                            role="tool",
+                            content=arguments,
+                            metadata={
+                                "name": name,
+                                "result_chars": len(result),
+                                "tool_call_id": call.get("id"),
+                                "assistant_message": assistant_message,
+                                **extra,
+                            },
+                        )
+                    )
+                    body["messages"] = body["messages"] + [
+                        {"role": "tool", "tool_call_id": call.get("id"), "content": result}
+                    ]
+
+            if debug and (ours_injected or tool_rounds):
+                debug_headers["x-infinitum-memory-tool-calls"] = str(tool_rounds)
+            if debug and reject_count:
+                debug_headers["x-infinitum-memory-tool-rejects"] = str(reject_count)
+            if final_iterator is None:
+                # Residual: only reachable if the server ignored
+                # tool_choice:"none" AND the forced round emitted a suppressible
+                # all-ours tool-call stream with no content. Keep the empty-stream
+                # fallback; re-streaming synthesis is deliberately not attempted.
+                final_iterator = _empty_stream()
+            final_iterator = _counted(final_iterator, counter)
+            handed_off = True
+            return StreamingResponse(
+                final_iterator, media_type="text/event-stream", headers=debug_headers
+            )
+        finally:
+            if not handed_off:
+                counter.decrement()
+
+    counter.increment()
+    try:
         tool_rounds = 0
-        final_iterator: AsyncIterator[bytes] | None = None
+        synthesized = False
         ours_active: set[str] = set(ours_injected)
-        # One extra round past the tool-round cap: suppress rounds are now
-        # reachable on any request (static tool exposure), so the cap can
-        # actually fire; the forced round must answer, never blank the client.
         for round_no in range(memory_tools.MAX_ITERATIONS + 1):
             is_forced = round_no == memory_tools.MAX_ITERATIONS
             if is_forced and ours_injected:
-                # Past the cap: force a terminal ANSWER round. Stripping defs
-                # alone is insufficient for servers with an automatic tool-call
-                # parser (vLLM/Qwen) that re-emit our tool names unprompted.
+                # Past the cap: force a terminal ANSWER round. Stripping defs alone
+                # is insufficient for servers with an automatic tool-call parser
+                # (vLLM/Qwen) that re-emit our tool names unprompted.
                 # tool_choice:"none" (OpenAI spec, honored by the verified vLLM
-                # upstream) forbids tool calls so the round must produce text.
-                # Keep our names in ours_active so a stray call that a server
-                # emits anyway is OUR loop-capped call to suppress, not a
-                # foreign tool to forward to the client.
+                # upstream) forbids tool calls so the round must produce text. Keep
+                # our names in ours_active so a stray call that a server emits
+                # anyway is OUR loop-capped call to suppress, not a foreign tool to
+                # forward to the client.
                 _strip_injected_tools(body, ours_injected)
                 body["tool_choice"] = "none"
             try:
-                iterator = await runtime.upstream.stream_bytes(
+                upstream = await runtime.upstream.request(
+                    "POST",
                     "chat/completions",
-                    body,
-                    request.headers,
-                    None,
+                    incoming_headers=request.headers,
+                    json_body=body,
                     request_context=request_context,
                 )
-            except httpx.HTTPStatusError as exc:
-                response = exc.response
-                return Response(
-                    content=response.content,
-                    status_code=response.status_code,
-                    media_type=response.headers.get("content-type", "application/json"),
-                    headers=debug_headers,
-                )
-
-            classifier = memory_tools.StreamClassifier(
-                ours_active, client_names=client_names, guard=guard_active
-            )
-            accum = bytearray()
-            exhausted = True
-            try:
-                async for chunk in iterator:
-                    accum.extend(chunk)
-                    classifier.feed(chunk)
-                    if classifier.decide() == "passthrough":
-                        exhausted = False
-                        break
             except httpx.RequestError as exc:
                 raise HTTPException(502, f"upstream connection failed: {exc}") from exc
 
-            decision = "passthrough" if not exhausted else classifier.finish()
-            if decision in ("passthrough", "replay"):
-                live: AsyncIterator[bytes] | None = iterator
-                if decision == "replay":
-                    # Drain the rest here (its finally closes the upstream
-                    # response); the full bytes replay from accum below.
-                    try:
-                        async for chunk in iterator:
-                            accum.extend(chunk)
-                    except httpx.RequestError as exc:
-                        raise HTTPException(
-                            502, f"upstream connection failed: {exc}"
-                        ) from exc
-                    live = None
+            if upstream.status_code >= 400:
+                break  # terminal: forward verbatim, no recording (mirrors the old guard)
 
-                async def stream_out(
-                    accum=accum, live=live
-                ) -> AsyncIterator[bytes]:  # default-args pin this iteration's state
-                    try:
-                        if accum:
-                            yield bytes(accum)
-                        if live is not None:
-                            async for chunk in live:
-                                accum.extend(chunk)
-                                yield chunk
-                    finally:
-                        await completed(bytes(accum))
+            try:
+                parsed = upstream.json()
+            except Exception:
+                parsed = None  # terminal; records ("", {}) like the old fallback
 
-                final_iterator = stream_out()
+            if is_forced and parsed is not None:
+                # Defensive: a server that ignored tool_choice:"none" can still
+                # blank the round. Synthesize so the terminal branch below records
+                # and forwards a non-empty answer, never null content or a dangling
+                # tool_call (the calls list below is recomputed from the
+                # synthesized message, which ends the loop).
+                try:
+                    forced_blank = not extract_nonstream_assistant(parsed)[0].strip()
+                except Exception:
+                    forced_blank = True
+                if forced_blank:
+                    parsed = _synthesize_from_tool_results(body, model)
+                    synthesized = True
+
+            calls = [
+                tool_call
+                for choice in ((parsed or {}).get("choices") or [])[:1]
+                for tool_call in (choice.get("message") or {}).get("tool_calls") or []
+            ]
+            classified = parsed is not None and memory_tools.classify_tool_calls(calls, ours_active)
+            # Partition rule: a non-forced round is a REJECT round only when every
+            # call is one of ours or a hallucinated infinitum_* name. Any
+            # client-defined/foreign name keeps the terminal-forward contract
+            # verbatim (never swallow a client's tool contract).
+            reject_round = (
+                not classified
+                and guard_active
+                and not is_forced
+                and bool(calls)
+                and all(
+                    (name := (call.get("function") or {}).get("name")) in ours_active
+                    or memory_tools.is_rejectable_memory_name(name, ours_active, client_names)
+                    for call in calls
+                )
+            )
+            if not (classified or reject_round):
+                try:
+                    assistant_text, assistant_meta = extract_nonstream_assistant(parsed)
+                except Exception:
+                    assistant_text, assistant_meta = "", {}
+                await _record_completion(
+                    runtime,
+                    request_id=request_id,
+                    session_id=session_id,
+                    user_event_id=user_event.id,
+                    user_text=user_text,
+                    assistant_text=assistant_text,
+                    assistant_metadata=assistant_meta,
+                    model=model,
+                    learning_enabled=learning_enabled,
+                    request_context=request_context,
+                )
                 break
 
             tool_rounds += 1
-            calls = memory_tools.reassemble_stream_tool_calls(classifier.calls)
-            assistant_content, _ = extract_stream_assistant(classifier.collected_bytes())
-            assistant_message: dict[str, Any] = {"role": "assistant"}
-            if assistant_content:
-                assistant_message["content"] = assistant_content
-            assistant_message["tool_calls"] = calls
+            assistant_message = (parsed.get("choices") or [{}])[0].get("message") or {
+                "role": "assistant",
+                "tool_calls": calls,
+            }
             body["messages"] = body["messages"] + [assistant_message]
             for call in calls:
                 function = call.get("function") or {}
@@ -420,13 +598,10 @@ async def chat_completions(request: Request) -> Response:
                 arguments = function.get("arguments", "")
                 extra: dict[str, Any] = {}
                 if name in ours_active:
-                    result = await memory_tools.execute(
-                        name, arguments, runtime, request_context
-                    )
+                    result = await memory_tools.execute(name, arguments, runtime, request_context)
                 else:
-                    # Hallucinated memory-tool name: NEVER forwarded to the
-                    # client. The model is told the real tool set and the loop
-                    # continues (same rule as the non-stream path).
+                    # Hallucinated memory-tool name: NEVER forwarded to the client.
+                    # The model is told the real tool set and the loop continues.
                     result = memory_tools.build_reject_result(name, sorted(ours_injected))
                     reject_count += 1
                     extra = {"rejected": True, "result": result}
@@ -452,169 +627,26 @@ async def chat_completions(request: Request) -> Response:
                 body["messages"] = body["messages"] + [
                     {"role": "tool", "tool_call_id": call.get("id"), "content": result}
                 ]
-
         if debug and (ours_injected or tool_rounds):
             debug_headers["x-infinitum-memory-tool-calls"] = str(tool_rounds)
         if debug and reject_count:
             debug_headers["x-infinitum-memory-tool-rejects"] = str(reject_count)
-        if final_iterator is None:
-            # Residual: only reachable if the server ignored
-            # tool_choice:"none" AND the forced round emitted a suppressible
-            # all-ours tool-call stream with no content. Keep the empty-stream
-            # fallback; re-streaming synthesis is deliberately not attempted.
-            final_iterator = iter(())
-        return StreamingResponse(
-            final_iterator, media_type="text/event-stream", headers=debug_headers
-        )
 
-    tool_rounds = 0
-    synthesized = False
-    ours_active: set[str] = set(ours_injected)
-    for round_no in range(memory_tools.MAX_ITERATIONS + 1):
-        is_forced = round_no == memory_tools.MAX_ITERATIONS
-        if is_forced and ours_injected:
-            # Past the cap: force a terminal ANSWER round. Stripping defs alone
-            # is insufficient for servers with an automatic tool-call parser
-            # (vLLM/Qwen) that re-emit our tool names unprompted.
-            # tool_choice:"none" (OpenAI spec, honored by the verified vLLM
-            # upstream) forbids tool calls so the round must produce text. Keep
-            # our names in ours_active so a stray call that a server emits
-            # anyway is OUR loop-capped call to suppress, not a foreign tool to
-            # forward to the client.
-            _strip_injected_tools(body, ours_injected)
-            body["tool_choice"] = "none"
-        try:
-            upstream = await runtime.upstream.request(
-                "POST",
-                "chat/completions",
-                incoming_headers=request.headers,
-                json_body=body,
-                request_context=request_context,
+        if synthesized:
+            return Response(
+                content=json.dumps(parsed).encode(),
+                status_code=200,
+                media_type="application/json",
+                headers=debug_headers,
             )
-        except httpx.RequestError as exc:
-            raise HTTPException(502, f"upstream connection failed: {exc}") from exc
-
-        if upstream.status_code >= 400:
-            break  # terminal: forward verbatim, no recording (mirrors the old guard)
-
-        try:
-            parsed = upstream.json()
-        except Exception:
-            parsed = None  # terminal; records ("", {}) like the old fallback
-
-        if is_forced and parsed is not None:
-            # Defensive: a server that ignored tool_choice:"none" can still
-            # blank the round. Synthesize so the terminal branch below records
-            # and forwards a non-empty answer, never null content or a dangling
-            # tool_call (the calls list below is recomputed from the
-            # synthesized message, which ends the loop).
-            try:
-                forced_blank = not extract_nonstream_assistant(parsed)[0].strip()
-            except Exception:
-                forced_blank = True
-            if forced_blank:
-                parsed = _synthesize_from_tool_results(body, model)
-                synthesized = True
-
-        calls = [
-            tool_call
-            for choice in ((parsed or {}).get("choices") or [])[:1]
-            for tool_call in (choice.get("message") or {}).get("tool_calls") or []
-        ]
-        classified = parsed is not None and memory_tools.classify_tool_calls(calls, ours_active)
-        # Partition rule: a non-forced round is a REJECT round only when every
-        # call is one of ours or a hallucinated infinitum_* name. Any
-        # client-defined/foreign name keeps the terminal-forward contract
-        # verbatim (never swallow a client's tool contract).
-        reject_round = (
-            not classified
-            and guard_active
-            and not is_forced
-            and bool(calls)
-            and all(
-                (name := (call.get("function") or {}).get("name")) in ours_active
-                or memory_tools.is_rejectable_memory_name(name, ours_active, client_names)
-                for call in calls
-            )
-        )
-        if not (classified or reject_round):
-            try:
-                assistant_text, assistant_meta = extract_nonstream_assistant(parsed)
-            except Exception:
-                assistant_text, assistant_meta = "", {}
-            await _record_completion(
-                runtime,
-                request_id=request_id,
-                session_id=session_id,
-                user_event_id=user_event.id,
-                user_text=user_text,
-                assistant_text=assistant_text,
-                assistant_metadata=assistant_meta,
-                model=model,
-                learning_enabled=learning_enabled,
-                request_context=request_context,
-            )
-            break
-
-        tool_rounds += 1
-        assistant_message = (parsed.get("choices") or [{}])[0].get("message") or {
-            "role": "assistant",
-            "tool_calls": calls,
-        }
-        body["messages"] = body["messages"] + [assistant_message]
-        for call in calls:
-            function = call.get("function") or {}
-            name = function.get("name")
-            arguments = function.get("arguments", "")
-            extra: dict[str, Any] = {}
-            if name in ours_active:
-                result = await memory_tools.execute(name, arguments, runtime, request_context)
-            else:
-                # Hallucinated memory-tool name: NEVER forwarded to the client.
-                # The model is told the real tool set and the loop continues.
-                result = memory_tools.build_reject_result(name, sorted(ours_injected))
-                reject_count += 1
-                extra = {"rejected": True, "result": result}
-            await runtime.db.add_event(
-                Event(
-                    session_id=session_id,
-                    user_id=request_context.user_id,
-                    project_id=request_context.project_id,
-                    cwd=request_context.cwd,
-                    request_id=request_id,
-                    event_type="memory.tool_call",
-                    role="tool",
-                    content=arguments,
-                    metadata={
-                        "name": name,
-                        "result_chars": len(result),
-                        "tool_call_id": call.get("id"),
-                        "assistant_message": assistant_message,
-                        **extra,
-                    },
-                )
-            )
-            body["messages"] = body["messages"] + [
-                {"role": "tool", "tool_call_id": call.get("id"), "content": result}
-            ]
-    if debug and (ours_injected or tool_rounds):
-        debug_headers["x-infinitum-memory-tool-calls"] = str(tool_rounds)
-    if debug and reject_count:
-        debug_headers["x-infinitum-memory-tool-rejects"] = str(reject_count)
-
-    if synthesized:
         return Response(
-            content=json.dumps(parsed).encode(),
-            status_code=200,
-            media_type="application/json",
-            headers=debug_headers,
+            content=upstream.content,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type", "application/json"),
+            headers=_response_headers(upstream, debug_headers),
         )
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        media_type=upstream.headers.get("content-type", "application/json"),
-        headers=_response_headers(upstream, debug_headers),
-    )
+    finally:
+        counter.decrement()
 
 
 @router.get("/v1/models")
