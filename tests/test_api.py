@@ -195,3 +195,63 @@ def test_tools_array_is_byte_identical_across_turns():
     assert json.dumps(captured[1]["tools"], sort_keys=True) == json.dumps(
         captured[0]["tools"], sort_keys=True
     )
+
+
+def test_headerless_requests_do_not_pin_cache():
+    captured: list[dict] = []
+    with tempfile.TemporaryDirectory() as tmp, _capture_app(tmp, captured) as client:
+        client.post(
+            "/memory",
+            json={
+                "memory_type": "decision",
+                "topic": "database",
+                "content": "PostgreSQL 17 is the current database standard.",
+                "importance": 1.0,
+                "confidence": 1.0,
+            },
+        )
+        # Headerless turns hand compile() a None session id, so the cache stays empty.
+        for _ in range(2):
+            client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [
+                        {"role": "user", "content": "What database standard do we use?"}
+                    ],
+                },
+            )
+        assert len(client.app.state.runtime.compiler._session_cache) == 0
+        # Provenance is still recorded: each headerless request got a ses_ id.
+        events = client.get("/events").json()
+        assert events and all(str(e["session_id"]).startswith("ses_") for e in events)
+
+
+def test_session_header_pins_one_entry():
+    captured: list[dict] = []
+    with tempfile.TemporaryDirectory() as tmp, _capture_app(tmp, captured) as client:
+        client.post(
+            "/memory",
+            json={
+                "memory_type": "decision",
+                "topic": "database",
+                "content": "PostgreSQL 17 is the current database standard.",
+                "importance": 1.0,
+                "confidence": 1.0,
+            },
+        )
+        headers = {"X-Infinitum-Session-ID": "pin-test"}
+        for _ in range(2):
+            client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [
+                        {"role": "user", "content": "What database standard do we use?"}
+                    ],
+                },
+                headers=headers,
+            )
+        cache = client.app.state.runtime.compiler._session_cache
+        # No user header -> resolved user/project are empty strings in the key.
+        assert len(cache) == 1 and ("pin-test", "", "") in cache
