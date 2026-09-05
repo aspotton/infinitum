@@ -23,7 +23,13 @@ def _runtime(request: Request) -> Runtime:
     return request.app.state.runtime
 
 
-def _session_id(request: Request, body: dict[str, Any]) -> str:
+def _session_id(request: Request, body: dict[str, Any]) -> str | None:
+    """Return the client-supplied session id, or None when the client sent none.
+
+    A None return means "no client session"; callers that need an id must
+    generate a provenance-only id themselves rather than treating a generated
+    id as if the client had pinned a session.
+    """
     # OpenCode's OpenAI-compatible provider path commonly supplies X-Session-Id
     # / x-session-affinity; its own provider uses x-opencode-session. Prefer the
     # canonical Infinitum header. The former x-context-* name remains accepted
@@ -44,7 +50,7 @@ def _session_id(request: Request, body: dict[str, Any]) -> str:
             return str(metadata["infinitum_session_id"])
         if metadata.get("context_session_id"):
             return str(metadata["context_session_id"])
-    return new_id("ses")
+    return None
 
 
 def _latest_user(messages: list[dict[str, Any]]) -> str:
