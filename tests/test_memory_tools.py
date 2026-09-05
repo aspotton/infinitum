@@ -509,9 +509,12 @@ def test_qa_g_get_unknown_id_error_result_roundtrip():
             assert sum(e["event_type"] == "memory.tool_call" for e in events) == 1
 
 
-def test_qa_h_four_round_cap_forwards_last_unrecorded():
+def test_qa_h_four_round_cap_forces_terminal_answer():
+    # Past the tool-round cap the proxy must answer, not forward the last
+    # internal tool-call message (content=null == blank client response).
     call = ("infinitum_memory_search", '{"query": "db"}', "call_h")
     replies = [_tool_reply([call]) for _ in range(memory_tools.MAX_ITERATIONS)]
+    replies.append(_completion("PostgreSQL 17 it is."))
     with tempfile.TemporaryDirectory() as tmp:
         app = _chat_app(tmp)
         with TestClient(app) as client:
@@ -520,9 +523,12 @@ def test_qa_h_four_round_cap_forwards_last_unrecorded():
             response = _chat(client, "qa-h")
             assert response.status_code == 200
             assert response.json() == replies[-1]
-            assert upstream.calls == memory_tools.MAX_ITERATIONS
+            assert upstream.calls == memory_tools.MAX_ITERATIONS + 1
+            last_names = {t["function"]["name"] for t in upstream.bodies[-1].get("tools", [])}
+            assert not last_names & set(memory_tools.TOOL_NAMES)
             events = _events(client, "qa-h")
-            assert not any(e["event_type"] == "message.assistant" for e in events)
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert [e["content"] for e in assistants] == ["PostgreSQL 17 it is."]
             assert sum(e["event_type"] == "memory.tool_call" for e in events) == 4
 
 
@@ -876,6 +882,42 @@ def test_qa_m_client_tool_stream_passes_through_intact():
             assert response.content == b"".join(stream)
             assert '"get_weather"' in response.content.decode()
             assert upstream.calls == 1
+
+
+def test_qa_t_stream_round_cap_forces_answer_not_empty_stream():
+    # Static tool-def exposure made N consecutive suppress rounds reachable on
+    # any request (an auto-parsing upstream may call our tools unprompted).
+    # Past the cap the client must receive a real answer, never a blank reply:
+    # the old code emitted a zero-byte SSE stream (final_iterator = iter(())).
+    tool_rounds = [
+        [
+            _tool_chunk(0, f"call_t{i}", "infinitum_memory_search", '{"query": "db"}'),
+            _finish_chunk("tool_calls"),
+            _DONE,
+        ]
+        for i in range(memory_tools.MAX_ITERATIONS)
+    ]
+    final_round = [_content_chunk("PostgreSQL 17."), _finish_chunk("stop"), _DONE]
+    replies = [(round_bytes, None) for round_bytes in tool_rounds]
+    replies.append((final_round, None))
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, replies)
+            response = _chat(client, "qa-t", extra={"stream": True})
+            assert response.status_code == 200
+            text = response.content.decode()
+            assert "PostgreSQL 17." in text
+            assert "tool_calls" not in text
+            assert text.rstrip().endswith("data: [DONE]")
+            assert upstream.calls == memory_tools.MAX_ITERATIONS + 1
+            last_names = [t["function"]["name"] for t in upstream.bodies[-1].get("tools", [])]
+            assert not set(last_names) & set(memory_tools.TOOL_NAMES)
+            events = _events(client, "qa-t")
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1
+            assert assistants[0]["content"] == "PostgreSQL 17."
 
 
 def test_qa_s_query_from_messages_truncates_tool_blobs():

@@ -195,7 +195,7 @@ When enabled, Infinitum appends two function tools to the client's tool list on 
 
 The tools use the same scorer as injection, so results are ranked identically. They read the same global namespace, and request user/project/CWD context stays a soft affinity, never an access-control filter.
 
-The tool loop runs server-side and is transparent to the client: intermediate tool-call rounds never appear in the client's response or stream, and the client sees only the final answer. Up to 4 tool rounds run per request. Suppressed rounds are recorded as `memory.tool_call` events; only the final assistant message becomes an assistant event. With `X-Infinitum-Debug: true`, the response carries `x-infinitum-memory-tool-calls` with the round count.
+The tool loop runs server-side and is transparent to the client: intermediate tool-call rounds never appear in the client's response or stream, and the client sees only the final answer. Up to 4 tool rounds run per request. If the model keeps calling the memory tools past that cap, Infinitum strips its own tool definitions and makes one final answer-only request, so the client always receives a real answer instead of a blank response. Suppressed rounds are recorded as `memory.tool_call` events; only the final assistant message becomes an assistant event. With `X-Infinitum-Debug: true`, the response carries `x-infinitum-memory-tool-calls` with the round count.
 
 Latency edges worth knowing:
 
