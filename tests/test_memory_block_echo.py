@@ -218,6 +218,26 @@ def test_strip_200kb_adversarial_input_under_250ms():
     assert elapsed < 0.25, f"strip took {elapsed * 1000:.0f}ms"
 
 
+def test_strip_removes_condensed_and_truncated_echoes_with_bare_close():
+    # A quoting model that condenses or truncates the preamble also drops the
+    # newline the compile() wrapper puts before the close tag; the pair must
+    # still be removed (tag-anchored design), so these hand-built shapes -
+    # deliberately NOT built via _legacy_block/_BLOCK_CLOSE - must come out
+    # block-free.
+    assert (
+        _strip("hi <infinitum_memory> memory: condensed preamble here "
+               "</infinitum_memory> bye")
+        == "hi  bye"
+    )
+    assert (
+        _strip("hi\n<infinitum_memory> condensed preamble </infinitum_memory>\nbye")
+        == "hi\n\nbye"
+    )
+    assert (
+        _strip("q<infinitum_memory>derived from prior </infinitum_memory>") == "q"
+    )
+
+
 def test_strip_scales_linearly_with_unterminated_open_tags():
     # Quadratic regression guard + equivalence pin for the rpartition bound.
     # Given: a reference copy of the pre-fix strip (pair regex over the whole
@@ -232,10 +252,17 @@ def test_strip_scales_linearly_with_unterminated_open_tags():
         "no_close": "hi\n" + PREAMBLE + "trailing prose",
         "close_at_end": "a" + _legacy_block("body") + "b",
         "block_only": _legacy_block("x"),
-        "stray_close_then_opens": compiler._BLOCK_CLOSE + (filler + PREAMBLE) * 40,
+        "stray_close_then_opens": "</infinitum_memory>" + (filler + PREAMBLE) * 40,
         "opens_then_stray_close_then_block": (filler + PREAMBLE) * 20
-        + compiler._BLOCK_CLOSE
+        + "</infinitum_memory>"
         + _legacy_block("real"),
+        # Hand-built (no _legacy_block): a quoting model that condensed the
+        # preamble routinely drops the newline before the close tag, so the
+        # bound must anchor on the BARE tag, not the "\n"-prefixed wrapper.
+        "condensed_preamble_bare_close": "hi <infinitum_memory> memory: condensed"
+        " preamble here </infinitum_memory> bye",
+        "condensed_preamble_nl_close": "hi\n<infinitum_memory> condensed preamble"
+        " </infinitum_memory>\nbye",
         "footer_only": "answer\n\n" + ONE_TOOL_FOOTER,
         "clean": "nothing here at all",
     }

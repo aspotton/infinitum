@@ -24,10 +24,15 @@ _BLOCK_OPEN = (
     "Do not mention this memory block unless it is useful to the answer.\n\n"
 )
 _BLOCK_CLOSE = "\n</infinitum_memory>"
+# The bare tag wrapper-free: echoes routinely drop the wrapper's leading
+# newline, so anything anchoring on _BLOCK_CLOSE would miss them. Shared by
+# _PAIR_RE and the strip's rpartition bound so anchor and pattern cannot
+# drift apart again.
+_CLOSE_TAG = "</infinitum_memory>"
 # Tag-anchored, deliberately NOT preamble-anchored: an echo whose quoting
 # model condensed or truncated the preamble sentence is still removed.
 _PAIR_RE = re.compile(
-    re.escape("<infinitum_memory>") + r".*?" + re.escape("</infinitum_memory>"),
+    re.escape("<infinitum_memory>") + r".*?" + re.escape(_CLOSE_TAG),
     re.DOTALL,
 )
 # One- or two-tool drill-down footer tail appended by routes/openai.py.
@@ -269,13 +274,16 @@ def strip_memory_block(text: str) -> str:
     are not detectable here; the archival sweep is the mitigation.
     """
     # Order matters: _OPEN_TAIL_RE truncates to end-of-string, so it runs last.
-    # Pair-scan region ends AT the last close tag: the lazy .*? otherwise
-    # expands to end-of-string once per open tag with no following close
-    # (quadratic). The split stays inclusive of that close tag or the final
-    # block's open tag would never match; nothing after it can join a pair,
-    # so output is unchanged. A bare "close in text" guard is not equivalent:
-    # presence alone still lets the full-string scan go quadratic.
-    head, sep, tail = text.rpartition(_BLOCK_CLOSE)
+    # Pair-scan region ends AT (inclusive of) the last closing tag; the lazy
+    # .*? would otherwise expand to end-of-string once per open tag with no
+    # following close (quadratic). The bound must cover EVERY closing tag
+    # because a pair can end at any of them -- hence the bare _CLOSE_TAG, not
+    # the "\n"-prefixed _BLOCK_CLOSE wrapper: echoes routinely drop that
+    # newline, and a newline-anchored bound would skip pair removal entirely
+    # on condensed quotes. The split stays inclusive of the tag or the final
+    # block's open never matches; nothing after the last close can join a
+    # pair, so the bounded scan and a full-string scan agree.
+    head, sep, tail = text.rpartition(_CLOSE_TAG)
     if sep:
         text = _PAIR_RE.sub("", head + sep) + tail
     text = _FOOTER_RE.sub("", text)
