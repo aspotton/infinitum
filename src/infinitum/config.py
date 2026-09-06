@@ -45,6 +45,10 @@ class MemoryConfig(BaseModel):
     database_path: str = "./infinitum.db"
     retrieve_candidates: int = 50
     minimum_retrieval_score: float = 0.18
+    # Eligibility gate requiring at least one query-dependent signal (semantic,
+    # lexical, or topic) above a deliberately low zero-signal net. This is NOT a
+    # precision knob — precision remains minimum_retrieval_score's job. 0.0 disables.
+    minimum_relevance_score: float = 0.08
     inject_max_memories: int = 24
     dedup_similarity: float = 0.88
     # Fast deterministic reinforcement for nearly identical wording.
