@@ -88,6 +88,8 @@ Schema changes must be additive/migratable and must preserve immutable events an
 
 Per interaction, the learner should see the current interaction plus a bounded nearby-memory set, not the entire corpus.
 
+- Echoed `<infinitum_memory>` regions must be stripped from recorded user/assistant text, learn-job payloads, and `memory.tool_call` metadata; `request.received` stays byte-exact as received, by design (events are truth; message text is derived).
+
 For candidate mutation:
 
 - explicit correction/supersession takes precedence over reinforcement;
