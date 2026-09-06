@@ -12,7 +12,7 @@ from .database import Database
 from .embeddings import EmbeddingClient
 from .models import Memory, MemoryCandidate, RequestContext, TopicSummary
 from .retrieval import MemoryRetriever
-from .text import compact_whitespace, lexical_similarity
+from .text import compact_whitespace, lexical_similarity, normalize_text
 from .upstream import UpstreamClient, extract_nonstream_assistant
 
 if TYPE_CHECKING:
@@ -494,9 +494,19 @@ Small current-topic context sample:
                 self._response_diagnostics(result),
             )
 
-        await self.db.upsert_topic(
-            TopicSummary(topic=topic, summary=summary, memory_count=active_count)
-        )
+        # Skip the write when the regenerated summary is unchanged (modulo
+        # whitespace/case). An identical summary must not bump topics.updated_at,
+        # which feeds the global session-pin watermark (database.py memory_state_watermark).
+        # Scope: this only removes the redundant topics-side bump; memory-write
+        # bumps in the same turn still move the watermark, and an LLM regeneration
+        # that reworded the summary is intentionally treated as changed (text
+        # equality is the conservative bar; the deterministic fallback path is
+        # where identical regeneration actually occurs). Trade-off: memory_count
+        # may go stale, but it is display-only (compiler.py, GET /topics).
+        if current is None or normalize_text(summary) != normalize_text(current.summary):
+            await self.db.upsert_topic(
+                TopicSummary(topic=topic, summary=summary, memory_count=active_count)
+            )
         # Clear only the exact dirty IDs captured before the model call. New
         # changes that arrived while the summary was running stay dirty.
         await self.db.clear_topic_updates(topic, dirty_updates)

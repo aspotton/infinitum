@@ -1,4 +1,5 @@
 import tempfile
+from datetime import datetime
 from unittest.mock import AsyncMock
 
 import pytest
@@ -211,3 +212,105 @@ async def test_dirty_topic_is_requeued_after_previous_summary_job_failed():
         assert len(rows) == 1
         assert await db.count_topic_updates("database") == 1
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_identical_summary_refresh_skips_topic_write_and_keeps_watermark():
+    """A regenerated-but-identical summary must not bump topics.updated_at.
+
+    The topics row feeds the global session-pin watermark
+    (Database.memory_state_watermark), so a no-op refresh must leave the row
+    byte-identical while still consuming the dirty batch. Clock-deterministic:
+    the expected timestamp is a seeded fixed value, never wall-clock.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = AppConfig()
+        cfg.memory.database_path = f"{tmp}/runtime.db"
+        cfg.learning.topic_summary_min_memories = 1
+        cfg.learning.topic_summary_context_memories = 1
+
+        db = Database(cfg.memory.database_path)
+        await db.connect()
+        first = await db.create_memory(
+            Memory(memory_type="fact", topic="database", content="PostgreSQL 17 is the standard.")
+        )
+        second = await db.create_memory(
+            Memory(memory_type="decision", topic="database", content="RDS hosts production.")
+        )
+        await db.upsert_topic(
+            TopicSummary(
+                topic="database",
+                summary="Current state: PostgreSQL 17 on RDS.",
+                memory_count=2,
+            )
+        )
+        # Pin the row to a fixed historical timestamp so any write is visible
+        # as updated_at moving away from this exact value.
+        seeded = "2020-01-01T00:00:00+00:00"
+        await db.execute("UPDATE topics SET updated_at=? WHERE topic=?", (seeded, "database"))
+        for memory_id in (first.id, second.id):
+            await db.mark_topic_dirty(
+                "database",
+                [memory_id],
+                model="memory-model",
+                debounce_seconds=0,
+                update_threshold=2,
+            )
+        assert await db.count_topic_updates("database") > 0
+
+        embeddings = EmbeddingClient(cfg.embeddings)
+        upstream = UpstreamClient(cfg)
+        retriever = MemoryRetriever(db, embeddings, cfg)
+        learner = MemoryLearner(db, retriever, embeddings, upstream, cfg)
+        # Same content as the stored summary modulo case and whitespace.
+        upstream.learning_chat_completion = AsyncMock(
+            return_value={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "  CURRENT STATE:   postgresql 17 on RDS. \t",
+                        }
+                    }
+                ]
+            }
+        )
+
+        try:
+            followup = await learner.refresh_topic_summary("database", "memory-model")
+            assert followup is False
+            topic = await db.get_topic("database")
+            assert topic is not None
+            assert topic.updated_at == datetime.fromisoformat(seeded)
+            # Dirty state is still consumed even though nothing was written.
+            assert await db.count_topic_updates("database") == 0
+
+            # Control: a genuinely reworded summary still takes the write.
+            await db.mark_topic_dirty(
+                "database",
+                [first.id],
+                model="memory-model",
+                debounce_seconds=0,
+                update_threshold=2,
+            )
+            upstream.learning_chat_completion = AsyncMock(
+                return_value={
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "Rewritten: PostgreSQL 17 on RDS with PgBouncer.",
+                            }
+                        }
+                    ]
+                }
+            )
+            await learner.refresh_topic_summary("database", "memory-model")
+            topic = await db.get_topic("database")
+            assert topic is not None
+            assert topic.updated_at != datetime.fromisoformat(seeded)
+            assert topic.summary == "Rewritten: PostgreSQL 17 on RDS with PgBouncer."
+        finally:
+            await upstream.close()
+            await embeddings.close()
+            await db.close()
