@@ -1,10 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.2.7
 
 - Retrieval eligibility now requires at least one genuine relevance signal (semantic, lexical, or topic) above `memory.minimum_relevance_score` (default `0.08`; set `0.0` to disable) before importance, confidence, or freshness can qualify a memory; the high-importance goal/decision exemption is unchanged and the drill-down memory tools and `POST /memory/search` share the same gated scorer.
 - A topic-summary refresh that regenerates an identical summary no longer writes the topic row, so it no longer bumps the cache-invalidation watermark that pins compiled context; memory-write bumps still move the watermark by design.
 - Recorded user/assistant text, learn-job payloads, and `memory.tool_call` metadata now strip echoed `<infinitum_memory>` regions, so quoted context blocks can never be re-learned into memory, while the `request.received` audit event stays byte-exact with what the client sent.
+- Added regression tests for the relevance gate, the identical-summary watermark guard, and echo sanitization; the full suite now covers 163 tests.
 
 ## 0.2.6
 
