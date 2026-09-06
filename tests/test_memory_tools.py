@@ -1467,6 +1467,229 @@ def test_stream_reject_mixed_foreign_replays():
             )
 
 
+# --- StreamClassifier reasoning awareness + tee-mode consume (todo 2) ---------
+#
+# Direct-unit tier: no HTTP, no app. Chunk builders above (_delta_event et al.)
+# produce `data: {json}\n\n` so every event is a data line + a blank line.
+
+
+_OURS = set(memory_tools.TOOL_NAMES)
+_REASONING_FIELDS = ("reasoning", "reasoning_content")
+
+
+def _reasoning_chunk(text: str, field: str = "reasoning") -> bytes:
+    return _delta_event({field: text})
+
+
+def _role_chunk() -> bytes:
+    return _delta_event({"role": "assistant"})
+
+
+def _tee_classifier(**overrides) -> memory_tools.StreamClassifier:
+    kwargs: dict = {
+        "reasoning_fields": _REASONING_FIELDS,
+        "tee_forward_enabled": True,
+    }
+    kwargs.update(overrides)
+    return memory_tools.StreamClassifier(_OURS, **kwargs)
+
+
+def test_consume_classifier_reasoning_only_forwards_with_split_chunks():
+    clf = _tee_classifier()
+    line = _reasoning_chunk("deep thought")
+    # First half of the line: incomplete, nothing can be forwarded yet.
+    assert clf.consume(line[:20]) == b""
+    # Completing the line forwards it verbatim (data line + blank).
+    assert clf.consume(line[20:]) == line
+    assert clf._reasoning_seen
+    assert clf.consume(_DONE) == b""  # [DONE] freezes, holds itself
+    assert clf.forwarded
+    assert clf.flush_held() == _DONE
+
+
+def test_consume_classifier_reasoning_prefix_flushes_held_role_lines_once():
+    # A role line held before reasoning was seen rides the prefix flush and is
+    # never double-sent: forwarded bytes form a byte prefix of the raw stream.
+    chunks = [_role_chunk(), _reasoning_chunk("think"), _reasoning_chunk("ing more")]
+    clf = _tee_classifier()
+    outs = [clf.consume(c) for c in chunks]
+    assert outs[0] == b""  # role line held: reasoning not seen yet
+    assert outs[1] == chunks[0] + chunks[1]  # role + first reasoning at once
+    assert outs[2] == chunks[2]
+    assert clf.forwarded
+
+
+def test_consume_classifier_reasoning_then_tool_call_suppresses_without_leak():
+    tool = _tool_chunk(0, "call_1", "infinitum_memory_search", '{"query": "db"}')
+    chunks = [_role_chunk(), _reasoning_chunk("plan"), tool, _finish_chunk("tool_calls"), _DONE]
+    clf = _tee_classifier()
+    forwarded = b"".join(clf.consume(c) for c in chunks)
+    # Leak-thinking-keep-loop: reasoning streamed, every tool byte held.
+    assert b"plan" in forwarded
+    assert b"infinitum_memory_search" not in forwarded  # zero-leak lock
+    assert clf.finish() == "suppress"
+    assert clf.flush_held() == tool + _finish_chunk("tool_calls") + _DONE
+    # The loop still executes the call: reassembly sees the full call.
+    calls = memory_tools.reassemble_stream_tool_calls(clf.calls)
+    assert calls[0]["function"]["name"] == "infinitum_memory_search"
+    assert b"infinitum_memory_search" in clf.collected_bytes()
+
+
+def test_consume_classifier_reasoning_content_only_flushes_full_raw():
+    chunks = [_content_chunk("hello"), _content_chunk(" world"), _finish_chunk("stop"), _DONE]
+    clf = _tee_classifier()
+    outs = [clf.consume(c) for c in chunks]
+    assert outs[0] == chunks[0]  # first content line decides: flush everything
+    assert outs[1:] == chunks[1:]  # raw thereafter, byte-identical
+    assert clf.finish() == "passthrough"
+    assert clf.flush_held() == b""
+
+
+def test_consume_classifier_reasoning_freeze_then_content_is_byte_identical():
+    tool = _tool_chunk(0, "call_1", "infinitum_memory_search", '{"query": "db"}')
+    chunks = [
+        _role_chunk(),
+        _reasoning_chunk("plan"),
+        tool,
+        _finish_chunk("tool_calls"),
+        _content_chunk("changed my mind"),
+        _finish_chunk("stop"),
+        _DONE,
+    ]
+    clf = _tee_classifier()
+    outs = [clf.consume(c) for c in chunks]
+    assert outs[0] == b"" and outs[1] == chunks[0] + chunks[1]  # hold, then tee
+    assert outs[2] == b"" and outs[3] == b""  # frozen: tool + finish lines held
+    assert b"".join(outs) == b"".join(chunks)  # flush + raw == exact full round
+    assert clf.finish() == "passthrough"
+
+
+def test_consume_classifier_reasoning_freeze_then_foreign_is_byte_identical():
+    chunks = [
+        _reasoning_chunk("plan"),
+        _tool_chunk(0, "call_f", "get_weather", '{"city": "Oslo"}'),
+        _content_chunk("sunny"),
+    ]
+    clf = _tee_classifier()
+    outs = [clf.consume(c) for c in chunks]
+    assert outs[0] == chunks[0]
+    # A foreign name decides passthrough the moment it is scanned (existing
+    # feed semantics): the whole held round flushes in order on that chunk.
+    assert outs[1] == chunks[1]
+    assert outs[2] == chunks[2]  # raw thereafter
+    assert b"".join(outs) == b"".join(chunks)
+    assert clf.finish() == "passthrough"
+
+
+def test_consume_classifier_reasoning_unparseable_line_freezes_then_content():
+    corrupt = b"data: {not json at all\n\n"
+    chunks = [_reasoning_chunk("think"), corrupt, _content_chunk("ok")]
+    clf = _tee_classifier()
+    outs = [clf.consume(c) for c in chunks]
+    assert outs[0] == chunks[0]
+    assert outs[1] == b""  # unparseable data line freezes conservatively
+    assert outs[2] == chunks[1] + chunks[2]
+    assert b"".join(outs) == b"".join(chunks)
+
+
+def test_consume_classifier_reasoning_finish_reason_freezes():
+    chunks = [_reasoning_chunk("think"), _finish_chunk("stop"), _DONE]
+    clf = _tee_classifier()
+    outs = [clf.consume(c) for c in chunks]
+    assert outs[0] == chunks[0]
+    assert outs[1] == b"" and outs[2] == b""
+    assert clf.flush_held() == chunks[1] + chunks[2]
+    assert clf.finish() == "replay"  # no calls, no content: terminal replay
+
+
+def test_consume_classifier_reasoning_done_freezes():
+    chunks = [_reasoning_chunk("think"), _DONE]
+    clf = _tee_classifier()
+    assert clf.consume(chunks[0]) == chunks[0]
+    assert clf.consume(chunks[1]) == b""
+    assert clf.flush_held() == _DONE
+    assert clf.finish() == "replay"
+
+
+def test_consume_classifier_reasoning_buffered_tee_disabled_holds_all():
+    tool = _tool_chunk(0, "call_1", "infinitum_memory_search", '{"query": "db"}')
+    chunks = [_reasoning_chunk("think"), tool, _finish_chunk("tool_calls"), _DONE]
+    clf = _tee_classifier(tee_forward_enabled=False)
+    assert [clf.consume(c) for c in chunks] == [b"", b"", b"", b""]
+    assert clf._reasoning_seen  # tracked, but never releases bytes
+    assert not clf.forwarded
+    assert clf.finish() == "suppress"
+    assert clf.flush_held() == b"".join(chunks)
+
+
+def test_consume_classifier_reasoning_custom_field_detected():
+    chunks = [
+        _reasoning_chunk("mine", field="my_reasoning"),
+        _tool_chunk(0, "call_1", "infinitum_memory_search", '{"query": "db"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    clf = _tee_classifier(reasoning_fields=("my_reasoning",))
+    forwarded = b"".join(clf.consume(c) for c in chunks)
+    assert b"mine" in forwarded
+    assert clf._reasoning_seen
+    assert clf.finish() == "suppress"
+
+
+def test_consume_classifier_reasoning_empty_string_values_not_seen():
+    chunks = [
+        _reasoning_chunk(""),
+        _tool_chunk(0, "call_1", "infinitum_memory_search", '{"query": "db"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    clf = _tee_classifier()
+    assert [clf.consume(c) for c in chunks] == [b""] * 4
+    assert not clf._reasoning_seen
+    assert not clf.forwarded
+    assert clf.finish() == "suppress"
+
+
+def test_consume_classifier_reasoning_disjoint_fields_forward_nothing():
+    # Configured fields absent from the stream: nothing forwards, silent suppress.
+    chunks = [
+        _reasoning_chunk("hidden", field="my_reasoning"),
+        _tool_chunk(0, "call_1", "infinitum_memory_search", '{"query": "db"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    clf = _tee_classifier()
+    assert [clf.consume(c) for c in chunks] == [b""] * 4
+    assert not clf.forwarded
+    assert clf.finish() == "suppress"
+
+
+def test_consume_classifier_reasoning_collected_reassemble_parity_with_feed():
+    tool = _tool_chunk(0, "call_9", "infinitum_memory_search", '{"query": "db"')
+    args = _tool_chunk(0, None, None, ', "limit": 5}')
+    chunks = [
+        _reasoning_chunk("think"),
+        tool,
+        args,
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    tee = _tee_classifier()
+    for chunk in chunks:
+        tee.consume(chunk)
+    plain = memory_tools.StreamClassifier(_OURS)
+    for chunk in chunks:
+        plain.feed(chunk)
+    assert tee.collected_bytes() == b"".join(chunks)
+    assert tee.collected_bytes() == plain.collected_bytes()
+    assert memory_tools.reassemble_stream_tool_calls(tee.calls) == (
+        memory_tools.reassemble_stream_tool_calls(plain.calls)
+    )
+    (call,) = memory_tools.reassemble_stream_tool_calls(tee.calls)
+    assert call["id"] == "call_9"
+    assert call["function"]["arguments"] == '{"query": "db", "limit": 5}'
+
+
 def test_qa_s_query_from_messages_truncates_tool_blobs():
     with tempfile.TemporaryDirectory() as tmp:
         app = _chat_app(tmp)
