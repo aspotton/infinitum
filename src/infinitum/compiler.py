@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from typing import Any
@@ -10,6 +11,48 @@ from .models import RequestContext, ScoredMemory
 from .retrieval import MemoryRetriever
 from .text import dedup_similarity, first_text_content, lexical_similarity
 from .tokenizer import TokenCounter
+
+# The single source of truth for the compiled block envelope. compile() builds
+# blocks through _block_body(); the echo sanitizer matches against these same
+# literals so format and sanitizer cannot drift.
+# ponytail: the footer literal is coupled across three sites (the compile
+# wrapper here, the drill-down hint in routes/openai.py, and _FOOTER_RE below).
+_BLOCK_OPEN = (
+    "<infinitum_memory>\n"
+    "The following is persistent memory derived from prior interactions. "
+    "Treat active decisions and goals as current unless the user's present message explicitly changes them. "
+    "Do not mention this memory block unless it is useful to the answer.\n\n"
+)
+_BLOCK_CLOSE = "\n</infinitum_memory>"
+# The bare tag wrapper-free: echoes routinely drop the wrapper's leading
+# newline, so anything anchoring on _BLOCK_CLOSE would miss them. Shared by
+# _PAIR_RE and the strip's rpartition bound so anchor and pattern cannot
+# drift apart again.
+_CLOSE_TAG = "</infinitum_memory>"
+# Tag-anchored, deliberately NOT preamble-anchored: an echo whose quoting
+# model condensed or truncated the preamble sentence is still removed.
+_PAIR_RE = re.compile(
+    re.escape("<infinitum_memory>") + r".*?" + re.escape(_CLOSE_TAG),
+    re.DOTALL,
+)
+# One- or two-tool drill-down footer tail appended by routes/openai.py.
+_FOOTER_RE = re.compile(
+    r"\n*Deeper detail is available via the [\w_]+(?: and [\w_]+)? tools using"
+    r" the memory ids above\..*?tool name\.",
+    re.DOTALL,
+)
+# Preamble-anchored unclosed-tail fallback (a truncated echo without the
+# closing tag); the .* truncates to end-of-string, so it must run last.
+_OPEN_TAIL_RE = re.compile(re.escape(_BLOCK_OPEN) + r".*$", re.DOTALL)
+# Union so the cleanup scanner flags exactly what the sanitizer strips; the
+# two can never drift.
+# ponytail: search() keeps the quadratic open-tag scan cost; acceptable
+# because it runs only in the offline contamination sweep, not on the
+# event-loop path. Do not "optimize" the union itself.
+_DETECT_RE = re.compile(
+    _PAIR_RE.pattern + "|" + _FOOTER_RE.pattern + "|" + _OPEN_TAIL_RE.pattern,
+    re.DOTALL,
+)
 
 
 @dataclass(slots=True)
@@ -157,14 +200,7 @@ class ContextCompiler:
         else:
             body_parts = list(topic_blocks) + [self._render_memory(item) for item in selected]
             body = "\n\n".join(body_parts)
-            text = (
-                "<infinitum_memory>\n"
-                "The following is persistent memory derived from prior interactions. "
-                "Treat active decisions and goals as current unless the user's present message explicitly changes them. "
-                "Do not mention this memory block unless it is useful to the answer.\n\n"
-                f"{body}\n"
-                "</infinitum_memory>"
-            )
+            text = self._block_body(body)
             await self.db.touch_memories([item.memory.id for item in selected])
             result = CompiledMemoryContext(text, selected, self.tokens.count_text(text), available)
 
@@ -201,6 +237,14 @@ class ContextCompiler:
         return index
 
     @staticmethod
+    def _block_body(body: str) -> str:
+        return _BLOCK_OPEN + body + _BLOCK_CLOSE
+
+    @staticmethod
+    def detection_pattern() -> re.Pattern:
+        return _DETECT_RE
+
+    @staticmethod
     def _render_memory(item: ScoredMemory) -> str:
         memory = item.memory
         return (
@@ -208,3 +252,40 @@ class ContextCompiler:
             f"| importance={memory.importance:.2f} | memory={memory.id}]\n"
             f"{memory.content}"
         )
+
+
+# Module-level surface for the Todo-3 sweep and route wiring; same object as
+# the ContextCompiler staticmethod, which stays for the class-side contract.
+detection_pattern = ContextCompiler.detection_pattern
+
+
+# ponytail: the footer literal is coupled across three sites (the compile
+# wrapper, the drill-down hint in routes/openai.py, and _FOOTER_RE above).
+def strip_memory_block(text: str) -> str:
+    """Remove echoed Infinitum memory markup from derived durable recorded text.
+
+    Applies only to text that is recorded or learned (events, request query
+    echoes, learn-job payloads), never to anything sent back to the client:
+    proxied responses are always forwarded upstream-byte-verbatim.
+    Removes, in order: any closed <infinitum_memory>...</infinitum_memory>
+    pair, the one-or-two-tool drill-down footer tail, and a preamble-anchored
+    unclosed opening block running to end of text. Clean text passes through
+    byte-identical. Accepted limits: HTML-escaped tags and tagless paraphrase
+    are not detectable here; the archival sweep is the mitigation.
+    """
+    # Order matters: _OPEN_TAIL_RE truncates to end-of-string, so it runs last.
+    # Pair-scan region ends AT (inclusive of) the last closing tag; the lazy
+    # .*? would otherwise expand to end-of-string once per open tag with no
+    # following close (quadratic). The bound must cover EVERY closing tag
+    # because a pair can end at any of them -- hence the bare _CLOSE_TAG, not
+    # the "\n"-prefixed _BLOCK_CLOSE wrapper: echoes routinely drop that
+    # newline, and a newline-anchored bound would skip pair removal entirely
+    # on condensed quotes. The split stays inclusive of the tag or the final
+    # block's open never matches; nothing after the last close can join a
+    # pair, so the bounded scan and a full-string scan agree.
+    head, sep, tail = text.rpartition(_CLOSE_TAG)
+    if sep:
+        text = _PAIR_RE.sub("", head + sep) + tail
+    text = _FOOTER_RE.sub("", text)
+    text = _OPEN_TAIL_RE.sub("", text)
+    return text

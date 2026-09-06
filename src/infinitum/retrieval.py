@@ -20,6 +20,11 @@ def cosine_similarity(a: np.ndarray | None, b: np.ndarray | None) -> float:
     return max(-1.0, min(1.0, float(np.dot(a, b) / denom)))
 
 
+def _is_high_authority(memory: Memory) -> bool:
+    """High-authority persistent goals/decisions that survive wording mismatch."""
+    return memory.memory_type in {"goal", "decision"} and memory.importance >= 0.85
+
+
 class MemoryRetriever:
     def __init__(self, db: Database, embeddings: EmbeddingClient, config: AppConfig):
         self.db = db
@@ -84,8 +89,34 @@ class MemoryRetriever:
 
             # Keep high-authority-like persistent goals/decisions from vanishing
             # solely because their wording differs from today's query.
-            if memory.memory_type in {"goal", "decision"} and memory.importance >= 0.85:
+            if _is_high_authority(memory):
                 base_score += 0.04
+
+            # Relevance eligibility gate: drop memories with no genuine query
+            # signal (semantic/lexical/topic all below the zero-signal net).
+            # lexical already carries the +0.15 FTS bonus above, so FTS hits clear.
+            # Learning-path proof: this gate applies to every retriever.search
+            # consumer (foreground, learner nearby-set, _apply matching, drill-down
+            # tools, POST /memory/search) yet cannot weaken any reinforcement path
+            # that can fire today. EVIDENCE-DOMINANCE: every reinforcement firing
+            # condition requires a relevance signal that IS the same variable this
+            # gate checks — in _apply, lexical_similarity(candidate.content,
+            # memory.content) is literally this search's `lexical` for
+            # query=candidate.content, and the thresholds (lexical >= 0.86/0.40,
+            # semantic >= 0.90/0.72) all dominate this 0.08 net, so nothing that
+            # passes a reinforcement guard can fail this gate. A smaller nearby
+            # set can only ENABLE reinforcements previously blocked by a
+            # zero-signal compatible[0] match (same guards, smaller pool — never
+            # weaker). Secondary observation only: with embeddings off the
+            # hint-path score guard 0.55 sits near the weighted ceiling, but the
+            # bump and affinity can exceed it, so this is not load-bearing.
+            # What does change: the extractor's nearby set loses zero-signal
+            # ambient memories — a quality improvement, not a regression.
+            if not (
+                max(semantic, lexical, topic) >= self.config.memory.minimum_relevance_score
+                or _is_high_authority(memory)
+            ):
+                continue
 
             # Affinity must not make an irrelevant memory eligible by itself.
             # It only reorders memories that already cleared the global relevance

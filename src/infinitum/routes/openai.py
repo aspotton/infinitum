@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 
 from .. import memory_tools
+from ..compiler import strip_memory_block
 from ..models import Event, RequestContext, new_id
 from ..runtime import Runtime
 from ..text import first_text_content
@@ -159,6 +160,7 @@ async def _record_completion(
     learning_enabled: bool,
     request_context: RequestContext,
 ) -> None:
+    assistant_text = strip_memory_block(assistant_text)
     assistant_event = Event(
         session_id=session_id,
         user_id=request_context.user_id,
@@ -203,7 +205,7 @@ async def chat_completions(request: Request) -> Response:
     session_id = client_session_id or new_id("ses")  # provenance id for events/audit
     request_context = runtime.request_context.resolve(request.headers)
     request_id = new_id("req")
-    user_text = _latest_user(original_messages)
+    user_text = strip_memory_block(_latest_user(original_messages))
 
     await runtime.db.add_request(
         request_id, session_id, user_text, model, context=request_context
@@ -279,6 +281,9 @@ async def chat_completions(request: Request) -> Response:
                 if compiled.memories:
                     # Copy-on-write: compile() may hand back a cached block, so
                     # never append the hint into the object the cache still holds.
+                    # ponytail: this footer literal is coupled across three sites
+                    # (compiler._block_body wrapper, this route hint, compiler._FOOTER_RE);
+                    # change one, change all.
                     compiled = replace(
                         compiled,
                         text=compiled.text
@@ -467,7 +472,14 @@ async def chat_completions(request: Request) -> Response:
                                 "name": name,
                                 "result_chars": len(result),
                                 "tool_call_id": call.get("id"),
-                                "assistant_message": assistant_message,
+                                # Copy-on-write: sanitize only the durable metadata
+                                # copy; the forwarded body["messages"] stays raw.
+                                "assistant_message": {
+                                    **assistant_message,
+                                    "content": strip_memory_block(
+                                        assistant_message.get("content") or ""
+                                    ),
+                                },
                                 **extra,
                             },
                         )
@@ -619,7 +631,12 @@ async def chat_completions(request: Request) -> Response:
                             "name": name,
                             "result_chars": len(result),
                             "tool_call_id": call.get("id"),
-                            "assistant_message": assistant_message,
+                            "assistant_message": {
+                                **assistant_message,
+                                "content": strip_memory_block(
+                                    assistant_message.get("content") or ""
+                                ),
+                            },
                             **extra,
                         },
                     )
