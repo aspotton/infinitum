@@ -155,7 +155,7 @@ class UpstreamClient:
         elif self.config.upstream.api_key:
             headers["Authorization"] = f"Bearer {self.config.upstream.api_key}"
         # Vendor-specific OpenAI-compatible request fields may be supplied for
-        # background learning (for example vLLM/Qwen chat-template controls).
+        # background learning (for example chat-template controls on compatible servers).
         # Core fields below intentionally win so extensions cannot accidentally
         # turn a learning call into streaming or replace its messages/model.
         body: dict[str, Any] = dict(extra_body or {})

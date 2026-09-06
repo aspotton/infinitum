@@ -358,9 +358,9 @@ async def chat_completions(request: Request) -> Response:
                 if is_forced and ours_injected:
                     # Past the cap: force a terminal ANSWER round. Stripping defs
                     # alone is insufficient for servers with an automatic tool-call
-                    # parser (vLLM/Qwen) that re-emit our tool names unprompted.
-                    # tool_choice:"none" (OpenAI spec, honored by the verified vLLM
-                    # upstream) forbids tool calls so the round must produce text.
+                    # parser that re-emits our tool names unprompted.
+                    # tool_choice:"none" (OpenAI spec, honored by many OpenAI-compatible
+                    # servers) forbids tool calls so the round must produce text.
                     # Keep our names in ours_active so a stray call that a server
                     # emits anyway is OUR loop-capped call to suppress, not a
                     # foreign tool to forward to the client.
@@ -505,9 +505,9 @@ async def chat_completions(request: Request) -> Response:
             if is_forced and ours_injected:
                 # Past the cap: force a terminal ANSWER round. Stripping defs alone
                 # is insufficient for servers with an automatic tool-call parser
-                # (vLLM/Qwen) that re-emit our tool names unprompted.
-                # tool_choice:"none" (OpenAI spec, honored by the verified vLLM
-                # upstream) forbids tool calls so the round must produce text. Keep
+                # parser that re-emits our tool names unprompted.
+                # tool_choice:"none" (OpenAI spec, honored by many OpenAI-compatible
+                # servers) forbids tool calls so the round must produce text. Keep
                 # our names in ours_active so a stray call that a server emits
                 # anyway is OUR loop-capped call to suppress, not a foreign tool to
                 # forward to the client.

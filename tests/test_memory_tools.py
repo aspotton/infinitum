@@ -1023,7 +1023,7 @@ def test_qa_t_stream_round_cap_forces_answer_not_empty_stream():
 
 # --- Forced terminal round: tool_choice:"none" + blank-answer synthesis --------
 #
-# Live-verified on vLLM/Qwen: stripping our defs is not enough, the automatic
+# Verified against a local OpenAI-compatible server: stripping our defs is not enough, the automatic
 # tool-call parser re-emits our tool names and the old forced round forwarded a
 # content:null tool_calls message (non-stream) or a blank SSE (stream).
 
@@ -1080,7 +1080,7 @@ def test_forced_round_synthesizes_when_tool_choice_ignored():
 
 
 def test_forced_round_stream_not_blank():
-    # Tool-choice-aware SSE fake (mirrors verified vLLM): honors
+    # Tool-choice-aware SSE fake (mirrors a server with an automatic tool parser): honors
     # tool_choice:"none" with a plain answer; otherwise its auto parser keeps
     # emitting our tool calls. The old forced round stripped defs but sent no
     # tool_choice, so the client received the stray tool-call stream.
