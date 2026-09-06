@@ -189,10 +189,6 @@ def test_detection_pattern_is_truthy_exactly_when_strip_changes_input():
         detected = bool(compiler.detection_pattern().search(text))
         changed = _strip(text) != text
         assert detected == changed, f"detect/strip disagree on case {name!r}"
-    for name, (text, _) in CASES.items():
-        detected = bool(compiler.detection_pattern().search(text))
-        changed = _strip(text) != text
-        assert detected == changed, f"detect/strip disagree on case {name!r}"
 
 
 def test_strip_is_idempotent_over_every_case():

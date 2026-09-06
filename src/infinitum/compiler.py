@@ -251,17 +251,19 @@ class ContextCompiler:
 detection_pattern = ContextCompiler.detection_pattern
 
 
+# ponytail: the footer literal is coupled across three sites (the compile
+# wrapper, the drill-down hint in routes/openai.py, and _FOOTER_RE above).
 def strip_memory_block(text: str) -> str:
-    """Remove echoed Infinitum memory markup from client-visible text.
+    """Remove echoed Infinitum memory markup from derived durable recorded text.
 
+    Applies only to text that is recorded or learned (events, request query
+    echoes, learn-job payloads), never to anything sent back to the client:
+    proxied responses are always forwarded upstream-byte-verbatim.
     Removes, in order: any closed <infinitum_memory>...</infinitum_memory>
     pair, the one-or-two-tool drill-down footer tail, and a preamble-anchored
     unclosed opening block running to end of text. Clean text passes through
     byte-identical. Accepted limits: HTML-escaped tags and tagless paraphrase
     are not detectable here; the archival sweep is the mitigation.
-
-    // ponytail: the footer literal is coupled across three sites (the compile
-    wrapper, the drill-down hint in routes/openai.py, and _FOOTER_RE).
     """
     # Order matters: _OPEN_TAIL_RE truncates to end-of-string, so it runs last.
     text = _PAIR_RE.sub("", text)
