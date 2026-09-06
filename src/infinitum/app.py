@@ -25,7 +25,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             await runtime.embeddings.close()
             await runtime.db.close()
 
-    app = FastAPI(title="Infinitum", version="0.2.6", lifespan=lifespan)
+    app = FastAPI(title="Infinitum", version="0.2.7", lifespan=lifespan)
     app.include_router(openai.router)
     app.include_router(memory.router)
     app.include_router(admin.router)
