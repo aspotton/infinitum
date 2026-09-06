@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
 from typing import Any
 
@@ -87,11 +87,168 @@ async def _counted(stream: AsyncIterator[bytes], counter: Any) -> AsyncIterator[
         counter.decrement()
 
 
-async def _empty_stream() -> AsyncIterator[bytes]:
-    # Async no-op stream: _counted's `async for` cannot wrap the sync
-    # iter(()) residual fallback, so the residual path hands over this instead.
-    if False:
-        yield b""
+async def _prefixed(first: bytes | None, rest: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    # Re-emit a prefetched first generator fragment, then drain the rest.
+    # The route prefetches so generator-raised errors (_VerbatimResponse,
+    # httpx.RequestError) can still become plain Responses before the
+    # StreamingResponse exists; the fragment must never be dropped or doubled.
+    if first is not None:
+        yield first
+    async for item in rest:
+        yield item
+
+
+async def _terminal_stream(
+    accum: bytearray,
+    live: AsyncIterator[bytes] | None,
+    comments: bytes,
+    completed: Callable[[bytes], Awaitable[None]],
+) -> AsyncIterator[bytes]:
+    """Emit a decided round: replay/passthrough bytes, then trailing debug comments.
+
+    `accum` holds the bytes already fed before the decision; `live` is the raw
+    upstream iterator, present only for a mid-round passthrough (None for a
+    replay whose rest was drained into `accum` in the route body). `completed`
+    is awaited in the finally so normal completion AND client disconnect each
+    record exactly once, exactly like the pre-0.3 stream_out.
+    """
+    try:
+        if accum:
+            yield bytes(accum)
+        if live is not None:
+            async for chunk in live:
+                accum.extend(chunk)
+                yield chunk
+        if comments:
+            yield comments
+    finally:
+        await completed(bytes(accum))
+
+
+class _VerbatimResponse(Exception):
+    """Carries a rounds-2+ upstream HTTPStatusError to the route for re-presentation.
+
+    Raised inside the Phase-B generator ONLY when zero client bytes have been
+    forwarded: the route prefetches the first fragment and converts this into
+    the same plain Response a round-1 4xx produces (status/content/media_type
+    from the error response, debug headers, no upstream headers passthrough).
+    """
+
+    def __init__(self, response: httpx.Response) -> None:
+        self.response = response
+        super().__init__(str(response.status_code))
+
+
+# The ONLY allowed byte synthesis on the streaming path: once client bytes exist
+# the HTTP status cannot change, so an upstream failure surfaces in-stream.
+_UPSTREAM_ERROR_EVENT = (
+    b'data: {"error": {"message": "upstream failed", "type": "upstream_error"}}\n\n'
+    b"data: [DONE]\n\n"
+)
+
+
+def _debug_stream_comments(
+    debug: bool, ours_injected: set[str], tool_rounds: int, reject_count: int
+) -> bytes:
+    """Trailing SSE comments carrying the debug counters on streaming responses.
+
+    Rounds 2+ run inside the returned StreamingResponse, where headers are
+    physically impossible, so both modes carry the same information the
+    non-stream path puts in headers, under the same gate. They ride AFTER
+    [DONE], so SDKs that stop at the sentinel never see them; the zero-count
+    case with no injected tools stays silent exactly like the header did.
+    """
+    if not debug or not (ours_injected or tool_rounds):
+        return b""
+    comments = f": x-infinitum-memory-tool-calls {tool_rounds}\n"
+    if reject_count:
+        comments += f": x-infinitum-memory-tool-rejects {reject_count}\n"
+    return comments.encode()
+
+
+def _stream_assistant_message(classifier: memory_tools.StreamClassifier) -> dict[str, Any]:
+    """Build the transcript assistant message from one suppressed stream round.
+
+    Shared by the Phase-A body assembly and the Phase-B generator: merges the
+    SSE tool-call deltas and attaches whatever content the round also streamed.
+    Reasoning is never included: extract_stream_assistant reads content and
+    tool_calls only.
+    """
+    calls = memory_tools.reassemble_stream_tool_calls(classifier.calls)
+    assistant_content, _ = extract_stream_assistant(classifier.collected_bytes())
+    assistant_message: dict[str, Any] = {"role": "assistant"}
+    if assistant_content:
+        assistant_message["content"] = assistant_content
+    assistant_message["tool_calls"] = calls
+    return assistant_message
+
+
+async def _run_tool_round(
+    runtime: Runtime,
+    body: dict[str, Any],
+    assistant_message: dict[str, Any],
+    *,
+    ours_active: set[str],
+    ours_injected: set[str],
+    request_id: str,
+    session_id: str,
+    request_context: RequestContext,
+) -> int:
+    """Execute one suppressed streaming round and append results to the body.
+
+    Extracted verbatim from the pre-0.3 streaming loop's assembly step so the
+    Phase-A body and the Phase-B generator share one implementation: execute
+    our calls, reject-instruct hallucinated memory names (NEVER forwarded to
+    the client), record one memory.tool_call event per call with the
+    copy-on-write sanitized assistant message, and append each tool result to
+    the transcript. Returns the number of rejected calls this round.
+    """
+    body["messages"] = body["messages"] + [assistant_message]
+    rejected = 0
+    for call in assistant_message["tool_calls"]:
+        function = call.get("function") or {}
+        name = function.get("name")
+        arguments = function.get("arguments", "")
+        extra: dict[str, Any] = {}
+        if name in ours_active:
+            result = await memory_tools.execute(name, arguments, runtime, request_context)
+        else:
+            # Hallucinated memory-tool name: NEVER forwarded to the client.
+            # The model is told the real tool set and the loop continues
+            # (same rule as the non-stream path).
+            result = memory_tools.build_reject_result(name, sorted(ours_injected))
+            rejected += 1
+            extra = {"rejected": True, "result": result}
+        await runtime.db.add_event(
+            Event(
+                session_id=session_id,
+                user_id=request_context.user_id,
+                project_id=request_context.project_id,
+                cwd=request_context.cwd,
+                request_id=request_id,
+                event_type="memory.tool_call",
+                role="tool",
+                content=arguments,
+                metadata={
+                    "name": name,
+                    "result_chars": len(result),
+                    "tool_call_id": call.get("id"),
+                    # Copy-on-write: sanitize only the durable metadata
+                    # copy; the forwarded body["messages"] stays raw.
+                    "assistant_message": {
+                        **assistant_message,
+                        "content": strip_memory_block(
+                            assistant_message.get("content") or ""
+                        ),
+                    },
+                    **extra,
+                },
+            )
+        )
+        body["messages"] = body["messages"] + [
+            {"role": "tool", "tool_call_id": call.get("id"), "content": result}
+        ]
+    return rejected
 
 
 def _strip_injected_tools(body: dict[str, Any], names: set[str]) -> None:
@@ -343,165 +500,254 @@ async def chat_completions(request: Request) -> Response:
                 request_context=request_context,
             )
 
-        # stream_bytes binds on_complete at call time but the classifier only
-        # decides while consuming, so every iteration passes None and the
-        # terminal iteration's recording happens in the returned generator's
-        # finally: suppressed iterations never reach a generator, so they never
-        # record. The loop runs inside the handler; only the terminal
-        # iteration's bytes ever reach the client.
+        # Two-phase streaming. Phase A decides round 1 in the route body,
+        # observable-identical to the pre-0.3 loop (success AND failure), so
+        # round-1 4xx/transport errors keep returning plain Responses and
+        # test_qa_k passes untouched. Phase B is ONE shared generator that runs
+        # upstream attempts 2..MAX+1 inside the returned StreamingResponse;
+        # `stream_mode` only flips that generator's forwarding policy (live
+        # tees visible pre-decision lines, buffered holds everything until the
+        # round decision). Phase A never forwards pre-decision bytes in either
+        # mode. Debug counters ride the stream as trailing SSE comments because
+        # rounds 2+ start before any headers exist.
+        stream_mode = runtime.config.memory.stream_reasoning
+        fields = runtime.config.memory.reasoning_delta_fields
+
+        async def _rounds_stream(tool_rounds: int, reject_count: int) -> AsyncIterator[bytes]:
+            # attempts 2..MAX_ITERATIONS+1: today's total upstream calls per
+            # request, minus the round-1 decision already taken in the body.
+            recorded = False  # completed() exactly-once guard
+            in_terminal = False  # current round resolved terminal (record on disconnect)
+            sent_bytes = False  # any byte already written to this client response
+            accum = bytearray()
+            try:
+                for attempt in range(2, memory_tools.MAX_ITERATIONS + 2):
+                    is_forced = attempt == memory_tools.MAX_ITERATIONS + 1
+                    if is_forced and ours_injected:
+                        # Past the cap: force a terminal ANSWER round. Stripping
+                        # defs alone is insufficient for servers with an
+                        # automatic tool-call parser that re-emits our tool names
+                        # unprompted. tool_choice:"none" (OpenAI spec, honored by
+                        # many OpenAI-compatible servers) forbids tool calls so the
+                        # round must produce text. Keep our names in ours_active so
+                        # a stray call a server emits anyway is OUR loop-capped
+                        # call to suppress, not a foreign tool to forward.
+                        _strip_injected_tools(body, ours_injected)
+                        body["tool_choice"] = "none"
+                    try:
+                        iterator = await runtime.upstream.stream_bytes(
+                            "chat/completions",
+                            body,
+                            request.headers,
+                            None,
+                            request_context=request_context,
+                        )
+                    except httpx.HTTPStatusError as exc:
+                        # An open failure precedes any bytes of this round, and
+                        # before the first forwarded fragment the route can
+                        # still re-present it verbatim.
+                        recorded = True
+                        if sent_bytes:
+                            yield _UPSTREAM_ERROR_EVENT
+                            return
+                        raise _VerbatimResponse(exc.response) from exc
+                    classifier = memory_tools.StreamClassifier(
+                        ours_active,
+                        client_names=client_names,
+                        guard=guard_active,
+                        reasoning_fields=fields,
+                        tee_forward_enabled=(stream_mode == "live"),
+                    )
+                    accum = bytearray()
+                    try:
+                        async for chunk in iterator:
+                            accum.extend(chunk)
+                            out = classifier.consume(chunk)
+                            if out:
+                                sent_bytes = True
+                                yield out
+                            if classifier.decide() == "passthrough":
+                                in_terminal = True
+                    except httpx.RequestError:
+                        # Zero forwarded bytes ⇒ the route body (or its prefetch)
+                        # still owns the response and maps this to today's 502;
+                        # otherwise the status ship has sailed: surface in-stream,
+                        # unrecorded.
+                        recorded = True
+                        if sent_bytes:
+                            yield _UPSTREAM_ERROR_EVENT
+                            return
+                        raise
+                    decision = classifier.decide()
+                    if decision == "undecided":
+                        decision = classifier.finish()
+                    if decision == "suppress":
+                        # A tool round leaks nothing: bytes held past the freeze
+                        # point are discarded and nothing is recorded; assemble
+                        # the round's tool results and run the next attempt.
+                        tool_rounds += 1
+                        assistant_message = _stream_assistant_message(classifier)
+                        reject_count += await _run_tool_round(
+                            runtime,
+                            body,
+                            assistant_message,
+                            ours_active=ours_active,
+                            ours_injected=ours_injected,
+                            request_id=request_id,
+                            session_id=session_id,
+                            request_context=request_context,
+                        )
+                        continue
+                    in_terminal = True
+                    if classifier.forwarded:
+                        # Live tee: visible lines already streamed; release the
+                        # frozen tail (or nothing, if passthrough decided early).
+                        held = classifier.flush_held()
+                        if held:
+                            yield held
+                    elif accum:
+                        # Buffered hold-all (or a live round with no visible
+                        # lines): replay this round's bytes verbatim, once.
+                        yield bytes(accum)
+                    comments = _debug_stream_comments(
+                        debug, ours_injected, tool_rounds, reject_count
+                    )
+                    if comments:
+                        yield comments
+                    recorded = True
+                    await completed(bytes(accum))
+                    return
+                # Cap exhausted: every round suppressed. Mirrors today's
+                # residual empty terminal; nothing is ever recorded here.
+                comments = _debug_stream_comments(
+                    debug, ours_injected, tool_rounds, reject_count
+                )
+                if comments:
+                    yield comments
+            finally:
+                # Only client-disconnect teardown of a TERMINAL round records a
+                # partial here (parity with the old stream_out finally): error
+                # and suppressed rounds set `recorded` or never set
+                # `in_terminal`, so they never produce assistant events.
+                if not recorded and in_terminal:
+                    await completed(bytes(accum))
+
         counter.increment()
         handed_off = False
         try:
             tool_rounds = 0
-            final_iterator: AsyncIterator[bytes] | None = None
             ours_active: set[str] = set(ours_injected)
-            # One extra round past the tool-round cap: suppress rounds are now
-            # reachable on any request (static tool exposure), so the cap can
-            # actually fire; the forced round must answer, never blank the client.
-            for round_no in range(memory_tools.MAX_ITERATIONS + 1):
-                is_forced = round_no == memory_tools.MAX_ITERATIONS
-                if is_forced and ours_injected:
-                    # Past the cap: force a terminal ANSWER round. Stripping defs
-                    # alone is insufficient for servers with an automatic tool-call
-                    # parser that re-emits our tool names unprompted.
-                    # tool_choice:"none" (OpenAI spec, honored by many OpenAI-compatible
-                    # servers) forbids tool calls so the round must produce text.
-                    # Keep our names in ours_active so a stray call that a server
-                    # emits anyway is OUR loop-capped call to suppress, not a
-                    # foreign tool to forward to the client.
-                    _strip_injected_tools(body, ours_injected)
-                    body["tool_choice"] = "none"
-                try:
-                    iterator = await runtime.upstream.stream_bytes(
-                        "chat/completions",
-                        body,
-                        request.headers,
-                        None,
-                        request_context=request_context,
-                    )
-                except httpx.HTTPStatusError as exc:
-                    response = exc.response
-                    return Response(
-                        content=response.content,
-                        status_code=response.status_code,
-                        media_type=response.headers.get("content-type", "application/json"),
-                        headers=debug_headers,
-                    )
-
-                classifier = memory_tools.StreamClassifier(
-                    ours_active, client_names=client_names, guard=guard_active
+            # Phase A: round-1 decision in the body. tee_forward_enabled=False
+            # keeps live byte-identical to buffered here: hold everything, decide
+            # on content/foreign or at end of stream.
+            try:
+                iterator = await runtime.upstream.stream_bytes(
+                    "chat/completions",
+                    body,
+                    request.headers,
+                    None,
+                    request_context=request_context,
                 )
-                accum = bytearray()
-                exhausted = True
-                try:
-                    async for chunk in iterator:
-                        accum.extend(chunk)
-                        classifier.feed(chunk)
-                        if classifier.decide() == "passthrough":
-                            exhausted = False
-                            break
-                except httpx.RequestError as exc:
-                    raise HTTPException(502, f"upstream connection failed: {exc}") from exc
+            except httpx.HTTPStatusError as exc:
+                response = exc.response
+                return Response(
+                    content=response.content,
+                    status_code=response.status_code,
+                    media_type=response.headers.get("content-type", "application/json"),
+                    headers=debug_headers,
+                )
 
-                decision = "passthrough" if not exhausted else classifier.finish()
-                if decision in ("passthrough", "replay"):
-                    live: AsyncIterator[bytes] | None = iterator
-                    if decision == "replay":
-                        # Drain the rest here (its finally closes the upstream
-                        # response); the full bytes replay from accum below.
-                        try:
-                            async for chunk in iterator:
-                                accum.extend(chunk)
-                        except httpx.RequestError as exc:
-                            raise HTTPException(
-                                502, f"upstream connection failed: {exc}"
-                            ) from exc
-                        live = None
+            classifier = memory_tools.StreamClassifier(
+                ours_active,
+                client_names=client_names,
+                guard=guard_active,
+                reasoning_fields=fields,
+                tee_forward_enabled=False,
+            )
+            accum = bytearray()
+            exhausted = True
+            try:
+                async for chunk in iterator:
+                    accum.extend(chunk)
+                    classifier.feed(chunk)
+                    if classifier.decide() == "passthrough":
+                        exhausted = False
+                        break
+            except httpx.RequestError as exc:
+                raise HTTPException(502, f"upstream connection failed: {exc}") from exc
 
-                    async def stream_out(
-                        accum=accum, live=live
-                    ) -> AsyncIterator[bytes]:  # default-args pin this iteration's state
-                        try:
-                            if accum:
-                                yield bytes(accum)
-                            if live is not None:
-                                async for chunk in live:
-                                    accum.extend(chunk)
-                                    yield chunk
-                        finally:
-                            await completed(bytes(accum))
+            decision = "passthrough" if not exhausted else classifier.finish()
+            if decision in ("passthrough", "replay"):
+                live: AsyncIterator[bytes] | None = iterator
+                if decision == "replay":
+                    # Drain the rest here (its finally closes the upstream
+                    # response); the full bytes replay from accum in the
+                    # generator below.
+                    try:
+                        async for chunk in iterator:
+                            accum.extend(chunk)
+                    except httpx.RequestError as exc:
+                        raise HTTPException(
+                            502, f"upstream connection failed: {exc}"
+                        ) from exc
+                    live = None
+                handed_off = True
+                return StreamingResponse(
+                    _counted(
+                        _terminal_stream(
+                            accum,
+                            live,
+                            _debug_stream_comments(
+                                debug, ours_injected, tool_rounds, reject_count
+                            ),
+                            completed,
+                        ),
+                        counter,
+                    ),
+                    media_type="text/event-stream",
+                    headers=debug_headers,
+                )
 
-                    final_iterator = stream_out()
-                    break
+            # Round 1 suppressed: assemble it in the body, then hand every
+            # remaining attempt to the Phase-B generator.
+            tool_rounds += 1
+            assistant_message = _stream_assistant_message(classifier)
+            reject_count += await _run_tool_round(
+                runtime,
+                body,
+                assistant_message,
+                ours_active=ours_active,
+                ours_injected=ours_injected,
+                request_id=request_id,
+                session_id=session_id,
+                request_context=request_context,
+            )
 
-                tool_rounds += 1
-                calls = memory_tools.reassemble_stream_tool_calls(classifier.calls)
-                assistant_content, _ = extract_stream_assistant(classifier.collected_bytes())
-                assistant_message: dict[str, Any] = {"role": "assistant"}
-                if assistant_content:
-                    assistant_message["content"] = assistant_content
-                assistant_message["tool_calls"] = calls
-                body["messages"] = body["messages"] + [assistant_message]
-                for call in calls:
-                    function = call.get("function") or {}
-                    name = function.get("name")
-                    arguments = function.get("arguments", "")
-                    extra: dict[str, Any] = {}
-                    if name in ours_active:
-                        result = await memory_tools.execute(
-                            name, arguments, runtime, request_context
-                        )
-                    else:
-                        # Hallucinated memory-tool name: NEVER forwarded to the
-                        # client. The model is told the real tool set and the loop
-                        # continues (same rule as the non-stream path).
-                        result = memory_tools.build_reject_result(name, sorted(ours_injected))
-                        reject_count += 1
-                        extra = {"rejected": True, "result": result}
-                    await runtime.db.add_event(
-                        Event(
-                            session_id=session_id,
-                            user_id=request_context.user_id,
-                            project_id=request_context.project_id,
-                            cwd=request_context.cwd,
-                            request_id=request_id,
-                            event_type="memory.tool_call",
-                            role="tool",
-                            content=arguments,
-                            metadata={
-                                "name": name,
-                                "result_chars": len(result),
-                                "tool_call_id": call.get("id"),
-                                # Copy-on-write: sanitize only the durable metadata
-                                # copy; the forwarded body["messages"] stays raw.
-                                "assistant_message": {
-                                    **assistant_message,
-                                    "content": strip_memory_block(
-                                        assistant_message.get("content") or ""
-                                    ),
-                                },
-                                **extra,
-                            },
-                        )
-                    )
-                    body["messages"] = body["messages"] + [
-                        {"role": "tool", "tool_call_id": call.get("id"), "content": result}
-                    ]
-
-            if debug and (ours_injected or tool_rounds):
-                debug_headers["x-infinitum-memory-tool-calls"] = str(tool_rounds)
-            if debug and reject_count:
-                debug_headers["x-infinitum-memory-tool-rejects"] = str(reject_count)
-            if final_iterator is None:
-                # Residual: only reachable if the server ignored
-                # tool_choice:"none" AND the forced round emitted a suppressible
-                # all-ours tool-call stream with no content. Keep the empty-stream
-                # fallback; re-streaming synthesis is deliberately not attempted.
-                final_iterator = _empty_stream()
-            final_iterator = _counted(final_iterator, counter)
+            # Prefetch one fragment so generator-raised plumbing errors
+            # (_VerbatimResponse, raw RequestError) still become today's plain
+            # Response / 502 BEFORE the StreamingResponse exists.
+            stream = _rounds_stream(tool_rounds, reject_count)
+            try:
+                first: bytes | None = await stream.__anext__()
+            except StopAsyncIteration:
+                first = None
+            except _VerbatimResponse as verbatim:
+                await stream.aclose()
+                failed = verbatim.response
+                return Response(
+                    content=failed.content,
+                    status_code=failed.status_code,
+                    media_type=failed.headers.get("content-type", "application/json"),
+                    headers=debug_headers,
+                )
+            except httpx.RequestError as exc:
+                await stream.aclose()
+                raise HTTPException(502, f"upstream connection failed: {exc}") from exc
             handed_off = True
             return StreamingResponse(
-                final_iterator, media_type="text/event-stream", headers=debug_headers
+                _counted(_prefixed(first, stream), counter),
+                media_type="text/event-stream",
+                headers=debug_headers,
             )
         finally:
             if not handed_off:

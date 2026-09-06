@@ -1388,8 +1388,11 @@ def test_stream_reject_no_leak():
             assert "infinitum_retrieve" not in text
             assert "tool_calls" not in text
             assert "PostgreSQL 17." in text
-            assert response.headers["x-infinitum-memory-tool-rejects"] == "1"
-            assert response.headers["x-infinitum-memory-tool-calls"] == "1"
+            # Streaming responses carry the debug counters as trailing SSE
+            # comments (rounds 2+ run inside the response; headers impossible).
+            assert ": x-infinitum-memory-tool-rejects 1" in text
+            assert ": x-infinitum-memory-tool-calls 1" in text
+            assert "x-infinitum-memory-tool-calls" not in response.headers
             assert upstream.calls == 2
             second = upstream.bodies[1]
             assistant = [m for m in second["messages"] if m.get("tool_calls")]
@@ -1465,6 +1468,73 @@ def test_stream_reject_mixed_foreign_replays():
                 e["event_type"] == "memory.tool_call"
                 for e in _events(client, "stream-reject-mixed")
             )
+
+
+def test_stream_upstream_4xx_represented_verbatim():
+    # Round 2 opens INSIDE the response generator; an HTTPStatusError with zero
+    # bytes forwarded is re-presented as a plain Response (prefetched first
+    # fragment), not raised through the stream and not recorded.
+    round1 = [
+        _tool_chunk(0, "call_4xx", "infinitum_memory_search", '{"query": "db"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    bodies: list[dict] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                bodies.append(json.loads(request.content))
+                if len(bodies) == 1:
+
+                    async def round1_body():
+                        for chunk in round1:
+                            yield chunk
+
+                    return httpx.Response(200, content=round1_body())
+                return httpx.Response(429, content=b'{"error":{"message":"rate"}}')
+
+            app.state.runtime.upstream.client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            response = _chat(client, "stream-4xx", extra={"stream": True})
+            assert response.status_code == 429
+            assert response.content == b'{"error":{"message":"rate"}}'
+            assert len(bodies) == 2
+            events = _events(client, "stream-4xx")
+            assert not any(e["event_type"] == "message.assistant" for e in events)
+
+
+def test_stream_error_after_forward_yields_sse_error():
+    # Round 1 (in-body decision) suppresses silently; round 2 streams its
+    # reasoning under live mode, then the iterator dies. Client bytes exist, so
+    # the failure surfaces as one in-stream SSE error event and nothing records.
+    round1 = [
+        _tool_chunk(0, "call_err", "infinitum_memory_search", '{"query": "db"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    reasoning = _delta_event({"reasoning": "pondering the database"})
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(
+                app.state.runtime,
+                [(round1, None), ([reasoning], httpx.ConnectError("boom"))],
+            )
+            response = _chat(client, "stream-err", extra={"stream": True})
+            assert response.status_code == 200
+            text = response.content.decode()
+            assert "pondering the database" in text
+            assert "tool_calls" not in text
+            assert 'data: {"error"' in text
+            assert text.rstrip().endswith("data: [DONE]")
+            assert upstream.calls == 2
+            events = _events(client, "stream-err")
+            assert not any(e["event_type"] == "message.assistant" for e in events)
 
 
 # --- StreamClassifier reasoning awareness + tee-mode consume (todo 2) ---------
