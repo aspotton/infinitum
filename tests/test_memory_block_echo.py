@@ -218,6 +218,53 @@ def test_strip_200kb_adversarial_input_under_250ms():
     assert elapsed < 0.25, f"strip took {elapsed * 1000:.0f}ms"
 
 
+def test_strip_scales_linearly_with_unterminated_open_tags():
+    # Quadratic regression guard + equivalence pin for the rpartition bound.
+    # Given: a reference copy of the pre-fix strip (pair regex over the whole
+    # string) and shapes covering every pair/close arrangement
+    def _reference(text: str) -> str:
+        text = compiler._PAIR_RE.sub("", text)
+        text = compiler._FOOTER_RE.sub("", text)
+        return compiler._OPEN_TAIL_RE.sub("", text)
+
+    filler = "filler text. " * 8
+    shapes = {
+        "no_close": "hi\n" + PREAMBLE + "trailing prose",
+        "close_at_end": "a" + _legacy_block("body") + "b",
+        "block_only": _legacy_block("x"),
+        "stray_close_then_opens": compiler._BLOCK_CLOSE + (filler + PREAMBLE) * 40,
+        "opens_then_stray_close_then_block": (filler + PREAMBLE) * 20
+        + compiler._BLOCK_CLOSE
+        + _legacy_block("real"),
+        "footer_only": "answer\n\n" + ONE_TOOL_FOOTER,
+        "clean": "nothing here at all",
+    }
+    # Then: the rpartition-bounded strip returns byte-identical output.
+    for name, text in shapes.items():
+        assert _strip(text) == _reference(text), f"output drifted on {name!r}"
+    # And: constant-density unterminated open tags, timed at 1x and 4x size.
+    # Linear is ~4x, quadratic is ~16x the 1x time. Repeats take the min so
+    # a scheduler pause during the 2ms small run cannot fake a 16x ratio.
+    unit = "alpha bravo charlie delta echo. " * 24 + PREAMBLE
+    small = unit * 200
+    large = small * 4
+
+    def _timed(text: str) -> float:
+        best = float("inf")
+        for _ in range(3):
+            started = time.perf_counter()
+            _strip(text)
+            best = min(best, time.perf_counter() - started)
+        return best
+
+    _strip(large)  # warm-up: code paths, allocator, page cache
+    t_small = _timed(small)
+    t_large = _timed(large)
+    assert t_large < 6 * t_small, (
+        f"quadratic scaling: {t_small * 1000:.0f}ms -> {t_large * 1000:.0f}ms"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Route wiring (t1-t5): strip_memory_block at the durable-text boundaries in
 # routes/openai.py (the user_text assignment, _record_completion, and both

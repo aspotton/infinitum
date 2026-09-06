@@ -41,6 +41,9 @@ _FOOTER_RE = re.compile(
 _OPEN_TAIL_RE = re.compile(re.escape(_BLOCK_OPEN) + r".*$", re.DOTALL)
 # Union so the cleanup scanner flags exactly what the sanitizer strips; the
 # two can never drift.
+# ponytail: search() keeps the quadratic open-tag scan cost; acceptable
+# because it runs only in the offline contamination sweep, not on the
+# event-loop path. Do not "optimize" the union itself.
 _DETECT_RE = re.compile(
     _PAIR_RE.pattern + "|" + _FOOTER_RE.pattern + "|" + _OPEN_TAIL_RE.pattern,
     re.DOTALL,
@@ -266,7 +269,15 @@ def strip_memory_block(text: str) -> str:
     are not detectable here; the archival sweep is the mitigation.
     """
     # Order matters: _OPEN_TAIL_RE truncates to end-of-string, so it runs last.
-    text = _PAIR_RE.sub("", text)
+    # Pair-scan region ends AT the last close tag: the lazy .*? otherwise
+    # expands to end-of-string once per open tag with no following close
+    # (quadratic). The split stays inclusive of that close tag or the final
+    # block's open tag would never match; nothing after it can join a pair,
+    # so output is unchanged. A bare "close in text" guard is not equivalent:
+    # presence alone still lets the full-string scan go quadratic.
+    head, sep, tail = text.rpartition(_BLOCK_CLOSE)
+    if sep:
+        text = _PAIR_RE.sub("", head + sep) + tail
     text = _FOOTER_RE.sub("", text)
     text = _OPEN_TAIL_RE.sub("", text)
     return text
