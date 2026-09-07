@@ -2,7 +2,10 @@ import os
 import tempfile
 from pathlib import Path
 
-from infinitum.config import load_config
+import pytest
+from pydantic import ValidationError
+
+from infinitum.config import AppConfig, load_config
 
 
 def test_config_environment_expansion():
@@ -35,3 +38,14 @@ def test_reinforcement_controls_have_safe_defaults():
     assert cfg.memory.reinforce_hint_min_score == 0.55
     assert cfg.memory.reinforce_hint_min_lexical == 0.40
     assert cfg.memory.reinforce_hint_min_semantic == 0.72
+
+
+def test_stream_reasoning_defaults():
+    cfg = AppConfig()
+    assert cfg.memory.stream_reasoning == "live"
+    assert cfg.memory.reasoning_delta_fields == ["reasoning", "reasoning_content"]
+
+
+def test_stream_reasoning_rejects_unknown_mode():
+    with pytest.raises(ValidationError):
+        AppConfig(memory={"stream_reasoning": "bogus"})

@@ -67,6 +67,11 @@ class MemoryConfig(BaseModel):
     # memory-enabled request (static exposure for prompt-cache stability);
     # default off for upstream compatibility.
     tools_enabled: bool = False
+    # "live" streams model reasoning deltas to the client before a round decides;
+    # "buffered" holds everything until the decision (pre-0.2 behavior).
+    stream_reasoning: Literal["live", "buffered"] = "live"
+    # SSE delta field names that carry model reasoning for the live mode.
+    reasoning_delta_fields: list[str] = ["reasoning", "reasoning_content"]
 
 
 class ContextConfig(BaseModel):

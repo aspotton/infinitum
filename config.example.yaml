@@ -20,6 +20,11 @@ memory:
   inject_max_memories: 24
   # Read-only drill-down tools: infinitum_memory_search / infinitum_memory_get.
   tools_enabled: false
+  # "live" streams model reasoning deltas to the client before a round decides;
+  # "buffered" holds everything until the decision (pre-0.2 behavior).
+  stream_reasoning: live
+  # SSE delta field names that carry model reasoning.
+  reasoning_delta_fields: [reasoning, reasoning_content]
   dedup_similarity: 0.88
   # Near-identical wording reinforces directly.
   reinforce_similarity: 0.86

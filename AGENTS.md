@@ -117,6 +117,8 @@ routes/openai.py:chat_completions → request_context.resolve → compiler.compi
   → _record_completion → db.add_event + db.enqueue_job("learn_interaction")
 ```
 
+Streaming has two `memory.stream_reasoning` modes: `live` tees model reasoning deltas to the client while a round is undecided and freezes at the first tool-call line; `buffered` holds all round bytes until the decision. Round-1 decisions and round-1 errors always behave identically in both modes. Rounds 2+ run inside the returned `StreamingResponse`: upstream failures there are either a 0-byte verbatim error re-presentation (nothing forwarded yet) or an in-stream SSE error event (bytes already forwarded), never HTTP statuses; suppressed rounds' `[DONE]` sentinels are never forwarded. Streaming debug counters ride the stream as trailing SSE comments in both modes (headers stay on non-stream responses only). `completed()` sees the final round only.
+
 Background path:
 
 ```
@@ -149,7 +151,7 @@ ruff check .
 
 Any change to request headers, database migration, reinforcement, retrieval limits, streaming, or background learning should include or update focused tests.
 
-Test conventions: flat `tests/` (12 files, no conftest, no shared helpers). DB isolation via `tempfile.TemporaryDirectory()`; upstream faked either by `httpx.MockTransport` handler (foreground proxy) or `AsyncMock` on `learning_chat_completion`/`retriever.search` (background). Tests construct `AppConfig()` directly, mutate fields, call `create_app(cfg)`, and wrap in `TestClient`.
+Test conventions: flat `tests/` (18 files, no conftest, no shared helpers). DB isolation via `tempfile.TemporaryDirectory()`; upstream faked either by `httpx.MockTransport` handler (foreground proxy) or `AsyncMock` on `learning_chat_completion`/`retriever.search` (background). Tests construct `AppConfig()` directly, mutate fields, call `create_app(cfg)`, and wrap in `TestClient`.
 
 Before packaging a release, verify at minimum:
 

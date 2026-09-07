@@ -48,9 +48,13 @@ class MemoryLearner:
         """
 
         query = payload.get("user_text", "")
-        assistant = payload.get("assistant_text", "")
+        assistant = payload.get("assistant_text") or ""
         model = self.config.learning.model or payload.get("model") or ""
-        if not model or not (query or assistant):
+        if not model or not assistant.strip():
+            log.debug(
+                "skipping learning request_id=%s (missing model or empty assistant content)",
+                payload.get("request_id", "?"),
+            )
             return
 
         context_payload = payload.get("request_context")

@@ -82,6 +82,9 @@ class StreamClassifier:
         ours: Iterable[str],
         client_names: set[str] | None = None,
         guard: bool = False,
+        *,
+        reasoning_fields: Sequence[str] = (),
+        tee_forward_enabled: bool = False,
     ) -> None:
         self._ours = set(ours)
         self._client_names = client_names or set()
@@ -94,6 +97,13 @@ class StreamClassifier:
         self._foreign_seen = False
         self._chunks: list[dict[str, Any]] = []
         self._finish_reason: str | None = None
+        self._reasoning_fields = tuple(reasoning_fields)
+        self._tee_forward = tee_forward_enabled
+        self._reasoning_seen = False
+        self._frozen = False
+        self._fwd_pos = 0
+        self._tee_buf = bytearray()
+        self._pending: list[bytes] = []
 
     def feed(self, chunk: bytes) -> list[bytes]:
         """Consume one network chunk; return raw bytes safe to forward now.
@@ -115,6 +125,49 @@ class StreamClassifier:
             flushed, self._held = list(self._held), []
             return flushed
         return []
+
+    def consume(self, chunk: bytes) -> bytes:
+        """Tee-mode consume for the Phase-B tool rounds; return bytes to forward now.
+
+        Additive to `feed()`: while undecided it holds all bytes exactly like
+        `feed()` unless `tee_forward_enabled` and a reasoning delta has been
+        seen, in which case complete visible lines (no tool_calls, null
+        finish_reason, not [DONE]) forward verbatim until the first freeze
+        trigger line (tool_calls, non-null finish_reason, [DONE], or an
+        unparseable data line), whose bytes and all later bytes stay held until
+        the round decision. On a "passthrough" decision it flushes every held
+        byte in order and forwards raw thereafter, byte-identical to `feed()`.
+        """
+        self._collected.extend(chunk)
+        if self._passthrough:
+            self._fwd_pos = len(self._collected)
+            return chunk
+        self._tee_buf.extend(chunk)
+        while (newline := self._tee_buf.find(b"\n")) >= 0:
+            line = bytes(self._tee_buf[: newline + 1])
+            del self._tee_buf[: newline + 1]
+            self._scan_line(line)
+            self._pending.append(line)
+        if self._content_seen or self._foreign_seen:
+            self._passthrough = True
+            return self.flush_held()
+        if self._tee_forward and self._reasoning_seen and not self._frozen:
+            out = bytearray()
+            while self._pending and not _freeze_trigger(self._pending[0]):
+                line = self._pending.pop(0)
+                out.extend(line)
+                self._fwd_pos += len(line)
+            if self._pending:
+                self._frozen = True
+            return bytes(out)
+        return b""
+
+    def flush_held(self) -> bytes:
+        """Return (and mark forwarded) every collected byte not yet forwarded."""
+        flushed = bytes(self._collected[self._fwd_pos :])
+        self._fwd_pos = len(self._collected)
+        self._pending.clear()
+        return flushed
 
     def decide(self) -> str:
         """Mid-stream decision after a feed: "passthrough" or "undecided"."""
@@ -176,13 +229,25 @@ class StreamClassifier:
                     and is_rejectable_memory_name(name, self._ours, self._client_names)
                 ):
                     self._foreign_seen = True
+        for field in self._reasoning_fields:
+            value = delta.get(field)
+            if isinstance(value, str) and value:
+                self._reasoning_seen = True
+                break
         reason = choice.get("finish_reason")
         if isinstance(reason, str) and reason:
             self._finish_reason = reason
 
+
+
     @property
     def content_seen(self) -> bool:
         return self._content_seen
+
+    @property
+    def forwarded(self) -> bool:
+        """True once any byte of this round has been forwarded to the client."""
+        return self._fwd_pos > 0
 
     @property
     def calls(self) -> list[dict[str, Any]]:
@@ -195,6 +260,36 @@ class StreamClassifier:
 
     def collected_bytes(self) -> bytes:
         return bytes(self._collected)
+
+def _freeze_trigger(line: bytes) -> bool:
+    """True for a complete SSE line tee-mode forwarding must stop before.
+
+    Triggers: delta carries tool_calls, a non-null finish_reason, [DONE], or a
+    data line that fails JSON parsing. Non-data (blank/comment) lines never
+    trigger; an unparseable-but-not-prefixed line is not a data line at all.
+    """
+    text = line.rstrip(b"\r").decode("utf-8", errors="replace").strip()
+    if not text.startswith("data:"):
+        return False
+    payload = text[5:].strip()
+    if payload == "[DONE]":
+        return True
+    if not payload:
+        return False
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return True
+    if not isinstance(data, dict):
+        return True
+    choices = data.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return False
+    choice = choices[0]
+    delta = choice.get("delta") or {}
+    if delta.get("tool_calls"):
+        return True
+    return choice.get("finish_reason") is not None
 
 
 class ToolRuntime(Protocol):
