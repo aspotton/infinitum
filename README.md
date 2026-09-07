@@ -14,7 +14,7 @@
 
 Infinitum is a standalone Python 3 memory and context runtime for AI agents and LLM applications. It exposes an OpenAI-compatible API, maintains durable event-sourced memory, learns and consolidates useful long-term context, and injects only the most relevant memory into each request.
 
-Current release: **v0.2.7**.
+Current release: **v0.2.8**.
 
 Full release history lives in [CHANGELOG.md](CHANGELOG.md). Upgrading from v0.1.x? See [the migration guide](docs/MIGRATION_FROM_CONTEXT_RUNTIME.md).
 
