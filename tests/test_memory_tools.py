@@ -2000,6 +2000,69 @@ async def test_stream_live_reasoning_arrives_before_final_content():
             await rt.db.close()
 
 
+@pytest.mark.asyncio
+async def test_stream_live_round1_reasoning_arrives_before_final_content():
+    # Round-1 liveness spec (red until live mode routes round 1 through the
+    # Phase-B tee). A no-tool request whose single round reasons then answers:
+    # in live mode the reasoning bytes must hit the wire DURING generation,
+    # strictly before the final-content bytes. Today the route body holds
+    # everything (Phase A builds its classifier with tee_forward_enabled=False
+    # and accumulates round-1 bytes in the body before the StreamingResponse
+    # exists), so both markers first appear in the same fragment and the
+    # monotonic delta collapses to ~0 — the delta assert is the red pin.
+    # Timing design mirrors the neighbor round-2 test verbatim: raw ASGI
+    # driving with per-send timestamps, 0.3s upstream sleep, >=0.15s margin.
+    import asyncio
+
+    with tempfile.TemporaryDirectory() as tmp:
+        app, rt = await _stream_runtime(tmp)
+        app.state.runtime.config.memory.stream_reasoning = "live"
+        calls: list[dict] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(json.loads(request.content))
+
+            async def answer_body():
+                yield _reasoning_chunk("incremental-live-think")
+                yield _reasoning_chunk(" more thought")
+                await asyncio.sleep(0.3)
+                yield _content_chunk("incremental-final-answer")
+                yield _finish_chunk("stop")
+                yield _DONE
+
+            return httpx.Response(200, content=answer_body())
+
+        rt.upstream.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            status, frags = await _asgi_stream(
+                app,
+                {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "What database standard do we use?"}],
+                },
+                "live-round1-incremental",
+            )
+            assert status == 200
+            joined = b"".join(frag for _, frag in frags)
+            # Byte-offset ordering within the received stream.
+            assert joined.index(_THINK_MARKER) < joined.index(_FINAL_MARKER)
+            # Timing: first fragment whose cumulative stream contains each marker.
+            seen_at: dict[bytes, float] = {}
+            cumulative = b""
+            for t, frag in frags:
+                cumulative += frag
+                for marker in (_THINK_MARKER, _FINAL_MARKER):
+                    if marker not in seen_at and marker in cumulative:
+                        seen_at[marker] = t
+            assert seen_at[_FINAL_MARKER] - seen_at[_THINK_MARKER] >= 0.15
+            assert len(calls) == 1
+            # Counter drains after the completed stream (scenario: drain check).
+            assert rt.active_requests.value == 0
+        finally:
+            await rt.upstream.client.aclose()
+            await rt.db.close()
+
+
 @pytest.mark.parametrize("mode", ["live", "buffered"])
 def test_stream_reasoning_free_stream_byte_identical_across_modes(mode):
     # Scenario 3: an identical scripted stream in which NO configured
