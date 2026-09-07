@@ -7,7 +7,7 @@
 - Memory tool calls and tool results are still never forwarded in either mode, and a live stream freezes the moment a tool-call line appears; under `live`, thinking text from intermediate tool rounds may now be visible in the client stream.
 - Streaming tool rounds after the first now run inside the streamed response; an upstream failure there surfaces either verbatim with zero bytes already sent, or as an in-stream SSE error event once bytes are committed, rather than failing a response whose status is already fixed.
 - Streaming `X-Infinitum-Debug` round counters now ride the stream as trailing SSE comment lines after `[DONE]` instead of response headers; SDK parsers that stop at the sentinel never see them, and non-stream responses keep their debug headers unchanged.
-- Added regression tests for the live and buffered modes, byte parity, reasoning passthrough, and error surfacing; the full suite now covers 181 tests.
+- Added regression tests for the live and buffered modes, byte parity, reasoning passthrough, and error surfacing; the full suite now covers 193 tests.
 
 ## 0.2.7
 
