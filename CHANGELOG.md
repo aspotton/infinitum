@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.9
 
 - In the default `live` mode, round-1 model reasoning deltas now stream to the client as they arrive instead of being held until the round's decision; `buffered` mode is unchanged and still holds every token until the decision.
 - A round-1 upstream failure before any streamed byte still returns a plain HTTP response, while a failure after reasoning bytes have been forwarded surfaces as an in-stream SSE error event.
