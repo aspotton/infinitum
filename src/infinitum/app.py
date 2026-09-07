@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from . import __version__
 from .config import AppConfig, load_config
 from .routes import admin, memory, openai
 from .runtime import build_runtime
@@ -25,7 +26,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             await runtime.embeddings.close()
             await runtime.db.close()
 
-    app = FastAPI(title="Infinitum", version="0.2.7", lifespan=lifespan)
+    app = FastAPI(title="Infinitum", version=__version__, lifespan=lifespan)
     app.include_router(openai.router)
     app.include_router(memory.router)
     app.include_router(admin.router)

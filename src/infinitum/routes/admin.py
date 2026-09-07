@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Query, Request
 
+from .. import __version__
 from ..runtime import Runtime
 
 router = APIRouter()
@@ -16,7 +17,7 @@ async def health(request: Request):
     runtime = _runtime(request)
     return {
         "status": "ok",
-        "version": "0.2.7",
+        "version": __version__,
         "memory_enabled": runtime.config.memory.enabled,
         "learning_enabled": runtime.config.learning.enabled,
         "embeddings_enabled": runtime.config.embeddings.enabled,
