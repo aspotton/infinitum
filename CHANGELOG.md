@@ -7,7 +7,11 @@
 - Memory tool calls and tool results are still never forwarded in either mode, and a live stream freezes the moment a tool-call line appears; under `live`, thinking text from intermediate tool rounds may now be visible in the client stream.
 - Streaming tool rounds after the first now run inside the streamed response; an upstream failure there surfaces either verbatim with zero bytes already sent, or as an in-stream SSE error event once bytes are committed, rather than failing a response whose status is already fixed.
 - Streaming `X-Infinitum-Debug` round counters now ride the stream as trailing SSE comment lines after `[DONE]` instead of response headers; SDK parsers that stop at the sentinel never see them, and non-stream responses keep their debug headers unchanged.
-- Added regression tests for the live and buffered modes, byte parity, reasoning passthrough, and error surfacing; the full suite now covers 193 tests.
+- Added regression tests for the live and buffered modes, byte parity, reasoning passthrough, and error surfacing.
+- Memory extraction now skips interactions whose assistant text is empty or whitespace-only, such as tool-call-only or blank turns. Those interactions complete their learning job as an instant no-op instead of firing a full extraction call, which previously flooded the upstream during client retry loops.
+- Skipped interactions are still recorded as immutable events; events remain the truth, and only the derived-memory work is skipped.
+- Known limitation: a durable statement made only in a user message on a turn that never receives an assistant answer is no longer extracted at that moment; it stays in events and is learned if a later answered turn repeats the context.
+- Added regression tests for the contentless-interaction skip; the full suite now covers 196 tests.
 
 ## 0.2.7
 
