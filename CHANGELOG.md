@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- In the default `live` mode, round-1 model reasoning deltas now stream to the client as they arrive instead of being held until the round's decision; `buffered` mode is unchanged and still holds every token until the decision.
+- A round-1 upstream failure before any streamed byte still returns a plain HTTP response, while a failure after reasoning bytes have been forwarded surfaces as an in-stream SSE error event.
+
 ## 0.2.8
 
 - Added `memory.stream_reasoning` (default `live`): streaming responses now pass a thinking model's reasoning deltas through to the client while a round is still undecided, instead of holding every token until the round's purpose is known; set `buffered` to restore the prior hold-everything behavior.
