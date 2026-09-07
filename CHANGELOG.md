@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Memory extraction now skips interactions whose assistant text is empty or whitespace-only, such as tool-call-only or blank turns. Those interactions complete their learning job as an instant no-op instead of firing a full extraction call, which previously flooded the upstream during client retry loops.
+- Skipped interactions are still recorded as immutable events; events remain the truth, and only the derived-memory work is skipped.
+- Known limitation: a durable statement made only in a user message on a turn that never receives an assistant answer is no longer extracted at that moment; it stays in events and is learned if a later answered turn repeats the context.
+- Added regression tests for the contentless-interaction skip; the full suite now covers 166 tests.
+
 ## 0.2.7
 
 - Retrieval eligibility now requires at least one genuine relevance signal (semantic, lexical, or topic) above `memory.minimum_relevance_score` (default `0.08`; set `0.0` to disable) before importance, confidence, or freshness can qualify a memory; the high-importance goal/decision exemption is unchanged and the drill-down memory tools and `POST /memory/search` share the same gated scorer.

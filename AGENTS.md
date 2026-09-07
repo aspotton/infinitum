@@ -149,7 +149,7 @@ ruff check .
 
 Any change to request headers, database migration, reinforcement, retrieval limits, streaming, or background learning should include or update focused tests.
 
-Test conventions: flat `tests/` (12 files, no conftest, no shared helpers). DB isolation via `tempfile.TemporaryDirectory()`; upstream faked either by `httpx.MockTransport` handler (foreground proxy) or `AsyncMock` on `learning_chat_completion`/`retriever.search` (background). Tests construct `AppConfig()` directly, mutate fields, call `create_app(cfg)`, and wrap in `TestClient`.
+Test conventions: flat `tests/` (18 files, no conftest, no shared helpers). DB isolation via `tempfile.TemporaryDirectory()`; upstream faked either by `httpx.MockTransport` handler (foreground proxy) or `AsyncMock` on `learning_chat_completion`/`retriever.search` (background). Tests construct `AppConfig()` directly, mutate fields, call `create_app(cfg)`, and wrap in `TestClient`.
 
 Before packaging a release, verify at minimum:
 
