@@ -135,6 +135,14 @@ Key symbols: `build_runtime` (runtime.py), `create_app` (app.py), `chat_completi
 
 All release changes, new-version descriptions, and feature narratives belong in `CHANGELOG.md`. The README keeps only the single `Current release: vX.Y.Z` line plus a pointer to the changelog — do not add or update version-release prose in README. Write entries in CHANGELOG.md's dash-bullet style and keep them vendor-neutral: describe server behaviors generically (for example, "OpenAI-compatible servers with automatic tool-call parsers") instead of naming specific vendor stacks.
 
+## Versioning
+
+- The single source of truth for the version is `__version__` in `src/infinitum/__init__.py`.
+- `pyproject.toml` reads it dynamically via hatchling (`[tool.hatch.version]`); do not duplicate the number there.
+- The FastAPI/OpenAPI version and `/health` derive from `__version__` in code; do not hardcode versions in routes or app construction.
+- A release bump edits `__init__.py` plus the human sites: the README `Current release:` line, the `docs/ARCHITECTURE.md` heading, and `CHANGELOG.md`.
+- After every bump rerun `uv pip install -e .` or the branding metadata test fails by design — the installed dist-info version freezes at install time (in a bare `pythonpath=["src"]` checkout without an install, that test skips instead).
+
 ## Testing
 
 Run from the repository root:
