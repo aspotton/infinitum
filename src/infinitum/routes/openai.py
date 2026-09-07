@@ -500,28 +500,33 @@ async def chat_completions(request: Request) -> Response:
                 request_context=request_context,
             )
 
-        # Two-phase streaming. Phase A decides round 1 in the route body,
-        # observable-identical to the pre-0.3 loop (success AND failure), so
-        # round-1 4xx/transport errors keep returning plain Responses and
-        # test_qa_k passes untouched. Phase B is ONE shared generator that runs
-        # upstream attempts 2..MAX+1 inside the returned StreamingResponse;
-        # `stream_mode` only flips that generator's forwarding policy (live
-        # tees visible pre-decision lines, buffered holds everything until the
-        # round decision). Phase A never forwards pre-decision bytes in either
-        # mode. Debug counters ride the stream as trailing SSE comments because
-        # rounds 2+ start before any headers exist.
+        # Two-phase streaming. Buffered mode decides round 1 in the route body
+        # (Phase A), observable-identical to the pre-0.3 loop, then hands
+        # attempts 2..MAX+1 to ONE shared generator inside the returned
+        # StreamingResponse. Live mode routes every attempt, round 1 included,
+        # through that generator from the start, so its tee streams visible
+        # reasoning lines as they arrive; buffered holds everything until each
+        # round decision. Round-1 errors BEFORE any forwarded byte still become
+        # plain Responses/502 via the prefetch; an error AFTER forwarded
+        # reasoning bytes yields the in-stream error event (approved: once
+        # bytes are on the wire the HTTP status ship has sailed). Debug
+        # counters ride the stream as trailing SSE comments because rounds 2+
+        # start before any headers exist.
         stream_mode = runtime.config.memory.stream_reasoning
         fields = runtime.config.memory.reasoning_delta_fields
 
-        async def _rounds_stream(tool_rounds: int, reject_count: int) -> AsyncIterator[bytes]:
-            # attempts 2..MAX_ITERATIONS+1: today's total upstream calls per
-            # request, minus the round-1 decision already taken in the body.
+        async def _rounds_stream(
+            tool_rounds: int, reject_count: int, start_attempt: int = 2
+        ) -> AsyncIterator[bytes]:
+            # attempts start_attempt..MAX_ITERATIONS+1: today's total upstream
+            # calls per request, minus any round whose decision was already
+            # taken in the body (buffered starts after round 1; live starts at 1).
             recorded = False  # completed() exactly-once guard
             in_terminal = False  # current round resolved terminal (record on disconnect)
             sent_bytes = False  # any byte already written to this client response
             accum = bytearray()
             try:
-                for attempt in range(2, memory_tools.MAX_ITERATIONS + 2):
+                for attempt in range(start_attempt, memory_tools.MAX_ITERATIONS + 2):
                     is_forced = attempt == memory_tools.MAX_ITERATIONS + 1
                     if is_forced and ours_injected:
                         # Past the cap: force a terminal ANSWER round. Stripping
@@ -637,8 +642,37 @@ async def chat_completions(request: Request) -> Response:
         try:
             tool_rounds = 0
             ours_active: set[str] = set(ours_injected)
+            if stream_mode == "live":
+                # Live: every attempt, round 1 included, runs inside the
+                # generator so its tee streams reasoning deltas as they arrive.
+                # The prefetch below keeps pre-byte errors as plain
+                # Responses/502, exactly like the block after a suppressed
+                # round-1 in the buffered path.
+                stream = _rounds_stream(tool_rounds, reject_count, start_attempt=1)
+                try:
+                    first: bytes | None = await stream.__anext__()
+                except StopAsyncIteration:
+                    first = None
+                except _VerbatimResponse as verbatim:
+                    await stream.aclose()
+                    failed = verbatim.response
+                    return Response(
+                        content=failed.content,
+                        status_code=failed.status_code,
+                        media_type=failed.headers.get("content-type", "application/json"),
+                        headers=debug_headers,
+                    )
+                except httpx.RequestError as exc:
+                    await stream.aclose()
+                    raise HTTPException(502, f"upstream connection failed: {exc}") from exc
+                handed_off = True
+                return StreamingResponse(
+                    _counted(_prefixed(first, stream), counter),
+                    media_type="text/event-stream",
+                    headers=debug_headers,
+                )
             # Phase A: round-1 decision in the body. tee_forward_enabled=False
-            # keeps live byte-identical to buffered here: hold everything, decide
+            # keeps buffered quiet pre-decision: hold everything, decide
             # on content/foreign or at end of stream.
             try:
                 iterator = await runtime.upstream.stream_bytes(
