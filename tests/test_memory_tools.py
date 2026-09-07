@@ -1779,15 +1779,15 @@ def test_qa_s_query_from_messages_truncates_tool_blobs():
 #
 # Async tests are plain async defs (collected via asyncio_mode="auto").
 #
-# Pins the two-phase route end to end: Phase A (round-1 decision in the route
-# body) never forwards pre-decision bytes in either mode; Phase B (attempts 2+)
-# is where "live" tees visible reasoning lines and "buffered" holds everything
-# until the round decision. The plan's scenario-1 phrasing ("client sees
-# round-1 reasoning") is physically impossible under Phase A, so the compatible
-# construction — same adaptation todo 3 made for t3 — is call 1 = suppressed
-# tool round, call 2 = the round whose reasoning reaches the client. The
-# observable rule is identical: reasoning of a round that turns terminal
-# streams live; suppressed rounds leak nothing.
+# Pins the two-phase route end to end. Under "live", EVERY attempt — round 1
+# included — runs through the generator's tee: visible reasoning lines stream
+# as they arrive and freeze at the first tool_calls / non-null finish_reason /
+# [DONE] line, so a suppressed round leaks exactly the reasoning that was
+# visible before its freeze (the same semantics attempts 2+ have always had)
+# while tool bytes stay invisible. Under "buffered", round 1 is still decided
+# in the route body, which holds every byte until the decision. The observable
+# rule: reasoning of a round that turns terminal streams live; a suppressed
+# round leaks only its pre-freeze reasoning — nothing else, in either mode.
 #
 # Async scenarios drive the ASGI app DIRECTLY instead of via httpx's
 # ASGITransport: ASGITransport (httpx 0.28.1, measured) awaits the whole app
@@ -1880,8 +1880,10 @@ async def _asgi_stream(app, body: dict, session: str, disconnect_after: float | 
 
 def test_stream_live_reasoning_streams_and_tool_round_stays_suppressed():
     # Scenario 1: live default, think->our-tool->answer. Round 1 (our tool
-    # call) is suppressed silently in the route body; round 2 reasons live and
-    # answers. Client bytes == raw round 2: round-2 reasoning text present,
+    # call) runs inside the tee'd generator: its reasoning lines stream before
+    # the tool_calls freeze, then the round is suppressed and the rest of its
+    # bytes are discarded. Round 2 reasons live and answers. Client bytes ==
+    # teed round-1 reasoning + raw round 2: both reasoning texts present,
     # every tool byte (name/args/tool_calls/round-1 [DONE]) absent.
     round1 = [
         _reasoning_chunk("suppressed-round-hidden-think"),
@@ -1903,10 +1905,12 @@ def test_stream_live_reasoning_streams_and_tool_round_stays_suppressed():
             response = _chat(client, "live-matrix-1", extra={"stream": True})
             assert response.status_code == 200
             text = response.content.decode()
-            assert response.content == b"".join(round2)
+            # Live tee: round 1's pre-freeze reasoning line prefixes the
+            # stream; everything after the tool_calls freeze is discarded.
+            assert response.content == round1[0] + b"".join(round2)
             assert "client-visible-live-think" in text
             assert "PostgreSQL 17." in text
-            assert "suppressed-round-hidden-think" not in text
+            assert "suppressed-round-hidden-think" in text
             assert "infinitum_memory_search" not in text
             assert "call_live1" not in text
             assert "tool_calls" not in text
@@ -2132,10 +2136,10 @@ def test_stream_disjoint_reasoning_fields_stays_silent(mode):
 
 @pytest.mark.parametrize("mode", ["live", "buffered"])
 def test_stream_buffered_replay_is_byte_identical_to_live_tee(mode):
-    # Scenario 5: the suppressed round's reasoning stays silent in BOTH modes
-    # (leak-free guarantee), and the terminal round — reasoning as terminal
-    # content — yields byte-identical client bytes whether live teed it out or
-    # buffered replayed it at end of round.
+    # Scenario 5: the suppressed round leaks only its teed pre-freeze reasoning
+    # under live and stays silent under buffered; the terminal round —
+    # reasoning as terminal content — yields byte-identical client bytes
+    # whether live teed it out or buffered replayed it at end of round.
     suppressed = [
         _reasoning_chunk("suppressed-round-hidden-think"),
         _tool_chunk(0, "call_silent", "infinitum_memory_search", '{"query": "db"}'),
@@ -2156,9 +2160,13 @@ def test_stream_buffered_replay_is_byte_identical_to_live_tee(mode):
             upstream = _SseUpstream(app.state.runtime, [(suppressed, None), (terminal, None)])
             response = _chat(client, f"replay-parity-{mode}", extra={"stream": True})
             assert response.status_code == 200
-            assert response.content == b"".join(terminal)
+            # Live round 1 runs in the tee'd generator, so the suppressed
+            # round's pre-freeze reasoning line prefixes the stream; buffered
+            # round 1 is decided in the body and its bytes never leave.
+            expected = suppressed[0] + b"".join(terminal) if mode == "live" else b"".join(terminal)
+            assert response.content == expected
             text = response.content.decode()
-            assert "suppressed-round-hidden-think" not in text
+            assert ("suppressed-round-hidden-think" in text) == (mode == "live")
             assert "terminal-round-visible-think" in text
             assert "tool_calls" not in text
             assert upstream.calls == 2
@@ -2168,6 +2176,30 @@ def test_stream_buffered_replay_is_byte_identical_to_live_tee(mode):
                 if e["event_type"] == "message.assistant"
             ]
             assert assistants[0]["content"] == "PostgreSQL 17."
+
+
+def test_stream_buffered_round1_replay_is_byte_identical_to_tee():
+    # Buffered round-1 regression: one visible-reasoning + content answer
+    # round, no tool calls. The body decision path must deliver the raw round
+    # byte-identical (pre-0.2 behavior, intact). Fragment count is NOT pinned:
+    # the route emits accum-up-to-decision then the passthrough remainder;
+    # joined equality is the contract either way.
+    round1 = [
+        _reasoning_chunk("buffered-round1-think"),
+        _content_chunk("PostgreSQL 17."),
+        _finish_chunk("stop"),
+        _DONE,
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            app.state.runtime.config.memory.stream_reasoning = "buffered"
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(round1, None)])
+            response = _chat(client, "buf-r1-replay", extra={"stream": True})
+            assert response.status_code == 200
+            assert response.content == b"".join(round1)
+            assert upstream.calls == 1
 
 
 def test_stream_reasoning_only_round_forwarded_once_without_duplication():
@@ -2226,8 +2258,11 @@ def test_stream_buffered_midround_error_after_content_yields_sse_error():
     # flush — consume() releases held bytes at the DECISION regardless of tee
     # mode — so once the iterator then dies, bytes are already on the wire and
     # the failure must surface as one in-stream SSE error event, unrecorded.
-    # Open failures with zero forwarded bytes stay t2/qa_k territory, and
-    # Phase A is mode-agnostic, so round-1 error parity holds in both modes.
+    # Open failures with zero forwarded bytes stay t2/qa_k territory. Round-1
+    # failures before any forwarded byte are plain-HTTP in both modes (the
+    # buffered body path / the live prefetch); live additionally surfaces a
+    # round-1 failure after teed bytes as this same in-stream event — pinned
+    # by test_stream_live_round1_error_after_tee_yields_error_event.
     round1 = [
         _tool_chunk(0, "call_buferr", "infinitum_memory_search", '{"query": "db"}'),
         _finish_chunk("tool_calls"),
@@ -2251,6 +2286,35 @@ def test_stream_buffered_midround_error_after_content_yields_sse_error():
             assert text.rstrip().endswith("data: [DONE]")
             assert upstream.calls == 2
             events = _events(client, "buf-mid-err")
+            assert not any(e["event_type"] == "message.assistant" for e in events)
+
+
+def test_stream_live_round1_error_after_tee_yields_error_event():
+    # Live round-1 error AFTER the tee: the teed reasoning bytes are already
+    # on the wire when the iterator dies, so the status ship has sailed — the
+    # failure surfaces as the in-stream error event and records nothing
+    # (parity with the later-rounds in-stream contract; _record_completion
+    # never fires for an error round).
+    from infinitum.routes.openai import _UPSTREAM_ERROR_EVENT
+
+    visible = _reasoning_chunk("round1-think-then-wire-died")
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(
+                app.state.runtime, [([visible], httpx.ConnectError("boom"))]
+            )
+            response = _chat(client, "live-r1-err", extra={"stream": True})
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/event-stream")
+            assert response.content == visible + _UPSTREAM_ERROR_EVENT
+            # The error event's own sentinel is the only [DONE] on the wire.
+            assert response.content.decode().count("[DONE]") == 1
+            assert upstream.calls == 1
+            events = _events(client, "live-r1-err")
+            assert any(e["event_type"] == "request.received" for e in events)
+            assert any(e["event_type"] == "message.user" for e in events)
             assert not any(e["event_type"] == "message.assistant" for e in events)
 
 
