@@ -14,6 +14,14 @@
 
 Infinitum is a standalone Python 3 memory and context runtime for AI agents and LLM applications. It exposes an OpenAI-compatible API, maintains durable event-sourced memory, learns and consolidates useful long-term context, and injects only the most relevant memory into each request.
 
+## Why Infinitum exists
+
+The newer AI services — OpenAI, Claude, and the rest — now ship their own memory. Their agents remember your decisions, your preferences, the things you already explained once, and that continuity makes them noticeably better at reasoning and recall and simply more useful to have around.
+
+Local AI doesn't have that. Worse, the moment you want to try a new tool or switch between providers, frameworks, and models, you leave that "magic" memory behind — it's locked inside whichever service learned it.
+
+Infinitum moves the memory out of the service and into a runtime that sits in front of whatever you point it at. It learns from your interactions and improves the general intelligence of whatever tool or service you happen to want to use today. Bring your own model, bring your own agent framework, switch whenever you like — the memory keeps compounding. No memory exports, no tricks, no workarounds.
+
 Current release: **v0.2.9**.
 
 Full release history lives in [CHANGELOG.md](CHANGELOG.md). Upgrading from v0.1.x? See [the migration guide](docs/MIGRATION_FROM_CONTEXT_RUNTIME.md).
@@ -419,7 +427,9 @@ Consumed aliases are stripped from normal upstream forwarding. When the immediat
 
 ### Embeddings
 
-Embeddings are optional. Without them, retrieval remains functional using lexical, topic, recency, importance, and confidence signals.
+Embeddings are optional and, in this build, supported but not yet exercised in day-to-day use — the wiring is fully in place (config, write-on-create, embed-on-search, and a semantic term in the hybrid scorer), but it ships disabled by default and the retrieval tuning so far has been done without them. Without embeddings, retrieval stays fully functional using lexical, topic, recency, importance, and confidence signals.
+
+Semantic search is the single largest relevance signal available to Infinitum (it carries the heaviest retrieval weight), so it is intentionally left as head room rather than something already maxed out. Every accuracy and recall improvement tuned so far — the relevance gate, lexical and topic scoring, freshness decay, and the reinforcement guards — was developed and calibrated with that signal absent. Turning embeddings on and testing them against a real embedding server is expected to make recall and ranking measurably better, especially for memories that matter but are phrased differently from today's query, where lexical matching alone can miss the connection.
 
 ```yaml
 embeddings:
@@ -429,7 +439,7 @@ embeddings:
   model: text-embedding-3-small
 ```
 
-Any OpenAI-compatible `/v1/embeddings` implementation can be used.
+Any OpenAI-compatible `/v1/embeddings` implementation can be used. When enabled, semantic similarity joins the blend described in [Retrieval and context compilation](#retrieval-and-context-compilation); when a memory has no usable vector or an embedding call fails, scoring degrades gracefully to the non-semantic signals rather than dropping the memory.
 
 ### Separate learning model
 
