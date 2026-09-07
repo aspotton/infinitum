@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.8
 
 - Added `memory.stream_reasoning` (default `live`): streaming responses now pass a thinking model's reasoning deltas through to the client while a round is still undecided, instead of holding every token until the round's purpose is known; set `buffered` to restore the prior hold-everything behavior.
 - Added `memory.reasoning_delta_fields` to name the SSE delta fields that carry model reasoning for the live mode.
