@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.10
 
 - Learn jobs that crashed mid-flight are now re-queued instead of stranding in `running` state: a startup pass in `build_runtime` requeues jobs that were running when the process died, and job claims adopt stale `running` locks once they pass a lease of `learning.timeout_seconds + 60s`. The lease is derived from `learning.timeout_seconds`, so there is no new config key.
 - A recovered replay of the same source events stays idempotent and cannot inflate `observation_count`.

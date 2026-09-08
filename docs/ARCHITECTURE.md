@@ -1,4 +1,4 @@
-# Infinitum v0.2.9 Architecture
+# Infinitum v0.2.10 Architecture
 
 ## Request path
 
