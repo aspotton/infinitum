@@ -1,11 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.2.10
 
 - Learn jobs that crashed mid-flight are now re-queued instead of stranding in `running` state: a startup pass in `build_runtime` requeues jobs that were running when the process died, and job claims adopt stale `running` locks once they pass a lease of `learning.timeout_seconds + 60s`. The lease is derived from `learning.timeout_seconds`, so there is no new config key.
 - A recovered replay of the same source events stays idempotent and cannot inflate `observation_count`.
 - Known limitation: a replayed mid-crash learn job re-asks the extraction model and can create a near-duplicate memory if the re-extraction is phrased differently; event provenance and the observation-count guard are unaffected.
 - Known limitation: `learning.max_attempts` is enforced only on the worker's exception path, so a job that hard-crashes the process would loop crash-requeue-crash every lease. Accepted for the single-process scope; the upgrade path is a one-line attempts check on the adoption path.
+- Fixed a streaming leak where a memory-tool round that also carried plain text, such as a whitespace or preamble artifact, forwarded Infinitum's own tool-call bytes to the client. Such a round now suppresses and loops, matching the non-streaming path, while its plain text may still stream under `live`; foreign and client tool names keep their verbatim terminal contract, and requests with memory tools off stay byte-for-byte unchanged.
+- Behavior change: with memory tools enabled, a buffered answer round is now held until generation completes, because plain text no longer short-circuits the round decision; the default `live` mode is unaffected and streams answer content incrementally.
+- Fixed blank exhausted memory-tool loops: when the final forced answer round returns blank, or the loop runs out of rounds with every round suppressed, both streaming and non-streaming responses now deliver an answer synthesized from the already-gathered tool results, leading with `Based on the retrieved memories:`, instead of silence or a dangling tool call.
+- Behavior change: with memory tools enabled, a buffered stream that fails upstream after a suppressed round now returns HTTP 502 rather than an in-stream SSE error event, because no client bytes precede the failure anymore.
+- Fixed forced answer rounds that ended the turn with a dangling "Let me check..." narration line instead of an answer: alongside stripping its tool definitions and `tool_choice: "none"`, the forced request now appends an explicit server-side instruction telling the model to write the complete final answer from the tool results already gathered, so a mid-planning model cannot trail off with nothing delivered. The instruction never reaches the client transcript or the recorded events.
 
 ## 0.2.9
 

@@ -75,6 +75,11 @@ class StreamClassifier:
     fed byte is accumulated for verbatim replay. With `guard`, hallucinated
     infinitum_* names (not ours, not client-defined) are neither foreign nor
     leaked: they decide "suppress" so the caller can reject-instruct them.
+    Under `guard`, content coexisting with only-ours/rejectable tool calls is
+    transcript text, never a terminal decision mid-stream; content decides
+    early only once the round proves non-tool (a finish_reason without any
+    tool-call delta). Otherwise foreign names or end-of-stream classification
+    decide.
     """
 
     def __init__(
@@ -120,7 +125,9 @@ class StreamClassifier:
             line = bytes(self._line_buf[:newline])
             del self._line_buf[: newline + 1]
             self._scan_line(line)
-        if self._content_seen or self._foreign_seen:
+        if self._foreign_seen or self._content_seen and (
+            not self._guard or (self._finish_reason and not self._chunks)
+        ):
             self._passthrough = True
             flushed, self._held = list(self._held), []
             return flushed
@@ -148,10 +155,16 @@ class StreamClassifier:
             del self._tee_buf[: newline + 1]
             self._scan_line(line)
             self._pending.append(line)
-        if self._content_seen or self._foreign_seen:
+        if self._foreign_seen or self._content_seen and (
+            not self._guard or (self._finish_reason and not self._chunks)
+        ):
             self._passthrough = True
             return self.flush_held()
-        if self._tee_forward and self._reasoning_seen and not self._frozen:
+        if (
+            self._tee_forward
+            and (self._reasoning_seen or (self._guard and self._content_seen))
+            and not self._frozen
+        ):
             out = bytearray()
             while self._pending and not _freeze_trigger(self._pending[0]):
                 line = self._pending.pop(0)
@@ -175,19 +188,28 @@ class StreamClassifier:
 
     def finish(self) -> str:
         """Resolve the decision at end of stream: suppress (loop) or replay."""
+        # Guard-scoped mirror of the non-stream partition: content coexisting
+        # with only-ours/rejectable calls is transcript text, not a terminal
+        # decision, so suppress before content_seen can preempt the loop.
+        if (
+            self._guard
+            and not self._passthrough
+            and not self._foreign_seen
+            and (calls := reassemble_stream_tool_calls(self._chunks))
+            and (
+                classify_tool_calls(calls, self._ours)
+                or all(
+                    (name := call.get("function", {}).get("name")) in self._ours
+                    or is_rejectable_memory_name(name, self._ours, self._client_names)
+                    for call in calls
+                )
+            )
+        ):
+            return "suppress"
         if self._passthrough or self._content_seen or self._foreign_seen:
             return "passthrough"
         calls = reassemble_stream_tool_calls(self._chunks)
         if classify_tool_calls(calls, self._ours):
-            return "suppress"
-        # Partition rule (mirror of the non-stream loop): suppress for the
-        # reject round only when every call is ours or a hallucinated
-        # infinitum_* name; `not classified` already proves >=1 rejectable.
-        if self._guard and calls and all(
-            (name := call.get("function", {}).get("name")) in self._ours
-            or is_rejectable_memory_name(name, self._ours, self._client_names)
-            for call in calls
-        ):
             return "suppress"
         return "replay"
 

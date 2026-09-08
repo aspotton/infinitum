@@ -1026,7 +1026,9 @@ def test_qa_t_stream_round_cap_forces_answer_not_empty_stream():
 #
 # Verified against a local OpenAI-compatible server: stripping our defs is not enough, the automatic
 # tool-call parser re-emits our tool names and the old forced round forwarded a
-# content:null tool_calls message (non-stream) or a blank SSE (stream).
+# content:null tool_calls message (non-stream) or a blank SSE (stream). Both
+# paths now synthesize the answer from the gathered tool results instead; the
+# streaming synthesis tests live at the bottom of this file.
 
 
 def test_forced_round_sets_tool_choice_none():
@@ -1051,6 +1053,69 @@ def test_forced_round_sets_tool_choice_none():
             events = _events(client, "forced-tc")
             assistants = [e for e in events if e["event_type"] == "message.assistant"]
             assert [e["content"] for e in assistants] == ["PostgreSQL 17 it is."]
+
+
+def test_forced_round_instructs_model_to_answer_from_results():
+    # Silent forcing (strip + tool_choice:"none") lets a model that is mid-planning
+    # end its turn with a dangling "Let me check..." narration line instead of an
+    # answer. The forced request must carry an explicit instruction to answer now
+    # from the gathered tool results, on BOTH paths, server-side only.
+    call = ("infinitum_memory_search", '{"query": "db"}', "call_fc_in")
+    replies = [_tool_reply([call]) for _ in range(memory_tools.MAX_ITERATIONS)]
+    replies.append(_completion("PostgreSQL 17 it is."))
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, replies)
+            response = _chat(client, "forced-instruct")
+            assert response.status_code == 200
+            forced_body = upstream.bodies[-1]
+            instruction = forced_body["messages"][-1]
+            assert instruction["role"] == "user"
+            assert "tool-round limit" in instruction["content"]
+            assert all(
+                "tool-round limit" not in json.dumps(b["messages"][-1])
+                for b in upstream.bodies[:-1]
+            )
+            events = _events(client, "forced-instruct")
+            assert not any("tool-round limit" in json.dumps(e) for e in events)
+
+
+def test_forced_round_stream_instructs_answer_from_results():
+    tool_stream = [
+        _tool_chunk(0, "call_fc_in2", "infinitum_memory_search", '{"query": "db"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    answer_stream = [_content_chunk("PostgreSQL 17."), _finish_chunk("stop"), _DONE]
+    bodies: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        chunks = answer_stream if bodies[-1].get("tool_choice") == "none" else tool_stream
+
+        async def stream_body():
+            for chunk in chunks:
+                yield chunk
+
+        return httpx.Response(200, content=stream_body())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            app.state.runtime.upstream.client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            response = _chat(client, "forced-stream-instruct", extra={"stream": True})
+            assert response.status_code == 200
+            text = response.content.decode()
+            assert "PostgreSQL 17." in text
+            assert "tool-round limit" not in text  # server-side only
+            instruction = bodies[-1]["messages"][-1]
+            assert instruction["role"] == "user"
+            assert "tool-round limit" in instruction["content"]
 
 
 def test_forced_round_synthesizes_when_tool_choice_ignored():
@@ -1560,6 +1625,16 @@ def _tee_classifier(**overrides) -> memory_tools.StreamClassifier:
     kwargs: dict = {
         "reasoning_fields": _REASONING_FIELDS,
         "tee_forward_enabled": True,
+    }
+    kwargs.update(overrides)
+    return memory_tools.StreamClassifier(_OURS, **kwargs)
+
+
+def _tee_classifier_guard(**overrides) -> memory_tools.StreamClassifier:
+    kwargs: dict = {
+        "reasoning_fields": _REASONING_FIELDS,
+        "tee_forward_enabled": True,
+        "guard": True,
     }
     kwargs.update(overrides)
     return memory_tools.StreamClassifier(_OURS, **kwargs)
@@ -2252,17 +2327,19 @@ def test_stream_reasoning_only_round_forwarded_once_without_duplication():
             assert assistants2[0]["metadata"] == assistants[0]["metadata"]
 
 
-def test_stream_buffered_midround_error_after_content_yields_sse_error():
-    # Scenario 7a: buffered equivalent of t3 (which pinned the live shape).
-    # Round 1 suppresses; round 2's content line triggers the passthrough
-    # flush — consume() releases held bytes at the DECISION regardless of tee
-    # mode — so once the iterator then dies, bytes are already on the wire and
-    # the failure must surface as one in-stream SSE error event, unrecorded.
-    # Open failures with zero forwarded bytes stay t2/qa_k territory. Round-1
-    # failures before any forwarded byte are plain-HTTP in both modes (the
-    # buffered body path / the live prefetch); live additionally surfaces a
-    # round-1 failure after teed bytes as this same in-stream event — pinned
-    # by test_stream_live_round1_error_after_tee_yields_error_event.
+def test_stream_buffered_midround_error_after_content_yields_502_unrecorded():
+    # Scenario 7a (guard-scoped): buffered equivalent of t3 (which pinned the
+    # live tee shape). Round 1 suppresses; round 2's content line no longer
+    # puts ANY byte on the wire — under the guard, content alone never makes a
+    # mid-round decision (a co-resident tool call stays possible, which is
+    # exactly the leak fix), so consume() keeps holding everything. The
+    # generator then dies on the upstream RequestError with zero forwarded
+    # bytes, re-raises, and the route's Phase-B prefetch converts that into
+    # today's plain HTTP 502 — the status ship has NOT sailed — with nothing
+    # recorded. Before the guard rule the content line flushed at the decision
+    # and this shape surfaced as an in-stream SSE error event; the live tee
+    # shape (where teed bytes DO precede the error) stays pinned by
+    # test_stream_live_round1_error_after_tee_yields_error_event.
     round1 = [
         _tool_chunk(0, "call_buferr", "infinitum_memory_search", '{"query": "db"}'),
         _finish_chunk("tool_calls"),
@@ -2278,12 +2355,7 @@ def test_stream_buffered_midround_error_after_content_yields_sse_error():
                 app.state.runtime, [(round1, None), ([visible], httpx.ConnectError("boom"))]
             )
             response = _chat(client, "buf-mid-err", extra={"stream": True})
-            assert response.status_code == 200
-            text = response.content.decode()
-            assert "visible before the wire died" in text
-            assert "tool_calls" not in text
-            assert 'data: {"error"' in text
-            assert text.rstrip().endswith("data: [DONE]")
+            assert response.status_code == 502
             assert upstream.calls == 2
             events = _events(client, "buf-mid-err")
             assert not any(e["event_type"] == "message.assistant" for e in events)
@@ -2409,3 +2481,480 @@ async def test_stream_disconnect_drains_counter():
         finally:
             await rt.upstream.client.aclose()
             await rt.db.close()
+
+
+# --- Guard-on classifier leak repro (content co-resident tool rounds) ----------
+#
+# Direct-unit tier, same builders as the tee section above. RED-by-assertion
+# proof for the streaming tool leak: under guard, a round carrying our tool
+# call alongside ANY content (whitespace or real) must decide "suppress" with
+# zero tool bytes forwarded. Today's classifier fires passthrough on
+# _content_seen regardless of guard (feed/consume), so variants B/C/D fail on
+# the zero-leak lock until the guard-mode fix lands. The tee-gate test is a
+# preservation guard: it passes before and after the fix, pinning that a
+# reasoning-free content-only stream still streams incrementally through
+# consume(), byte-identical, decided mid-stream.
+
+
+def test_stream_classifier_guard_whitespace_content_tool_round_leaks_nothing():
+    # Variant B: a whitespace-only content delta co-resident with our call.
+    tool = _tool_chunk(0, "call_1", "infinitum_memory_search", '{"query": "db"}')
+    chunks = [
+        _reasoning_chunk("plan"),
+        _content_chunk("\n\n"),
+        tool,
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    clf = _tee_classifier_guard()
+    forwarded = b"".join(part for chunk in chunks for part in clf.feed(chunk))
+    assert b"infinitum_memory_search" not in forwarded  # zero-leak lock
+    assert clf.finish() == "suppress"
+    calls = memory_tools.reassemble_stream_tool_calls(clf.calls)
+    assert calls[0]["function"]["name"] == "infinitum_memory_search"
+
+
+def test_stream_classifier_guard_tool_then_late_content_leaks_nothing():
+    # Variant C: tool_calls finish first, then the model "changes its mind"
+    # with content + stop; the round was ours end to end.
+    tool = _tool_chunk(0, "call_1", "infinitum_memory_search", '{"query": "db"}')
+    chunks = [
+        _reasoning_chunk("plan"),
+        tool,
+        _finish_chunk("tool_calls"),
+        _content_chunk("changed my mind"),
+        _finish_chunk("stop"),
+        _DONE,
+    ]
+    clf = _tee_classifier_guard()
+    forwarded = b"".join(part for chunk in chunks for part in clf.feed(chunk))
+    assert b"infinitum_memory_search" not in forwarded  # zero-leak lock
+    assert clf.finish() == "suppress"
+
+
+def test_stream_classifier_guard_early_content_tool_round_leaks_nothing():
+    # Variant D: real content before our tool call; under guard the round is
+    # still ours and must never forward the tool bytes.
+    tool = _tool_chunk(0, "call_1", "infinitum_memory_search", '{"query": "db"}')
+    chunks = [
+        _reasoning_chunk("plan"),
+        _content_chunk("let me check"),
+        tool,
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    clf = _tee_classifier_guard()
+    forwarded = b"".join(part for chunk in chunks for part in clf.feed(chunk))
+    assert b"infinitum_memory_search" not in forwarded  # zero-leak lock
+    assert clf.finish() == "suppress"
+
+
+def test_stream_classifier_guard_content_with_foreign_call_stays_passthrough():
+    # The foreign short-circuit wins over the guard suppress rule: a foreign
+    # name beside content must still forward the round verbatim.
+    tool = _tool_chunk(0, "call_gx", "get_weather", '{"city": "Oslo"}')
+    chunks = [_content_chunk("checking"), tool, _finish_chunk("tool_calls"), _DONE]
+    clf = _tee_classifier_guard()
+    forwarded = b"".join(part for chunk in chunks for part in clf.feed(chunk))
+    assert b"get_weather" in forwarded  # verbatim-forward contract
+    assert clf.finish() == "passthrough"
+
+
+def test_stream_classifier_guard_content_only_tee_gate_preserved():
+    # Preservation guard: no reasoning fields anywhere; content must decide
+    # passthrough mid-stream, forwarding byte-identical bytes incrementally
+    # before any end-of-stream call.
+    chunks = [
+        _content_chunk("hello"),
+        _content_chunk(" world"),
+        _finish_chunk("stop"),
+        _DONE,
+    ]
+    clf = _tee_classifier_guard()
+    outs = [clf.consume(c) for c in chunks]
+    assert b"".join(outs) == b"".join(chunks)  # byte-identical full round
+    assert outs[0]  # incremental: bytes land before any finish()/EOS decide
+    assert clf.decide() == "passthrough"
+    assert clf.finish() == "passthrough"
+
+
+# --- Route-level incident regression: the Open WebUI whitespace+tool leak -------
+#
+# The live-server incident (req_967eb7c1): Qwen streamed a whitespace content
+# delta co-resident with our own search call. Before the guard-scoped rule the
+# classifier fired passthrough on the content line and forwarded the tool-call
+# bytes to Open WebUI. Now the round suppresses, the search runs server-side,
+# and the loop asks for a real answer. These are the route-level acceptance
+# contracts F3 manual QA re-derives; the classifier tier above proves the unit.
+
+
+def test_stream_incident_whitespace_content_tool_round_live_streams_clean_answer():
+    # Live mode: the reasoning/whitespace preamble may still reach the client,
+    # but no tool-call structure ever does, the search executes server-side,
+    # and the answer round streams through.
+    round1 = [
+        _reasoning_chunk("deciding whether to look it up"),
+        _content_chunk("\n\n"),
+        _tool_chunk(0, "call_incident", "infinitum_memory_search", '{"query": "database"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    round2 = [_content_chunk("PostgreSQL 17."), _finish_chunk("stop"), _DONE]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(round1, None), (round2, None)])
+            response = _chat(client, "incident-live", extra={"stream": True})
+            assert response.status_code == 200
+            text = response.content.decode()
+            assert "PostgreSQL 17." in text
+            assert "infinitum_memory_search" not in text  # zero-leak lock
+            assert "call_" not in text  # zero-leak lock: no call ids either
+            assert upstream.calls == 2
+            events = _events(client, "incident-live")
+            tool_events = [e for e in events if e["event_type"] == "memory.tool_call"]
+            assert len(tool_events) == 1
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1
+            assert assistants[0]["content"] == "PostgreSQL 17."
+
+
+def test_stream_incident_whitespace_content_tool_round_buffered_stays_silent():
+    # Buffered twin: the suppressed round contributes ZERO bytes — the client
+    # sees round 2's bytes verbatim, nothing else.
+    round1 = [
+        _reasoning_chunk("deciding whether to look it up"),
+        _content_chunk("\n\n"),
+        _tool_chunk(0, "call_incident", "infinitum_memory_search", '{"query": "database"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    round2 = [_content_chunk("PostgreSQL 17."), _finish_chunk("stop"), _DONE]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            app.state.runtime.config.memory.stream_reasoning = "buffered"
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(round1, None), (round2, None)])
+            response = _chat(client, "incident-buffered", extra={"stream": True})
+            assert response.status_code == 200
+            assert response.content == b"".join(round2)  # zero bytes from round 1
+            assert upstream.calls == 2
+            events = _events(client, "incident-buffered")
+            tool_events = [e for e in events if e["event_type"] == "memory.tool_call"]
+            assert len(tool_events) == 1
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1
+            assert assistants[0]["content"] == "PostgreSQL 17."
+
+
+@pytest.mark.asyncio
+async def test_stream_disconnect_recording_parity_live_rounds():
+    # Disconnect-recording parity across tool-loop rounds (todo 3(d) companion).
+    # httpx buffers the ASGI call, so an in-process disconnect is simulated
+    # exactly the way a real server does it: aclose() on the response body
+    # iterator, which throws GeneratorExit through _counted/_prefixed into
+    # _rounds_stream and runs its recording finally (asyncgen aclose finalizes
+    # the sub-generators too, so completed() lands — the plain-cancel path in
+    # test_stream_disconnect_drains_counter can never land that await).
+    # (i) a content-only answer round interrupted mid-stream records exactly
+    # ONE assistant event whose content is a non-empty prefix of the answer;
+    # (ii) a suppressed round never leaves a stale in_terminal behind:
+    # round 1 (preamble text + our call) suppresses, round 2 (reasoning + our
+    # call) is interrupted ⇒ ZERO assistant events.
+    import asyncio
+
+    from starlette.requests import Request
+
+    from infinitum.routes.openai import chat_completions
+
+    def _request(app: object, session: str) -> Request:
+        payload = json.dumps(
+            {"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+        ).encode()
+
+        async def receive() -> dict:
+            return {"type": "http.request", "body": payload, "more_body": False}
+
+        return Request(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.4"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/v1/chat/completions",
+                "raw_path": b"/v1/chat/completions",
+                "query_string": b"",
+                "root_path": "",
+                "client": ("test", 1234),
+                "server": ("infinitum.test", 80),
+                "app": app,
+                "headers": [
+                    (b"host", b"infinitum.test"),
+                    (b"content-type", b"application/json"),
+                    (b"x-infinitum-session-id", session.encode()),
+                ],
+            },
+            receive=receive,
+        )
+
+    # (i) content-only round: two chunks land, the third never gets pulled.
+    full_answer = "Partial answer  continued and never delivered tail"
+    with tempfile.TemporaryDirectory() as tmp:
+        app, rt = await _stream_runtime(tmp)
+        try:
+            async def content_body():
+                yield _content_chunk("Partial answer ")
+                yield _content_chunk(" continued")
+                yield _content_chunk(" and never delivered tail")
+                yield _finish_chunk("stop")
+                yield _DONE
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                return httpx.Response(200, content=content_body())
+
+            rt.upstream.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            response = await chat_completions(_request(app, "disc-content-only"))
+            agen = response.body_iterator
+            streamed = [await agen.__anext__(), await agen.__anext__()]
+            await agen.aclose()
+            # The recording lands via the asyncgen finalizer, a loop tick later.
+            await asyncio.sleep(0.01)
+            joined = b"".join(streamed)
+            assert b"Partial answer " in joined
+            assert b"never delivered tail" not in joined
+            events = await rt.db.list_events(session_id="disc-content-only", limit=1000)
+            assistants = [e for e in events if e.event_type == "message.assistant"]
+            assert len(assistants) == 1
+            assert assistants[0].content  # non-empty prefix...
+            assert full_answer.startswith(assistants[0].content)  # ...of the answer
+            assert assistants[0].metadata["stream_complete"] is False  # never saw [DONE]
+        finally:
+            await rt.upstream.client.aclose()
+            await rt.db.close()
+
+    # (ii) suppressed rounds only: a disconnect inside round 2 records nothing.
+    with tempfile.TemporaryDirectory() as tmp:
+        app, rt = await _stream_runtime(tmp)
+        park = asyncio.Event()
+        calls: list[dict] = []
+        try:
+            async def round1_body():
+                yield _content_chunk("preamble text")
+                yield _tool_chunk(0, "disc-a", "infinitum_memory_search", '{"query": "db"}')
+                yield _finish_chunk("tool_calls")
+                yield _DONE
+
+            async def round2_body():
+                yield _reasoning_chunk("round2 thinking before the cut")
+                yield _tool_chunk(0, "disc-b", "infinitum_memory_search", '{"query": "db2"}')
+                await park.wait()
+                yield _finish_chunk("tool_calls")
+                yield _DONE
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                calls.append(json.loads(request.content))
+                return httpx.Response(
+                    200, content=(round1_body() if len(calls) == 1 else round2_body())
+                )
+
+            rt.upstream.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            response = await chat_completions(_request(app, "disc-suppressed"))
+            agen = response.body_iterator
+            await agen.__anext__()  # round-1 preamble text (teed, round still ours)
+            await agen.__anext__()  # round 1 suppressed + executed; round 2 now live
+            await agen.aclose()
+            await asyncio.sleep(0)
+            park.set()
+            await asyncio.sleep(0)
+            assert len(calls) == 2
+            events = await rt.db.list_events(session_id="disc-suppressed", limit=1000)
+            assert not any(e.event_type == "message.assistant" for e in events)
+            # The interrupted attempt must not leak the disconnect either.
+            assert rt.active_requests.value == 0
+        finally:
+            park.set()
+            await rt.upstream.client.aclose()
+            await rt.db.close()
+
+
+# --- Streamed forced-round blank synthesis (todo 5, Open WebUI blank final) -----
+#
+# Route contract: when the FORCED terminal round (tool_choice:"none") streams
+# back blank, the client gets a synthesized answer built from the gathered tool
+# results instead of the blank bytes, with [DONE] exactly once and exactly one
+# non-empty assistant event. The forced round therefore streams nothing
+# pre-decision: its [DONE] must never beat the synthesis's [DONE] to the wire.
+# Non-forced blanks stay byte-for-byte verbatim (sibling test below).
+
+
+def test_forced_stream_blank_whitespace_round_synthesizes():
+    # Shape 1: the forced round streams whitespace content + stop + [DONE].
+    # Old shape forwarded that blank SSE verbatim (blank assistant event); the
+    # route must swap the stream for the tool-result synthesis, whose content
+    # deterministically carries "Based on the retrieved memories:" plus the
+    # search-result JSON (the seeded "PostgreSQL 17..." memory).
+    tool_rounds = [
+        [
+            _tool_chunk(0, f"call_fb{i}", "infinitum_memory_search", '{"query": "db"}'),
+            _finish_chunk("tool_calls"),
+            _DONE,
+        ]
+        for i in range(memory_tools.MAX_ITERATIONS)
+    ]
+    blank_round = [_content_chunk("\n\n"), _finish_chunk("stop"), _DONE]
+    replies = [(round_bytes, None) for round_bytes in tool_rounds]
+    replies.append((blank_round, None))
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, replies)
+            response = _chat(client, "forced-blank-ws", extra={"stream": True})
+            assert response.status_code == 200
+            assert upstream.calls == memory_tools.MAX_ITERATIONS + 1
+            assert upstream.bodies[-1]["tool_choice"] == "none"
+            text = response.content.decode()
+            assert "Based on the retrieved memories:" in text
+            assert "PostgreSQL 17" in text
+            assert "tool_calls" not in text
+            assert text.count("data: [DONE]") == 1
+            lines = text.split("\n\n")
+            chunk = json.loads(
+                next(line[6:] for line in lines if line.startswith("data: {"))
+            )
+            assert chunk["object"] == "chat.completion.chunk"
+            assert chunk["model"] == "test-model"
+            assert isinstance(chunk["created"], int)
+            assert chunk["choices"][0]["finish_reason"] == "stop"
+            assert chunk["choices"][0]["delta"]["content"].startswith(
+                "Based on the retrieved memories:"
+            )
+            events = _events(client, "forced-blank-ws")
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1
+            assert assistants[0]["content"].startswith("Based on the retrieved memories:")
+            assert "PostgreSQL 17" in assistants[0]["content"]
+            assert assistants[0]["metadata"]["stream_complete"] is True
+
+
+def test_forced_stream_blank_no_content_round_synthesizes():
+    # Shape 2: the forced round streams NO content delta at all (finish stop +
+    # [DONE] only). Same contract: synthesized marker in the client bytes,
+    # [DONE] exactly once, one non-empty assistant event.
+    tool_rounds = [
+        [
+            _tool_chunk(0, f"call_fbn{i}", "infinitum_memory_search", '{"query": "db"}'),
+            _finish_chunk("tool_calls"),
+            _DONE,
+        ]
+        for i in range(memory_tools.MAX_ITERATIONS)
+    ]
+    blank_round = [_finish_chunk("stop"), _DONE]
+    replies = [(round_bytes, None) for round_bytes in tool_rounds]
+    replies.append((blank_round, None))
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, replies)
+            response = _chat(client, "forced-blank-nocontent", extra={"stream": True})
+            assert response.status_code == 200
+            assert upstream.calls == memory_tools.MAX_ITERATIONS + 1
+            assert upstream.bodies[-1]["tool_choice"] == "none"
+            text = response.content.decode()
+            assert "Based on the retrieved memories:" in text
+            assert "PostgreSQL 17" in text
+            assert text.count("data: [DONE]") == 1
+            events = _events(client, "forced-blank-nocontent")
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1
+            assert assistants[0]["content"].startswith("Based on the retrieved memories:")
+            assert assistants[0]["metadata"]["stream_complete"] is True
+
+
+def test_nonforced_blank_stream_terminal_stays_verbatim():
+    # Synthesis is FORCED-round-only. A non-forced blank terminal round is the
+    # model's own whitespace answer and must reach the client byte-for-byte,
+    # exactly as streamed today.
+    round1 = [
+        _tool_chunk(0, "call_nb1", "infinitum_memory_search", '{"query": "db"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    round2 = [_content_chunk("\n\n"), _finish_chunk("stop"), _DONE]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(round1, None), (round2, None)])
+            response = _chat(client, "nonforced-blank", extra={"stream": True})
+            assert response.status_code == 200
+            assert response.content == b"".join(round2)
+            assert "Based on the retrieved memories:" not in response.content.decode()
+            assert upstream.calls == 2
+            events = _events(client, "nonforced-blank")
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1
+
+
+def test_cap_exhausted_stream_with_forced_round_suppressed_synthesizes():
+    # Cap-exhausted variant: an auto-parsing server ignores tool_choice:"none"
+    # and re-emits our (stripped) tool names on the FORCED round too, so every
+    # attempt — forced included — classifies as ours and suppresses. The attempt
+    # loop falls through; today that terminal is silence: SSE comment lines only
+    # and zero assistant events (the live incident's second failure mode). The
+    # post-loop branch must answer with the tool-result synthesis instead.
+    # Loop bound pinned from the attempt range: live (the default
+    # stream_reasoning) starts at attempt 1 and iterates
+    # range(1, MAX_ITERATIONS + 2) = attempts 1..5 for MAX_ITERATIONS = 4,
+    # and the last attempt is the forced one -> exactly 5 upstream calls.
+    ours_call_round = [
+        _tool_chunk(0, "call_capx", "infinitum_memory_search", '{"query": "db"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    replies = [
+        (list(ours_call_round), None) for _ in range(memory_tools.MAX_ITERATIONS + 1)
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, replies)
+            response = _chat(
+                client,
+                "cap-exhausted",
+                extra={"stream": True},
+                headers={"X-Infinitum-Debug": "true"},
+            )
+            assert response.status_code == 200
+            # 5 calls = every attempt of range(1, MAX_ITERATIONS + 2), the
+            # forced round included — see the range comment above.
+            assert upstream.calls == memory_tools.MAX_ITERATIONS + 1
+            # The forced round really ran: defs stripped, tool_choice pinned.
+            assert upstream.bodies[-1]["tool_choice"] == "none"
+            forced_names = {t["function"]["name"] for t in upstream.bodies[-1].get("tools", [])}
+            assert not forced_names & set(memory_tools.TOOL_NAMES)
+            text = response.content.decode()
+            # The synthesized answer reaches the client before any debug comment.
+            assert "Based on the retrieved memories:" in text
+            assert "PostgreSQL 17" in text
+            assert "tool_calls" not in text
+            assert text.count("data: [DONE]") == 1
+            assert text.index("Based on the retrieved memories:") < text.index(
+                ": x-infinitum-memory-tool-calls"
+            )
+            # Zero-tool-round streams keep their silent comments-only shape:
+            # test_qa_f_content_first_stream_passthrough_single_call pins the
+            # byte-exact passthrough stream and test_qa_k the unrecorded
+            # failure tail, and neither path touches the post-loop branch
+            # (reaching it requires >= 1 suppressed round by construction).
+            events = _events(client, "cap-exhausted")
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1
+            assert assistants[0]["content"].startswith("Based on the retrieved memories:")
+            assert "PostgreSQL 17" in assistants[0]["content"]
+            assert assistants[0]["metadata"]["stream_complete"] is True

@@ -274,6 +274,31 @@ def _strip_injected_tools(body: dict[str, Any], names: set[str]) -> None:
         body.pop("tools", None)
 
 
+_FINAL_ANSWER_INSTRUCTION = (
+    "[Infinitum] You have reached the tool-round limit; the memory tools are no "
+    "longer available. Write the complete final answer for the user's question "
+    "NOW, using only the tool results already present in this conversation. Do "
+    "not announce further tool calls."
+)
+
+
+def _force_answer_round(body: dict[str, Any], names: set[str]) -> None:
+    """Arm the forced terminal round: strip our defs, forbid calls, and tell the
+    model to answer from the results it already gathered.
+
+    tool_choice:"none" alone is insufficient: a model that is mid-planning
+    narrates its next planned call and ends the turn with a dangling "Let me
+    check..." line (observed live with Qwen-class models via Open WebUI). The
+    instruction rides the SERVER-SIDE transcript only; the client never sees it,
+    exactly like the injected tool results.
+    """
+    _strip_injected_tools(body, names)
+    body["tool_choice"] = "none"
+    body["messages"] = body["messages"] + [
+        {"role": "user", "content": _FINAL_ANSWER_INSTRUCTION}
+    ]
+
+
 def _synthesize_from_tool_results(body: dict[str, Any], model: str) -> dict[str, Any]:
     """Build a plain assistant chat-completion from the gathered tool results.
 
@@ -302,6 +327,29 @@ def _synthesize_from_tool_results(body: dict[str, Any], model: str) -> dict[str,
             }
         ],
     }
+
+
+def _synthesize_sse(body: dict[str, Any], model: str) -> bytes:
+    """Render the tool-result synthesis as handcrafted SSE terminal bytes.
+
+    Streaming twin of the non-stream synthesis fallback, in the same
+    handcrafted style as _UPSTREAM_ERROR_EVENT (the only other allowed byte
+    synthesis on the streaming path): exactly one chunk + one [DONE], so the
+    client of a blank forced round still receives a complete answer.
+    """
+    parsed = _synthesize_from_tool_results(body, model)
+    content = str(parsed["choices"][0]["message"].get("content") or "")
+    chunk_payload = {
+        "id": parsed["id"],
+        "object": "chat.completion.chunk",
+        "created": parsed["created"],
+        "model": model,
+        "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": "stop"}],
+    }
+    return (
+        f"data: {json.dumps(chunk_payload, ensure_ascii=False)}\n\n".encode()
+        + b"data: [DONE]\n\n"
+    )
 
 
 async def _record_completion(
@@ -527,18 +575,19 @@ async def chat_completions(request: Request) -> Response:
             accum = bytearray()
             try:
                 for attempt in range(start_attempt, memory_tools.MAX_ITERATIONS + 2):
+                    in_terminal = False  # never sticky across rounds
                     is_forced = attempt == memory_tools.MAX_ITERATIONS + 1
                     if is_forced and ours_injected:
                         # Past the cap: force a terminal ANSWER round. Stripping
-                        # defs alone is insufficient for servers with an
-                        # automatic tool-call parser that re-emits our tool names
-                        # unprompted. tool_choice:"none" (OpenAI spec, honored by
-                        # many OpenAI-compatible servers) forbids tool calls so the
-                        # round must produce text. Keep our names in ours_active so
-                        # a stray call a server emits anyway is OUR loop-capped
-                        # call to suppress, not a foreign tool to forward.
-                        _strip_injected_tools(body, ours_injected)
-                        body["tool_choice"] = "none"
+                        # defs and tool_choice:"none" alone is insufficient for
+                        # servers with an automatic tool-call parser and a
+                        # mid-planning model: it narrates "Let me check..." and
+                        # ends the turn. The instruction appended server-side
+                        # tells it to answer now from the gathered tool results.
+                        # Keep our names in ours_active so a stray call a server
+                        # emits anyway is OUR loop-capped call to suppress, not a
+                        # foreign tool to forward.
+                        _force_answer_round(body, ours_injected)
                     try:
                         iterator = await runtime.upstream.stream_bytes(
                             "chat/completions",
@@ -568,10 +617,24 @@ async def chat_completions(request: Request) -> Response:
                         async for chunk in iterator:
                             accum.extend(chunk)
                             out = classifier.consume(chunk)
-                            if out:
+                            if out and not is_forced:
+                                # A FORCED round streams nothing pre-decision:
+                                # its [DONE] must never beat a possible
+                                # blank-round synthesis to the wire (two
+                                # sentinels, synthesis after the stop).
                                 sent_bytes = True
                                 yield out
-                            if classifier.decide() == "passthrough":
+                            if (
+                                classifier.decide() == "passthrough"
+                                or (
+                                    guard_active
+                                    and classifier.content_seen
+                                    and not classifier.calls
+                                )
+                            ):
+                                # Under guard, content alone never sets
+                                # passthrough, so a content-only round must set
+                                # the disconnect-recording flag directly.
                                 in_terminal = True
                     except httpx.RequestError:
                         # Zero forwarded bytes ⇒ the route body (or its prefetch)
@@ -604,31 +667,59 @@ async def chat_completions(request: Request) -> Response:
                         )
                         continue
                     in_terminal = True
-                    if classifier.forwarded:
+                    raw = bytes(accum)
+                    synth_bytes: bytes | None = None
+                    if is_forced:
+                        # The one round whose bytes cannot be trusted verbatim:
+                        # a server that ignored tool_choice:"none" may answer
+                        # blank. Swap the blank stream for the tool-result
+                        # synthesis (held bytes discarded — nothing was tee'd,
+                        # so this synth's [DONE] is the stream's only one).
+                        # Non-blank forced rounds replay raw, byte-identical.
+                        if not extract_stream_assistant(raw)[0].strip():
+                            synth_bytes = _synthesize_sse(body, model)
+                            yield synth_bytes
+                        elif raw:
+                            yield raw
+                    elif classifier.forwarded:
                         # Live tee: visible lines already streamed; release the
                         # frozen tail (or nothing, if passthrough decided early).
                         held = classifier.flush_held()
                         if held:
                             yield held
-                    elif accum:
+                    elif raw:
                         # Buffered hold-all (or a live round with no visible
                         # lines): replay this round's bytes verbatim, once.
-                        yield bytes(accum)
+                        yield raw
                     comments = _debug_stream_comments(
                         debug, ours_injected, tool_rounds, reject_count
                     )
                     if comments:
                         yield comments
                     recorded = True
-                    await completed(bytes(accum))
+                    await completed(synth_bytes if synth_bytes is not None else raw)
                     return
-                # Cap exhausted: every round suppressed. Mirrors today's
-                # residual empty terminal; nothing is ever recorded here.
+                # Cap exhausted: every round suppressed. A loop that ran tool
+                # rounds gets the same tool-result synthesis as the blank forced
+                # round — this is its still-suppressed variant — streamed ahead
+                # of the debug comments and recorded exactly once, mirroring the
+                # terminal branch's recorded-before-await ordering so the
+                # disconnect finally cannot double-record. Zero tool rounds (so
+                # nothing was ever gathered) keeps today's silent comments-only
+                # shape byte-identical.
+                in_terminal = False  # last suppressed attempt may set it transiently
+                post_synth: bytes | None = None
+                if tool_rounds > 0:
+                    post_synth = _synthesize_sse(body, model)
+                    yield post_synth
                 comments = _debug_stream_comments(
                     debug, ours_injected, tool_rounds, reject_count
                 )
                 if comments:
                     yield comments
+                if post_synth is not None:
+                    recorded = True
+                    await completed(post_synth)
             finally:
                 # Only client-disconnect teardown of a TERMINAL round records a
                 # partial here (parity with the old stream_out finally): error
@@ -795,16 +886,14 @@ async def chat_completions(request: Request) -> Response:
         for round_no in range(memory_tools.MAX_ITERATIONS + 1):
             is_forced = round_no == memory_tools.MAX_ITERATIONS
             if is_forced and ours_injected:
-                # Past the cap: force a terminal ANSWER round. Stripping defs alone
-                # is insufficient for servers with an automatic tool-call parser
-                # parser that re-emits our tool names unprompted.
-                # tool_choice:"none" (OpenAI spec, honored by many OpenAI-compatible
-                # servers) forbids tool calls so the round must produce text. Keep
-                # our names in ours_active so a stray call that a server emits
-                # anyway is OUR loop-capped call to suppress, not a foreign tool to
-                # forward to the client.
-                _strip_injected_tools(body, ours_injected)
-                body["tool_choice"] = "none"
+                # Past the cap: force a terminal ANSWER round. Stripping defs and
+                # tool_choice:"none" alone is insufficient: a mid-planning model
+                # narrates "Let me check..." and ends the turn. The instruction
+                # appended server-side tells it to answer now from the gathered
+                # tool results. Keep our names in ours_active so a stray call that
+                # a server emits anyway is OUR loop-capped call to suppress, not a
+                # foreign tool to forward to the client.
+                _force_answer_round(body, ours_injected)
             try:
                 upstream = await runtime.upstream.request(
                     "POST",
