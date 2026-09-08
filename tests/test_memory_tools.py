@@ -2958,3 +2958,160 @@ def test_cap_exhausted_stream_with_forced_round_suppressed_synthesizes():
             assert assistants[0]["content"].startswith("Based on the retrieved memories:")
             assert "PostgreSQL 17" in assistants[0]["content"]
             assert assistants[0]["metadata"]["stream_complete"] is True
+
+
+# --- Batch 7: mixed-round forward strip primitives ----------------------------
+
+
+def _msg_call(call_id: str, name: str | None, index: int | None = None) -> dict:
+    """Message-shaped tool_call entry; name=None builds a nameless continuation."""
+    function: dict = {"arguments": "{}"}
+    if name is not None:
+        function["name"] = name
+    call: dict = {"id": call_id, "type": "function", "function": function}
+    if index is not None:
+        call["index"] = index
+    return call
+
+
+def _nonstream_body(calls: list[dict]) -> dict:
+    return {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": None, "tool_calls": calls},
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+
+
+def test_is_memory_namespace_call_table():
+    assert memory_tools.is_memory_namespace_call("infinitum_memory_search", set()) is True
+    assert memory_tools.is_memory_namespace_call("bash", set()) is False
+    # A client tool that happens to carry our prefix stays client-owned.
+    assert memory_tools.is_memory_namespace_call("infinitum_foo", {"infinitum_foo"}) is False
+    assert memory_tools.is_memory_namespace_call("Infinitum_X", set()) is True
+    assert memory_tools.is_memory_namespace_call(None, set()) is False
+    assert memory_tools.is_memory_namespace_call("", set()) is False
+
+
+def test_strip_response_tool_calls_mixed_returns_stripped_call():
+    parsed = _nonstream_body(
+        [
+            _msg_call("call_a", "infinitum_memory_search", index=0),
+            _msg_call("call_b", "bash", index=1),
+        ]
+    )
+    out, stripped = memory_tools.strip_response_tool_calls(parsed, set())
+    assert out is not parsed
+    calls = out["choices"][0]["message"]["tool_calls"]
+    assert [c["function"]["name"] for c in calls] == ["bash"]
+    assert len(stripped) == 1
+    assert stripped[0]["id"] == "call_a"
+    assert stripped[0]["function"]["name"] == "infinitum_memory_search"
+    # Events are truth: the caller's raw parsed body is never mutated.
+    assert len(parsed["choices"][0]["message"]["tool_calls"]) == 2
+
+
+def test_strip_response_tool_calls_all_client_identity_no_op():
+    parsed = _nonstream_body([_msg_call("call_b", "bash"), _msg_call("call_c", "get_weather")])
+    out, stripped = memory_tools.strip_response_tool_calls(parsed, set())
+    assert out is parsed
+    assert stripped == []
+
+
+def test_strip_response_tool_calls_nameless_continuation_follows_index():
+    parsed = _nonstream_body(
+        [
+            _msg_call("call_a", "infinitum_memory_get", index=0),
+            _msg_call("call_a", None, index=0),  # continuation of a strippable index
+            _msg_call("call_z", None, index=5),  # index never named -> kept
+            _msg_call("call_b", "bash", index=1),
+        ]
+    )
+    out, stripped = memory_tools.strip_response_tool_calls(parsed, set())
+    calls = out["choices"][0]["message"]["tool_calls"]
+    assert [c["id"] for c in calls] == ["call_z", "call_b"]
+    assert [c["id"] for c in stripped] == ["call_a", "call_a"]
+
+
+def test_forward_stripper_byte_identical_when_nothing_strippable():
+    stream = b"".join(
+        [
+            b": ok\n\n",
+            b"data: {}\n\n",
+            _content_chunk("hello"),
+            _delta_event({"reasoning": "r"}),
+            # Index never named: nameless continuations are kept.
+            _delta_event({"tool_calls": [{"index": 9, "function": {"arguments": "x"}}]}),
+            _tool_chunk(0, "call_b", "bash", '{"c": 1}'),
+            _finish_chunk("stop"),
+            _DONE,
+        ]
+    )
+    whole = memory_tools.ForwardStripper(set())
+    assert whole.consume(stream) + whole.flush() == stream
+    per_byte = memory_tools.ForwardStripper(set())
+    out = b"".join(per_byte.consume(stream[i : i + 1]) for i in range(len(stream)))
+    assert out + per_byte.flush() == stream
+
+
+def test_forward_stripper_strips_pi_incident_mixed_stream():
+    # Chunk shapes from the Pi incident: idx0 carries our whole name in its
+    # first fragment, idx1 is the client's bash call, args interleave after.
+    stream = b"".join(
+        [
+            _delta_event({"reasoning": "checking memory"}),
+            _delta_event({"content": "Let me "}),
+            _delta_event(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_a",
+                            "function": {"name": "infinitum_memory_search", "arguments": ""},
+                        },
+                        {
+                            "index": 1,
+                            "id": "call_b",
+                            "function": {"name": "bash", "arguments": ""},
+                        },
+                    ]
+                }
+            ),
+            _tool_chunk(0, None, None, '{"query": "db"}'),
+            _tool_chunk(1, None, None, '{"command": "ls -la"}'),
+            _finish_chunk("tool_calls"),
+            _DONE,
+        ]
+    )
+    stripper = memory_tools.ForwardStripper(set())
+    out = stripper.consume(stream) + stripper.flush()
+    assert b"infinitum_" not in out
+    assert b"call_a" not in out
+    # The client's call survives: name, id, and interleaved arg fragments.
+    assert b"call_b" in out
+    assert b"bash" in out
+    # The kept lines (client call start + arg continuation) survive verbatim;
+    # the stripped index's arg-only line is gone.
+    assert _tool_chunk(1, None, None, '{"command": "ls -la"}') in out
+    assert _tool_chunk(0, None, None, '{"query": "db"}') not in out
+    # Content, reasoning, finish, and [DONE] survive verbatim.
+    assert _content_chunk("Let me ") in out
+    assert _delta_event({"reasoning": "checking memory"}) in out
+    assert _finish_chunk("tool_calls") in out
+    assert out.endswith(_DONE)
+    assert stripper.stripped == [
+        {"name": "infinitum_memory_search", "id": "call_a", "arguments": '{"query": "db"}'}
+    ]
+
+
+def test_forward_stripper_reset_clears_index_verdicts():
+    # SSE tool-call indices restart every attempt; a stale strippable verdict
+    # must not mis-strip the next attempt's client call reusing index 0.
+    stripper = memory_tools.ForwardStripper(set())
+    stripper.consume(_tool_chunk(0, "call_a", "infinitum_memory_get", "{}"))
+    stripper.reset()
+    chunk = _tool_chunk(0, "call_b", "bash", "{}")
+    assert stripper.consume(chunk) == chunk
+    assert stripper.stripped == []
