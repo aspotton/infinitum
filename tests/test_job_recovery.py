@@ -1,9 +1,13 @@
+import asyncio
 import tempfile
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from infinitum.config import AppConfig
 from infinitum.database import Database
+from infinitum.learning import MemoryLearner, LearningWorker
 
 
 def _iso(dt: datetime) -> str:
@@ -136,3 +140,47 @@ async def test_startup_requeue_is_a_no_op_for_an_unexpired_pending_job():
         assert after["run_after"] == before["run_after"]
         assert after["locked_at"] == before["locked_at"]
         assert after["created_at"] == before["created_at"]
+
+
+@pytest.mark.asyncio
+async def test_stale_running_job_reclaimed_by_worker():
+    """Given a job left running by a crash whose lock is a day old, When the
+    worker polls with the lease cutoff derived from learning.timeout_seconds,
+    Then it adopts the orphan and the row reaches done."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Database(f"{tmp}/runtime.db")
+        await db.connect()
+
+        cfg = AppConfig()
+        cfg.memory.database_path = f"{tmp}/runtime.db"
+        cfg.learning.enabled = True
+        cfg.learning.topic_summaries = False  # keep the queue free of summary jobs
+        cfg.learning.poll_interval_seconds = 0.05
+        # learning.timeout_seconds intentionally left at its default.
+
+        job_id = await db.enqueue_job("learn_interaction", {"event_id": "evt_1"})
+        first = await db.claim_job()
+        assert first is not None and first["id"] == job_id
+        stale_lock = _iso(datetime.now(timezone.utc) - timedelta(days=1))
+        await db.execute("UPDATE jobs SET locked_at=? WHERE id=?", (stale_lock, job_id))
+
+        # The worker only needs a claimable row; extraction itself is mocked so
+        # the test exercises the lease wiring, not the learner.
+        learner = MemoryLearner(db, MagicMock(), MagicMock(), MagicMock(), cfg)
+        learner.learn = AsyncMock(return_value=None)
+
+        worker = LearningWorker(db, learner, cfg)
+        worker.start()
+        try:
+            deadline = asyncio.get_running_loop().time() + 5.0
+            row = None
+            while asyncio.get_running_loop().time() < deadline:
+                row = await db.fetchone("SELECT status FROM jobs WHERE id=?", (job_id,))
+                if row["status"] == "done":
+                    break
+                await asyncio.sleep(0.1)
+            assert row["status"] == "done", row
+        finally:
+            await worker.stop()
+            await db.close()
+

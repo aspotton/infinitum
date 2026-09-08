@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from .config import AppConfig
@@ -21,6 +22,17 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _JSON_RE = re.compile(r"\{.*\}", re.S)
+
+# ponytail: lease assumes one LLM call bounded by learning.timeout_seconds +
+# local DB work; with embeddings.enabled the learn path also makes embedding
+# HTTP calls at up to embeddings.timeout_seconds each — retrieval search plus
+# one per created memory — which can exceed the lease; safe in-process because
+# the sole worker only claims when idle and can never steal a job it is
+# running; recompute the lease per job type if multiple LLM calls ever land on
+# the claim path. max_attempts is enforced only on the worker's exception path;
+# a job that hard-crashes the process would loop crash-requeue-crash every
+# lease. Upgrade path: one-line attempts check on the adoption path.
+STALE_LOCK_GRACE_SECONDS = 60.0
 
 
 class MemoryLearner:
@@ -622,7 +634,13 @@ class LearningWorker:
                     except TimeoutError:
                         pass
                     continue
-            job = await self.db.claim_job()
+            cutoff = (
+                datetime.now(timezone.utc)
+                - timedelta(
+                    seconds=self.config.learning.timeout_seconds + STALE_LOCK_GRACE_SECONDS
+                )
+            ).isoformat()
+            job = await self.db.claim_job(stale_cutoff=cutoff)
             if not job:
                 try:
                     await asyncio.wait_for(
