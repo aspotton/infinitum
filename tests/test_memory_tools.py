@@ -1026,7 +1026,9 @@ def test_qa_t_stream_round_cap_forces_answer_not_empty_stream():
 #
 # Verified against a local OpenAI-compatible server: stripping our defs is not enough, the automatic
 # tool-call parser re-emits our tool names and the old forced round forwarded a
-# content:null tool_calls message (non-stream) or a blank SSE (stream).
+# content:null tool_calls message (non-stream) or a blank SSE (stream). Both
+# paths now synthesize the answer from the gathered tool results instead; the
+# streaming synthesis tests live at the bottom of this file.
 
 
 def test_forced_round_sets_tool_choice_none():
@@ -2701,3 +2703,123 @@ async def test_stream_disconnect_recording_parity_live_rounds():
             park.set()
             await rt.upstream.client.aclose()
             await rt.db.close()
+
+
+# --- Streamed forced-round blank synthesis (todo 5, Open WebUI blank final) -----
+#
+# Route contract: when the FORCED terminal round (tool_choice:"none") streams
+# back blank, the client gets a synthesized answer built from the gathered tool
+# results instead of the blank bytes, with [DONE] exactly once and exactly one
+# non-empty assistant event. The forced round therefore streams nothing
+# pre-decision: its [DONE] must never beat the synthesis's [DONE] to the wire.
+# Non-forced blanks stay byte-for-byte verbatim (sibling test below).
+
+
+def test_forced_stream_blank_whitespace_round_synthesizes():
+    # Shape 1: the forced round streams whitespace content + stop + [DONE].
+    # Old shape forwarded that blank SSE verbatim (blank assistant event); the
+    # route must swap the stream for the tool-result synthesis, whose content
+    # deterministically carries "Based on the retrieved memories:" plus the
+    # search-result JSON (the seeded "PostgreSQL 17..." memory).
+    tool_rounds = [
+        [
+            _tool_chunk(0, f"call_fb{i}", "infinitum_memory_search", '{"query": "db"}'),
+            _finish_chunk("tool_calls"),
+            _DONE,
+        ]
+        for i in range(memory_tools.MAX_ITERATIONS)
+    ]
+    blank_round = [_content_chunk("\n\n"), _finish_chunk("stop"), _DONE]
+    replies = [(round_bytes, None) for round_bytes in tool_rounds]
+    replies.append((blank_round, None))
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, replies)
+            response = _chat(client, "forced-blank-ws", extra={"stream": True})
+            assert response.status_code == 200
+            assert upstream.calls == memory_tools.MAX_ITERATIONS + 1
+            assert upstream.bodies[-1]["tool_choice"] == "none"
+            text = response.content.decode()
+            assert "Based on the retrieved memories:" in text
+            assert "PostgreSQL 17" in text
+            assert "tool_calls" not in text
+            assert text.count("data: [DONE]") == 1
+            lines = text.split("\n\n")
+            chunk = json.loads(
+                next(line[6:] for line in lines if line.startswith("data: {"))
+            )
+            assert chunk["object"] == "chat.completion.chunk"
+            assert chunk["model"] == "test-model"
+            assert isinstance(chunk["created"], int)
+            assert chunk["choices"][0]["finish_reason"] == "stop"
+            assert chunk["choices"][0]["delta"]["content"].startswith(
+                "Based on the retrieved memories:"
+            )
+            events = _events(client, "forced-blank-ws")
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1
+            assert assistants[0]["content"].startswith("Based on the retrieved memories:")
+            assert "PostgreSQL 17" in assistants[0]["content"]
+            assert assistants[0]["metadata"]["stream_complete"] is True
+
+
+def test_forced_stream_blank_no_content_round_synthesizes():
+    # Shape 2: the forced round streams NO content delta at all (finish stop +
+    # [DONE] only). Same contract: synthesized marker in the client bytes,
+    # [DONE] exactly once, one non-empty assistant event.
+    tool_rounds = [
+        [
+            _tool_chunk(0, f"call_fbn{i}", "infinitum_memory_search", '{"query": "db"}'),
+            _finish_chunk("tool_calls"),
+            _DONE,
+        ]
+        for i in range(memory_tools.MAX_ITERATIONS)
+    ]
+    blank_round = [_finish_chunk("stop"), _DONE]
+    replies = [(round_bytes, None) for round_bytes in tool_rounds]
+    replies.append((blank_round, None))
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, replies)
+            response = _chat(client, "forced-blank-nocontent", extra={"stream": True})
+            assert response.status_code == 200
+            assert upstream.calls == memory_tools.MAX_ITERATIONS + 1
+            assert upstream.bodies[-1]["tool_choice"] == "none"
+            text = response.content.decode()
+            assert "Based on the retrieved memories:" in text
+            assert "PostgreSQL 17" in text
+            assert text.count("data: [DONE]") == 1
+            events = _events(client, "forced-blank-nocontent")
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1
+            assert assistants[0]["content"].startswith("Based on the retrieved memories:")
+            assert assistants[0]["metadata"]["stream_complete"] is True
+
+
+def test_nonforced_blank_stream_terminal_stays_verbatim():
+    # Synthesis is FORCED-round-only. A non-forced blank terminal round is the
+    # model's own whitespace answer and must reach the client byte-for-byte,
+    # exactly as streamed today.
+    round1 = [
+        _tool_chunk(0, "call_nb1", "infinitum_memory_search", '{"query": "db"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    round2 = [_content_chunk("\n\n"), _finish_chunk("stop"), _DONE]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(round1, None), (round2, None)])
+            response = _chat(client, "nonforced-blank", extra={"stream": True})
+            assert response.status_code == 200
+            assert response.content == b"".join(round2)
+            assert "Based on the retrieved memories:" not in response.content.decode()
+            assert upstream.calls == 2
+            events = _events(client, "nonforced-blank")
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1

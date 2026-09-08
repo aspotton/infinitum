@@ -304,6 +304,29 @@ def _synthesize_from_tool_results(body: dict[str, Any], model: str) -> dict[str,
     }
 
 
+def _synthesize_sse(body: dict[str, Any], model: str) -> bytes:
+    """Render the tool-result synthesis as handcrafted SSE terminal bytes.
+
+    Streaming twin of the non-stream synthesis fallback, in the same
+    handcrafted style as _UPSTREAM_ERROR_EVENT (the only other allowed byte
+    synthesis on the streaming path): exactly one chunk + one [DONE], so the
+    client of a blank forced round still receives a complete answer.
+    """
+    parsed = _synthesize_from_tool_results(body, model)
+    content = str(parsed["choices"][0]["message"].get("content") or "")
+    chunk_payload = {
+        "id": parsed["id"],
+        "object": "chat.completion.chunk",
+        "created": parsed["created"],
+        "model": model,
+        "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": "stop"}],
+    }
+    return (
+        f"data: {json.dumps(chunk_payload, ensure_ascii=False)}\n\n".encode()
+        + b"data: [DONE]\n\n"
+    )
+
+
 async def _record_completion(
     runtime: Runtime,
     *,
@@ -569,7 +592,11 @@ async def chat_completions(request: Request) -> Response:
                         async for chunk in iterator:
                             accum.extend(chunk)
                             out = classifier.consume(chunk)
-                            if out:
+                            if out and not is_forced:
+                                # A FORCED round streams nothing pre-decision:
+                                # its [DONE] must never beat a possible
+                                # blank-round synthesis to the wire (two
+                                # sentinels, synthesis after the stop).
                                 sent_bytes = True
                                 yield out
                             if (
@@ -615,23 +642,37 @@ async def chat_completions(request: Request) -> Response:
                         )
                         continue
                     in_terminal = True
-                    if classifier.forwarded:
+                    raw = bytes(accum)
+                    synth_bytes: bytes | None = None
+                    if is_forced:
+                        # The one round whose bytes cannot be trusted verbatim:
+                        # a server that ignored tool_choice:"none" may answer
+                        # blank. Swap the blank stream for the tool-result
+                        # synthesis (held bytes discarded — nothing was tee'd,
+                        # so this synth's [DONE] is the stream's only one).
+                        # Non-blank forced rounds replay raw, byte-identical.
+                        if not extract_stream_assistant(raw)[0].strip():
+                            synth_bytes = _synthesize_sse(body, model)
+                            yield synth_bytes
+                        elif raw:
+                            yield raw
+                    elif classifier.forwarded:
                         # Live tee: visible lines already streamed; release the
                         # frozen tail (or nothing, if passthrough decided early).
                         held = classifier.flush_held()
                         if held:
                             yield held
-                    elif accum:
+                    elif raw:
                         # Buffered hold-all (or a live round with no visible
                         # lines): replay this round's bytes verbatim, once.
-                        yield bytes(accum)
+                        yield raw
                     comments = _debug_stream_comments(
                         debug, ours_injected, tool_rounds, reject_count
                     )
                     if comments:
                         yield comments
                     recorded = True
-                    await completed(bytes(accum))
+                    await completed(synth_bytes if synth_bytes is not None else raw)
                     return
                 # Cap exhausted: every round suppressed. Mirrors today's
                 # residual empty terminal; nothing is ever recorded here.
