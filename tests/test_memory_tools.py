@@ -2591,8 +2591,9 @@ async def test_stream_disconnect_recording_parity_live_rounds():
     # call) is interrupted ⇒ ZERO assistant events.
     import asyncio
 
-    from infinitum.routes.openai import chat_completions
     from starlette.requests import Request
+
+    from infinitum.routes.openai import chat_completions
 
     def _request(app: object, session: str) -> Request:
         payload = json.dumps(
