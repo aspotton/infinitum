@@ -527,6 +527,7 @@ async def chat_completions(request: Request) -> Response:
             accum = bytearray()
             try:
                 for attempt in range(start_attempt, memory_tools.MAX_ITERATIONS + 2):
+                    in_terminal = False  # never sticky across rounds
                     is_forced = attempt == memory_tools.MAX_ITERATIONS + 1
                     if is_forced and ours_injected:
                         # Past the cap: force a terminal ANSWER round. Stripping
@@ -571,7 +572,17 @@ async def chat_completions(request: Request) -> Response:
                             if out:
                                 sent_bytes = True
                                 yield out
-                            if classifier.decide() == "passthrough":
+                            if (
+                                classifier.decide() == "passthrough"
+                                or (
+                                    guard_active
+                                    and classifier.content_seen
+                                    and not classifier.calls
+                                )
+                            ):
+                                # Under guard, content alone never sets
+                                # passthrough, so a content-only round must set
+                                # the disconnect-recording flag directly.
                                 in_terminal = True
                     except httpx.RequestError:
                         # Zero forwarded bytes ⇒ the route body (or its prefetch)
