@@ -1565,6 +1565,16 @@ def _tee_classifier(**overrides) -> memory_tools.StreamClassifier:
     return memory_tools.StreamClassifier(_OURS, **kwargs)
 
 
+def _tee_classifier_guard(**overrides) -> memory_tools.StreamClassifier:
+    kwargs: dict = {
+        "reasoning_fields": _REASONING_FIELDS,
+        "tee_forward_enabled": True,
+        "guard": True,
+    }
+    kwargs.update(overrides)
+    return memory_tools.StreamClassifier(_OURS, **kwargs)
+
+
 def test_consume_classifier_reasoning_only_forwards_with_split_chunks():
     clf = _tee_classifier()
     line = _reasoning_chunk("deep thought")
@@ -2409,3 +2419,87 @@ async def test_stream_disconnect_drains_counter():
         finally:
             await rt.upstream.client.aclose()
             await rt.db.close()
+
+
+# --- Guard-on classifier leak repro (content co-resident tool rounds) ----------
+#
+# Direct-unit tier, same builders as the tee section above. RED-by-assertion
+# proof for the streaming tool leak: under guard, a round carrying our tool
+# call alongside ANY content (whitespace or real) must decide "suppress" with
+# zero tool bytes forwarded. Today's classifier fires passthrough on
+# _content_seen regardless of guard (feed/consume), so variants B/C/D fail on
+# the zero-leak lock until the guard-mode fix lands. The tee-gate test is a
+# preservation guard: it passes before and after the fix, pinning that a
+# reasoning-free content-only stream still streams incrementally through
+# consume(), byte-identical, decided mid-stream.
+
+
+def test_stream_classifier_guard_whitespace_content_tool_round_leaks_nothing():
+    # Variant B: a whitespace-only content delta co-resident with our call.
+    tool = _tool_chunk(0, "call_1", "infinitum_memory_search", '{"query": "db"}')
+    chunks = [
+        _reasoning_chunk("plan"),
+        _content_chunk("\n\n"),
+        tool,
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    clf = _tee_classifier_guard()
+    forwarded = b"".join(part for chunk in chunks for part in clf.feed(chunk))
+    assert b"infinitum_memory_search" not in forwarded  # zero-leak lock
+    assert clf.finish() == "suppress"
+    calls = memory_tools.reassemble_stream_tool_calls(clf.calls)
+    assert calls[0]["function"]["name"] == "infinitum_memory_search"
+
+
+def test_stream_classifier_guard_tool_then_late_content_leaks_nothing():
+    # Variant C: tool_calls finish first, then the model "changes its mind"
+    # with content + stop; the round was ours end to end.
+    tool = _tool_chunk(0, "call_1", "infinitum_memory_search", '{"query": "db"}')
+    chunks = [
+        _reasoning_chunk("plan"),
+        tool,
+        _finish_chunk("tool_calls"),
+        _content_chunk("changed my mind"),
+        _finish_chunk("stop"),
+        _DONE,
+    ]
+    clf = _tee_classifier_guard()
+    forwarded = b"".join(part for chunk in chunks for part in clf.feed(chunk))
+    assert b"infinitum_memory_search" not in forwarded  # zero-leak lock
+    assert clf.finish() == "suppress"
+
+
+def test_stream_classifier_guard_early_content_tool_round_leaks_nothing():
+    # Variant D: real content before our tool call; under guard the round is
+    # still ours and must never forward the tool bytes.
+    tool = _tool_chunk(0, "call_1", "infinitum_memory_search", '{"query": "db"}')
+    chunks = [
+        _reasoning_chunk("plan"),
+        _content_chunk("let me check"),
+        tool,
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    clf = _tee_classifier_guard()
+    forwarded = b"".join(part for chunk in chunks for part in clf.feed(chunk))
+    assert b"infinitum_memory_search" not in forwarded  # zero-leak lock
+    assert clf.finish() == "suppress"
+
+
+def test_stream_classifier_guard_content_only_tee_gate_preserved():
+    # Preservation guard: no reasoning fields anywhere; content must decide
+    # passthrough mid-stream, forwarding byte-identical bytes incrementally
+    # before any end-of-stream call.
+    chunks = [
+        _content_chunk("hello"),
+        _content_chunk(" world"),
+        _finish_chunk("stop"),
+        _DONE,
+    ]
+    clf = _tee_classifier_guard()
+    outs = [clf.consume(c) for c in chunks]
+    assert b"".join(outs) == b"".join(chunks)  # byte-identical full round
+    assert outs[0]  # incremental: bytes land before any finish()/EOS decide
+    assert clf.decide() == "passthrough"
+    assert clf.finish() == "passthrough"
