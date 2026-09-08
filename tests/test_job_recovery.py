@@ -1,13 +1,16 @@
 import asyncio
 import tempfile
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from infinitum.config import AppConfig
 from infinitum.database import Database
 from infinitum.learning import MemoryLearner, LearningWorker
+from infinitum.models import Event, Memory
+from infinitum.runtime import build_runtime
+from infinitum.upstream import UpstreamClient
 
 
 def _iso(dt: datetime) -> str:
@@ -184,3 +187,119 @@ async def test_stale_running_job_reclaimed_by_worker():
             await worker.stop()
             await db.close()
 
+
+@pytest.mark.asyncio
+async def test_startup_integration_recovers_stale_job_and_worker_finishes_it():
+    """Given a crashed job left running with a day-old lock, When build_runtime
+    starts (topic summaries off) and the worker polls, Then startup recovery
+    requeues it and the worker drives the row to done."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = f"{tmp}/runtime.db"
+        db = Database(db_path)
+        await db.connect()
+        job_id = await db.enqueue_job("learn_interaction", {
+            "event_id": "evt_1",
+            "model": "test-model",
+            "user_text": "What database do we use?",
+            "assistant_text": "We use SQLite.",
+        })
+        first = await db.claim_job()
+        assert first is not None and first["id"] == job_id
+        stale_lock = _iso(datetime.now(timezone.utc) - timedelta(days=1))
+        await db.execute("UPDATE jobs SET locked_at=? WHERE id=?", (stale_lock, job_id))
+        await db.close()
+
+        cfg = AppConfig()
+        cfg.memory.database_path = db_path
+        cfg.learning.enabled = True
+        cfg.learning.topic_summaries = False
+        cfg.learning.poll_interval_seconds = 0.05
+
+        empty = {"choices": [{"message": {"content": '{"memories": []}'}}]}
+        with patch.object(
+            UpstreamClient, "learning_chat_completion", AsyncMock(return_value=empty)
+        ):
+            rt = await build_runtime(cfg)
+            try:
+                rt.worker.start()
+                deadline = asyncio.get_running_loop().time() + 5.0
+                row = None
+                while asyncio.get_running_loop().time() < deadline:
+                    row = await rt.db.fetchone("SELECT status FROM jobs WHERE id=?", (job_id,))
+                    if row["status"] == "done":
+                        break
+                    await asyncio.sleep(0.1)
+                assert row["status"] == "done", row
+            finally:
+                await rt.worker.stop()
+                await rt.upstream.close()
+                await rt.embeddings.close()
+                await rt.db.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_after_orphaned_summary_job_causes_no_double_enqueue():
+    """Given a crash-orphaned running summary job plus dirty topic state, When
+    build_runtime runs its startup passes (worker never started), Then the
+    orphan is normalized to pending and topic recovery adds no second row."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = f"{tmp}/runtime.db"
+        db = Database(db_path)
+        await db.connect()
+        # SEED ORDER IS LOAD-BEARING: the memory must exist before
+        # mark_topic_dirty (topic_updates FK), and the running owner must exist
+        # before mark_topic_dirty so its ensure inserts nothing. Inverting this
+        # yields two rows and false-fails correct code.
+        mem = await db.create_memory(
+            Memory(memory_type="fact", topic="storage", content="We use SQLite.")
+        )
+        job_id = await db.enqueue_job("refresh_topic_summary", {"topic": "storage", "model": ""})
+        first = await db.claim_job()
+        assert first is not None and first["id"] == job_id
+        stale_lock = _iso(datetime.now(timezone.utc) - timedelta(days=1))
+        await db.execute("UPDATE jobs SET locked_at=? WHERE id=?", (stale_lock, job_id))
+        await db.mark_topic_dirty(
+            "storage", [mem.id], model="", debounce_seconds=30.0, update_threshold=3
+        )
+        await db.close()
+
+        cfg = AppConfig()
+        cfg.memory.database_path = db_path
+        cfg.learning.enabled = True
+        cfg.learning.topic_summaries = True
+
+        rt = await build_runtime(cfg)
+        try:
+            rows = await rt.db.fetchall(
+                "SELECT status FROM jobs WHERE job_type='refresh_topic_summary'"
+            )
+            assert len(rows) == 1, rows
+            assert rows[0]["status"] == "pending", rows
+        finally:
+            await rt.upstream.close()
+            await rt.embeddings.close()
+            await rt.db.close()
+
+
+@pytest.mark.asyncio
+async def test_reinforce_with_already_attached_source_event_is_replay_idempotency():
+    """Given a memory whose provenance already contains an event, When the
+    recovered-job path reinforces it with that same source event, Then
+    observation_count stays 1 (the guard replayed jobs rely on)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Database(f"{tmp}/runtime.db")
+        await db.connect()
+        evt = await db.add_event(
+            Event(session_id="s", event_type="message.user", role="user", content="Use SQLite")
+        )
+        mem = await db.create_memory(
+            Memory(memory_type="decision", topic="database", content="We use SQLite.")
+        )
+        await db.add_memory_source(mem.id, evt.id)
+
+        updated = await db.reinforce_memory(
+            mem.id, confidence=0.5, importance=0.5, source_event_ids=[evt.id]
+        )
+        assert updated is not None
+        assert updated.observation_count == 1
+        await db.close()
