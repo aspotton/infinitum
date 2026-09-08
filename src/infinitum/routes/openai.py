@@ -884,6 +884,11 @@ async def chat_completions(request: Request) -> Response:
         synthesized = False
         ours_active: set[str] = set(ours_injected)
         for round_no in range(memory_tools.MAX_ITERATIONS + 1):
+            # Default False every iteration: every non-suppress exit (4xx break,
+            # terminal break, parse-fail) then sees False by construction, so
+            # only a suppress that exhausts the range triggers the post-loop
+            # synthesis below.
+            last_suppressed = False
             is_forced = round_no == memory_tools.MAX_ITERATIONS
             if is_forced and ours_injected:
                 # Past the cap: force a terminal ANSWER round. Stripping defs and
@@ -933,14 +938,15 @@ async def chat_completions(request: Request) -> Response:
                 for tool_call in (choice.get("message") or {}).get("tool_calls") or []
             ]
             classified = parsed is not None and memory_tools.classify_tool_calls(calls, ours_active)
-            # Partition rule: a non-forced round is a REJECT round only when every
-            # call is one of ours or a hallucinated infinitum_* name. Any
-            # client-defined/foreign name keeps the terminal-forward contract
-            # verbatim (never swallow a client's tool contract).
+            # Partition rule: a round is a REJECT round only when every call is
+            # one of ours or a hallucinated infinitum_* name (forced rounds
+            # reject too; an exhausted loop then synthesizes the answer below).
+            # Any client-defined/foreign name keeps the terminal-forward
+            # contract (never swallow a client's tool contract; memory-namespace
+            # calls are stripped at the terminal branch, not forwarded).
             reject_round = (
                 not classified
                 and guard_active
-                and not is_forced
                 and bool(calls)
                 and all(
                     (name := (call.get("function") or {}).get("name")) in ours_active
@@ -953,6 +959,49 @@ async def chat_completions(request: Request) -> Response:
                     assistant_text, assistant_meta = extract_nonstream_assistant(parsed)
                 except Exception:
                     assistant_text, assistant_meta = "", {}
+                # Extraction above saw the RAW parsed (events are truth). A
+                # terminal round's memory-namespace calls must not reach a
+                # client that cannot run them: sanitize a COPY and route it via
+                # the synthesized return below, because the post-loop return
+                # always forwards raw upstream.content. Nothing stripped keeps
+                # the raw path byte-identical.
+                if guard_active and calls:
+                    sanitized, stripped = memory_tools.strip_response_tool_calls(
+                        parsed, client_names
+                    )
+                    if stripped:
+                        reject_count += len(stripped)
+                        raw_message = (parsed.get("choices") or [{}])[0].get("message") or {
+                            "role": "assistant",
+                            "tool_calls": calls,
+                        }
+                        for call in stripped:
+                            function = call.get("function") or {}
+                            await runtime.db.add_event(
+                                Event(
+                                    session_id=session_id,
+                                    user_id=request_context.user_id,
+                                    project_id=request_context.project_id,
+                                    cwd=request_context.cwd,
+                                    request_id=request_id,
+                                    event_type="memory.tool_call",
+                                    role="tool",
+                                    content=function.get("arguments", ""),
+                                    metadata={
+                                        "name": function.get("name"),
+                                        "tool_call_id": call.get("id"),
+                                        "assistant_message": {
+                                            **raw_message,
+                                            "content": strip_memory_block(
+                                                raw_message.get("content") or ""
+                                            ),
+                                        },
+                                        "stripped": True,
+                                    },
+                                )
+                            )
+                        parsed = sanitized
+                        synthesized = True
                 await _record_completion(
                     runtime,
                     request_id=request_id,
@@ -968,6 +1017,7 @@ async def chat_completions(request: Request) -> Response:
                 break
 
             tool_rounds += 1
+            last_suppressed = True
             assistant_message = (parsed.get("choices") or [{}])[0].get("message") or {
                 "role": "assistant",
                 "tool_calls": calls,
@@ -1017,6 +1067,14 @@ async def chat_completions(request: Request) -> Response:
             debug_headers["x-infinitum-memory-tool-calls"] = str(tool_rounds)
         if debug and reject_count:
             debug_headers["x-infinitum-memory-tool-rejects"] = str(reject_count)
+
+        if last_suppressed and not synthesized:
+            # The loop exhausted with its final round suppressed (forced or
+            # reject): answer from the gathered tool results, the non-stream
+            # twin of the streaming cap-exhausted synthesis. Never forward the
+            # last round's raw tool_calls or fall through to raw upstream.content.
+            parsed = _synthesize_from_tool_results(body, model)
+            synthesized = True
 
         if synthesized:
             return Response(
