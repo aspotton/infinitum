@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Learn jobs that crashed mid-flight are now re-queued instead of stranding in `running` state: a startup pass in `build_runtime` requeues jobs that were running when the process died, and job claims adopt stale `running` locks once they pass a lease of `learning.timeout_seconds + 60s`. The lease is derived from `learning.timeout_seconds`, so there is no new config key.
+- A recovered replay of the same source events stays idempotent and cannot inflate `observation_count`.
+- Known limitation: a replayed mid-crash learn job re-asks the extraction model and can create a near-duplicate memory if the re-extraction is phrased differently; event provenance and the observation-count guard are unaffected.
+- Known limitation: `learning.max_attempts` is enforced only on the worker's exception path, so a job that hard-crashes the process would loop crash-requeue-crash every lease. Accepted for the single-process scope; the upgrade path is a one-line attempts check on the adoption path.
+
 ## 0.2.9
 
 - In the default `live` mode, round-1 model reasoning deltas now stream to the client as they arrive instead of being held until the round's decision; `buffered` mode is unchanged and still holds every token until the decision.

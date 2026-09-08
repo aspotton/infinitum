@@ -916,17 +916,28 @@ class Database:
         )
         return job_id
 
-    async def claim_job(self) -> dict[str, Any] | None:
+    async def claim_job(self, *, stale_cutoff: str | None = None) -> dict[str, Any] | None:
         async with self._lock:
-            return await asyncio.to_thread(self._claim_job_sync)
+            return await asyncio.to_thread(self._claim_job_sync, stale_cutoff)
 
-    def _claim_job_sync(self) -> dict[str, Any] | None:
+    def _claim_job_sync(self, stale_cutoff: str | None = None) -> dict[str, Any] | None:
         assert self._conn is not None
         now = datetime.now(timezone.utc).isoformat()
         self._conn.execute("BEGIN IMMEDIATE")
-        row = self._conn.execute(
-            "SELECT * FROM jobs WHERE status='pending' AND run_after<=? ORDER BY created_at LIMIT 1", (now,)
-        ).fetchone()
+        # The cutoff binds locked_at ONLY; run_after always binds now, so a
+        # stale cutoff never delays pending jobs. NULL locked_at on a running
+        # row fails closed (NULL < cutoff is NULL) by design: no COALESCE.
+        if stale_cutoff is None:
+            row = self._conn.execute(
+                "SELECT * FROM jobs WHERE status='pending' AND run_after<=? ORDER BY created_at LIMIT 1",
+                (now,),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT * FROM jobs WHERE run_after<=? AND (status='pending' OR "
+                "(status='running' AND locked_at<?)) ORDER BY created_at LIMIT 1",
+                (now, stale_cutoff),
+            ).fetchone()
         if not row:
             self._conn.commit()
             return None
@@ -958,3 +969,28 @@ class Database:
                 "UPDATE jobs SET status='failed', last_error=?, locked_at=NULL WHERE id=?",
                 (error[:4000], job_id),
             )
+
+    async def recover_interrupted_jobs(self) -> int:
+        """Requeue every ``running`` job row.
+
+        All ``running`` rows are orphans when this is called: the call site is
+        ``build_runtime``, which fully completes before ``LearningWorker.start()``
+        creates its task, so no worker can hold one of these locks yet. ``attempts``
+        and ``run_after`` stay untouched — the poison-loop ceiling of
+        ``learning.max_attempts`` and any retry backoff must survive the restart,
+        and the old ``run_after`` is already due.
+        """
+
+        async with self._lock:
+            return await asyncio.to_thread(self._recover_interrupted_jobs_sync)
+
+    def _recover_interrupted_jobs_sync(self) -> int:
+        assert self._conn is not None
+        self._conn.execute("BEGIN IMMEDIATE")
+        cursor = self._conn.execute(
+            "UPDATE jobs SET status='pending', locked_at=NULL, "
+            "last_error='interrupted mid-flight; requeued after restart' "
+            "WHERE status='running'"
+        )
+        self._conn.commit()
+        return cursor.rowcount

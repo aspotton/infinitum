@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 
@@ -12,6 +13,8 @@ from .request_context import RequestContextResolver
 from .retrieval import MemoryRetriever
 from .tokenizer import TokenCounter
 from .upstream import UpstreamClient
+
+log = logging.getLogger(__name__)
 
 
 class ActiveRequestCounter:
@@ -66,6 +69,12 @@ async def build_runtime(config: AppConfig) -> Runtime:
     request_context = RequestContextResolver(config.request_context)
     compiler = ContextCompiler(db, retriever, TokenCounter(), config)
     learner = MemoryLearner(db, retriever, embeddings, upstream, config)
+    # Gate differs from the topic-recovery line below on purpose: requeuing
+    # jobs interrupted by a crash is needed even without topic summaries.
+    if config.learning.enabled:
+        recovered = await db.recover_interrupted_jobs()
+        if recovered:
+            log.info("recovered %d interrupted learning job(s) after restart", recovered)
     if config.learning.enabled and config.learning.topic_summaries:
         await db.recover_dirty_topic_summary_jobs(default_model=config.learning.model)
     active_requests = ActiveRequestCounter()
