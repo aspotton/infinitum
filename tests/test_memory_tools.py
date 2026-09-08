@@ -2824,3 +2824,63 @@ def test_nonforced_blank_stream_terminal_stays_verbatim():
             events = _events(client, "nonforced-blank")
             assistants = [e for e in events if e["event_type"] == "message.assistant"]
             assert len(assistants) == 1
+
+
+def test_cap_exhausted_stream_with_forced_round_suppressed_synthesizes():
+    # Cap-exhausted variant: an auto-parsing server ignores tool_choice:"none"
+    # and re-emits our (stripped) tool names on the FORCED round too, so every
+    # attempt — forced included — classifies as ours and suppresses. The attempt
+    # loop falls through; today that terminal is silence: SSE comment lines only
+    # and zero assistant events (the live incident's second failure mode). The
+    # post-loop branch must answer with the tool-result synthesis instead.
+    # Loop bound pinned from the attempt range: live (the default
+    # stream_reasoning) starts at attempt 1 and iterates
+    # range(1, MAX_ITERATIONS + 2) = attempts 1..5 for MAX_ITERATIONS = 4,
+    # and the last attempt is the forced one -> exactly 5 upstream calls.
+    ours_call_round = [
+        _tool_chunk(0, "call_capx", "infinitum_memory_search", '{"query": "db"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    replies = [
+        (list(ours_call_round), None) for _ in range(memory_tools.MAX_ITERATIONS + 1)
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, replies)
+            response = _chat(
+                client,
+                "cap-exhausted",
+                extra={"stream": True},
+                headers={"X-Infinitum-Debug": "true"},
+            )
+            assert response.status_code == 200
+            # 5 calls = every attempt of range(1, MAX_ITERATIONS + 2), the
+            # forced round included — see the range comment above.
+            assert upstream.calls == memory_tools.MAX_ITERATIONS + 1
+            # The forced round really ran: defs stripped, tool_choice pinned.
+            assert upstream.bodies[-1]["tool_choice"] == "none"
+            forced_names = {t["function"]["name"] for t in upstream.bodies[-1].get("tools", [])}
+            assert not forced_names & set(memory_tools.TOOL_NAMES)
+            text = response.content.decode()
+            # The synthesized answer reaches the client before any debug comment.
+            assert "Based on the retrieved memories:" in text
+            assert "PostgreSQL 17" in text
+            assert "tool_calls" not in text
+            assert text.count("data: [DONE]") == 1
+            assert text.index("Based on the retrieved memories:") < text.index(
+                ": x-infinitum-memory-tool-calls"
+            )
+            # Zero-tool-round streams keep their silent comments-only shape:
+            # test_qa_f_content_first_stream_passthrough_single_call pins the
+            # byte-exact passthrough stream and test_qa_k the unrecorded
+            # failure tail, and neither path touches the post-loop branch
+            # (reaching it requires >= 1 suppressed round by construction).
+            events = _events(client, "cap-exhausted")
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1
+            assert assistants[0]["content"].startswith("Based on the retrieved memories:")
+            assert "PostgreSQL 17" in assistants[0]["content"]
+            assert assistants[0]["metadata"]["stream_complete"] is True

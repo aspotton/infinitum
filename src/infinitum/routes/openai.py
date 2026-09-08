@@ -674,13 +674,26 @@ async def chat_completions(request: Request) -> Response:
                     recorded = True
                     await completed(synth_bytes if synth_bytes is not None else raw)
                     return
-                # Cap exhausted: every round suppressed. Mirrors today's
-                # residual empty terminal; nothing is ever recorded here.
+                # Cap exhausted: every round suppressed. A loop that ran tool
+                # rounds gets the same tool-result synthesis as the blank forced
+                # round — this is its still-suppressed variant — streamed ahead
+                # of the debug comments and recorded exactly once, mirroring the
+                # terminal branch's recorded-before-await ordering so the
+                # disconnect finally cannot double-record. Zero tool rounds (so
+                # nothing was ever gathered) keeps today's silent comments-only
+                # shape byte-identical.
+                post_synth: bytes | None = None
+                if tool_rounds > 0:
+                    post_synth = _synthesize_sse(body, model)
+                    yield post_synth
                 comments = _debug_stream_comments(
                     debug, ours_injected, tool_rounds, reject_count
                 )
                 if comments:
                     yield comments
+                if post_synth is not None:
+                    recorded = True
+                    await completed(post_synth)
             finally:
                 # Only client-disconnect teardown of a TERMINAL round records a
                 # partial here (parity with the old stream_out finally): error
