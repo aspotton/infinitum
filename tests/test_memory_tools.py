@@ -2486,6 +2486,17 @@ def test_stream_classifier_guard_early_content_tool_round_leaks_nothing():
     assert clf.finish() == "suppress"
 
 
+def test_stream_classifier_guard_content_with_foreign_call_stays_passthrough():
+    # The foreign short-circuit wins over the guard suppress rule: a foreign
+    # name beside content must still forward the round verbatim.
+    tool = _tool_chunk(0, "call_gx", "get_weather", '{"city": "Oslo"}')
+    chunks = [_content_chunk("checking"), tool, _finish_chunk("tool_calls"), _DONE]
+    clf = _tee_classifier_guard()
+    forwarded = b"".join(part for chunk in chunks for part in clf.feed(chunk))
+    assert b"get_weather" in forwarded  # verbatim-forward contract
+    assert clf.finish() == "passthrough"
+
+
 def test_stream_classifier_guard_content_only_tee_gate_preserved():
     # Preservation guard: no reasoning fields anywhere; content must decide
     # passthrough mid-stream, forwarding byte-identical bytes incrementally

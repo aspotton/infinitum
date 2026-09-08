@@ -682,6 +682,7 @@ async def chat_completions(request: Request) -> Response:
                 # disconnect finally cannot double-record. Zero tool rounds (so
                 # nothing was ever gathered) keeps today's silent comments-only
                 # shape byte-identical.
+                in_terminal = False  # last suppressed attempt may set it transiently
                 post_synth: bytes | None = None
                 if tool_rounds > 0:
                     post_synth = _synthesize_sse(body, model)

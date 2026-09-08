@@ -193,6 +193,7 @@ class StreamClassifier:
         # decision, so suppress before content_seen can preempt the loop.
         if (
             self._guard
+            and not self._passthrough
             and not self._foreign_seen
             and (calls := reassemble_stream_tool_calls(self._chunks))
             and (
@@ -209,15 +210,6 @@ class StreamClassifier:
             return "passthrough"
         calls = reassemble_stream_tool_calls(self._chunks)
         if classify_tool_calls(calls, self._ours):
-            return "suppress"
-        # Partition rule (mirror of the non-stream loop): suppress for the
-        # reject round only when every call is ours or a hallucinated
-        # infinitum_* name; `not classified` already proves >=1 rejectable.
-        if self._guard and calls and all(
-            (name := call.get("function", {}).get("name")) in self._ours
-            or is_rejectable_memory_name(name, self._ours, self._client_names)
-            for call in calls
-        ):
             return "suppress"
         return "replay"
 
