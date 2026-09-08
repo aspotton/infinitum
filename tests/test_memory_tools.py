@@ -1055,6 +1055,69 @@ def test_forced_round_sets_tool_choice_none():
             assert [e["content"] for e in assistants] == ["PostgreSQL 17 it is."]
 
 
+def test_forced_round_instructs_model_to_answer_from_results():
+    # Silent forcing (strip + tool_choice:"none") lets a model that is mid-planning
+    # end its turn with a dangling "Let me check..." narration line instead of an
+    # answer. The forced request must carry an explicit instruction to answer now
+    # from the gathered tool results, on BOTH paths, server-side only.
+    call = ("infinitum_memory_search", '{"query": "db"}', "call_fc_in")
+    replies = [_tool_reply([call]) for _ in range(memory_tools.MAX_ITERATIONS)]
+    replies.append(_completion("PostgreSQL 17 it is."))
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, replies)
+            response = _chat(client, "forced-instruct")
+            assert response.status_code == 200
+            forced_body = upstream.bodies[-1]
+            instruction = forced_body["messages"][-1]
+            assert instruction["role"] == "user"
+            assert "tool-round limit" in instruction["content"]
+            assert all(
+                "tool-round limit" not in json.dumps(b["messages"][-1])
+                for b in upstream.bodies[:-1]
+            )
+            events = _events(client, "forced-instruct")
+            assert not any("tool-round limit" in json.dumps(e) for e in events)
+
+
+def test_forced_round_stream_instructs_answer_from_results():
+    tool_stream = [
+        _tool_chunk(0, "call_fc_in2", "infinitum_memory_search", '{"query": "db"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    answer_stream = [_content_chunk("PostgreSQL 17."), _finish_chunk("stop"), _DONE]
+    bodies: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        chunks = answer_stream if bodies[-1].get("tool_choice") == "none" else tool_stream
+
+        async def stream_body():
+            for chunk in chunks:
+                yield chunk
+
+        return httpx.Response(200, content=stream_body())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            app.state.runtime.upstream.client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            response = _chat(client, "forced-stream-instruct", extra={"stream": True})
+            assert response.status_code == 200
+            text = response.content.decode()
+            assert "PostgreSQL 17." in text
+            assert "tool-round limit" not in text  # server-side only
+            instruction = bodies[-1]["messages"][-1]
+            assert instruction["role"] == "user"
+            assert "tool-round limit" in instruction["content"]
+
+
 def test_forced_round_synthesizes_when_tool_choice_ignored():
     # Server ignores tool_choice:"none": even the forced round comes back as
     # finish_reason=tool_calls with content=null. The proxy must synthesize an

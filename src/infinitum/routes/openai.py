@@ -274,6 +274,31 @@ def _strip_injected_tools(body: dict[str, Any], names: set[str]) -> None:
         body.pop("tools", None)
 
 
+_FINAL_ANSWER_INSTRUCTION = (
+    "[Infinitum] You have reached the tool-round limit; the memory tools are no "
+    "longer available. Write the complete final answer for the user's question "
+    "NOW, using only the tool results already present in this conversation. Do "
+    "not announce further tool calls."
+)
+
+
+def _force_answer_round(body: dict[str, Any], names: set[str]) -> None:
+    """Arm the forced terminal round: strip our defs, forbid calls, and tell the
+    model to answer from the results it already gathered.
+
+    tool_choice:"none" alone is insufficient: a model that is mid-planning
+    narrates its next planned call and ends the turn with a dangling "Let me
+    check..." line (observed live with Qwen-class models via Open WebUI). The
+    instruction rides the SERVER-SIDE transcript only; the client never sees it,
+    exactly like the injected tool results.
+    """
+    _strip_injected_tools(body, names)
+    body["tool_choice"] = "none"
+    body["messages"] = body["messages"] + [
+        {"role": "user", "content": _FINAL_ANSWER_INSTRUCTION}
+    ]
+
+
 def _synthesize_from_tool_results(body: dict[str, Any], model: str) -> dict[str, Any]:
     """Build a plain assistant chat-completion from the gathered tool results.
 
@@ -554,15 +579,15 @@ async def chat_completions(request: Request) -> Response:
                     is_forced = attempt == memory_tools.MAX_ITERATIONS + 1
                     if is_forced and ours_injected:
                         # Past the cap: force a terminal ANSWER round. Stripping
-                        # defs alone is insufficient for servers with an
-                        # automatic tool-call parser that re-emits our tool names
-                        # unprompted. tool_choice:"none" (OpenAI spec, honored by
-                        # many OpenAI-compatible servers) forbids tool calls so the
-                        # round must produce text. Keep our names in ours_active so
-                        # a stray call a server emits anyway is OUR loop-capped
-                        # call to suppress, not a foreign tool to forward.
-                        _strip_injected_tools(body, ours_injected)
-                        body["tool_choice"] = "none"
+                        # defs and tool_choice:"none" alone is insufficient for
+                        # servers with an automatic tool-call parser and a
+                        # mid-planning model: it narrates "Let me check..." and
+                        # ends the turn. The instruction appended server-side
+                        # tells it to answer now from the gathered tool results.
+                        # Keep our names in ours_active so a stray call a server
+                        # emits anyway is OUR loop-capped call to suppress, not a
+                        # foreign tool to forward.
+                        _force_answer_round(body, ours_injected)
                     try:
                         iterator = await runtime.upstream.stream_bytes(
                             "chat/completions",
@@ -861,16 +886,14 @@ async def chat_completions(request: Request) -> Response:
         for round_no in range(memory_tools.MAX_ITERATIONS + 1):
             is_forced = round_no == memory_tools.MAX_ITERATIONS
             if is_forced and ours_injected:
-                # Past the cap: force a terminal ANSWER round. Stripping defs alone
-                # is insufficient for servers with an automatic tool-call parser
-                # parser that re-emits our tool names unprompted.
-                # tool_choice:"none" (OpenAI spec, honored by many OpenAI-compatible
-                # servers) forbids tool calls so the round must produce text. Keep
-                # our names in ours_active so a stray call that a server emits
-                # anyway is OUR loop-capped call to suppress, not a foreign tool to
-                # forward to the client.
-                _strip_injected_tools(body, ours_injected)
-                body["tool_choice"] = "none"
+                # Past the cap: force a terminal ANSWER round. Stripping defs and
+                # tool_choice:"none" alone is insufficient: a mid-planning model
+                # narrates "Let me check..." and ends the turn. The instruction
+                # appended server-side tells it to answer now from the gathered
+                # tool results. Keep our names in ours_active so a stray call that
+                # a server emits anyway is OUR loop-capped call to suppress, not a
+                # foreign tool to forward to the client.
+                _force_answer_round(body, ours_injected)
             try:
                 upstream = await runtime.upstream.request(
                     "POST",

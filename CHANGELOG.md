@@ -10,6 +10,7 @@
 - Behavior change: with memory tools enabled, a buffered answer round is now held until generation completes, because plain text no longer short-circuits the round decision; the default `live` mode is unaffected and streams answer content incrementally.
 - Fixed blank exhausted memory-tool loops: when the final forced answer round returns blank, or the loop runs out of rounds with every round suppressed, both streaming and non-streaming responses now deliver an answer synthesized from the already-gathered tool results, leading with `Based on the retrieved memories:`, instead of silence or a dangling tool call.
 - Behavior change: with memory tools enabled, a buffered stream that fails upstream after a suppressed round now returns HTTP 502 rather than an in-stream SSE error event, because no client bytes precede the failure anymore.
+- Fixed forced answer rounds that ended the turn with a dangling "Let me check..." narration line instead of an answer: alongside stripping its tool definitions and `tool_choice: "none"`, the forced request now appends an explicit server-side instruction telling the model to write the complete final answer from the tool results already gathered, so a mid-planning model cannot trail off with nothing delivered. The instruction never reaches the client transcript or the recorded events.
 
 ## 0.2.9
 
