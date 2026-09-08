@@ -129,6 +129,8 @@ learning.py:LearningWorker._run → db.claim_job (jobs table, SQLite)
   → db.finish_job / db.fail_job (backoff 2**attempts, capped 60s)
 ```
 
+Interrupted jobs self-heal two ways: `claim_job` adopts a stale `running` lock past a lease of `learning.timeout_seconds + 60s` (derived from config, no new config key), and `recover_interrupted_jobs` in `build_runtime` requeues interrupted jobs at startup. The startup call sits above the dirty-topic recovery, though the order is functionally neutral. Both paths assume a single process: the startup requeue presumes no other live instance is using the DB.
+
 Key symbols: `build_runtime` (runtime.py), `create_app` (app.py), `chat_completions` (routes/openai.py), `ContextCompiler.compile/inject` (compiler.py), `MemoryRetriever.search` (retrieval.py), `MemoryLearner.learn/_apply` (learning.py), `LearningWorker` (learning.py), durable job queue `enqueue_job/claim_job/finish_job/fail_job` (database.py).
 
 ## Release notes
@@ -159,7 +161,7 @@ ruff check .
 
 Any change to request headers, database migration, reinforcement, retrieval limits, streaming, or background learning should include or update focused tests.
 
-Test conventions: flat `tests/` (18 files, no conftest, no shared helpers). DB isolation via `tempfile.TemporaryDirectory()`; upstream faked either by `httpx.MockTransport` handler (foreground proxy) or `AsyncMock` on `learning_chat_completion`/`retriever.search` (background). Tests construct `AppConfig()` directly, mutate fields, call `create_app(cfg)`, and wrap in `TestClient`.
+Test conventions: flat `tests/` (19 files, no conftest, no shared helpers). DB isolation via `tempfile.TemporaryDirectory()`; upstream faked either by `httpx.MockTransport` handler (foreground proxy) or `AsyncMock` on `learning_chat_completion`/`retriever.search` (background). Tests construct `AppConfig()` directly, mutate fields, call `create_app(cfg)`, and wrap in `TestClient`.
 
 Before packaging a release, verify at minimum:
 
