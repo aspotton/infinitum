@@ -2262,17 +2262,19 @@ def test_stream_reasoning_only_round_forwarded_once_without_duplication():
             assert assistants2[0]["metadata"] == assistants[0]["metadata"]
 
 
-def test_stream_buffered_midround_error_after_content_yields_sse_error():
-    # Scenario 7a: buffered equivalent of t3 (which pinned the live shape).
-    # Round 1 suppresses; round 2's content line triggers the passthrough
-    # flush — consume() releases held bytes at the DECISION regardless of tee
-    # mode — so once the iterator then dies, bytes are already on the wire and
-    # the failure must surface as one in-stream SSE error event, unrecorded.
-    # Open failures with zero forwarded bytes stay t2/qa_k territory. Round-1
-    # failures before any forwarded byte are plain-HTTP in both modes (the
-    # buffered body path / the live prefetch); live additionally surfaces a
-    # round-1 failure after teed bytes as this same in-stream event — pinned
-    # by test_stream_live_round1_error_after_tee_yields_error_event.
+def test_stream_buffered_midround_error_after_content_yields_502_unrecorded():
+    # Scenario 7a (guard-scoped): buffered equivalent of t3 (which pinned the
+    # live tee shape). Round 1 suppresses; round 2's content line no longer
+    # puts ANY byte on the wire — under the guard, content alone never makes a
+    # mid-round decision (a co-resident tool call stays possible, which is
+    # exactly the leak fix), so consume() keeps holding everything. The
+    # generator then dies on the upstream RequestError with zero forwarded
+    # bytes, re-raises, and the route's Phase-B prefetch converts that into
+    # today's plain HTTP 502 — the status ship has NOT sailed — with nothing
+    # recorded. Before the guard rule the content line flushed at the decision
+    # and this shape surfaced as an in-stream SSE error event; the live tee
+    # shape (where teed bytes DO precede the error) stays pinned by
+    # test_stream_live_round1_error_after_tee_yields_error_event.
     round1 = [
         _tool_chunk(0, "call_buferr", "infinitum_memory_search", '{"query": "db"}'),
         _finish_chunk("tool_calls"),
@@ -2288,12 +2290,7 @@ def test_stream_buffered_midround_error_after_content_yields_sse_error():
                 app.state.runtime, [(round1, None), ([visible], httpx.ConnectError("boom"))]
             )
             response = _chat(client, "buf-mid-err", extra={"stream": True})
-            assert response.status_code == 200
-            text = response.content.decode()
-            assert "visible before the wire died" in text
-            assert "tool_calls" not in text
-            assert 'data: {"error"' in text
-            assert text.rstrip().endswith("data: [DONE]")
+            assert response.status_code == 502
             assert upstream.calls == 2
             events = _events(client, "buf-mid-err")
             assert not any(e["event_type"] == "message.assistant" for e in events)
@@ -2503,3 +2500,204 @@ def test_stream_classifier_guard_content_only_tee_gate_preserved():
     assert outs[0]  # incremental: bytes land before any finish()/EOS decide
     assert clf.decide() == "passthrough"
     assert clf.finish() == "passthrough"
+
+
+# --- Route-level incident regression: the Open WebUI whitespace+tool leak -------
+#
+# The live-server incident (req_967eb7c1): Qwen streamed a whitespace content
+# delta co-resident with our own search call. Before the guard-scoped rule the
+# classifier fired passthrough on the content line and forwarded the tool-call
+# bytes to Open WebUI. Now the round suppresses, the search runs server-side,
+# and the loop asks for a real answer. These are the route-level acceptance
+# contracts F3 manual QA re-derives; the classifier tier above proves the unit.
+
+
+def test_stream_incident_whitespace_content_tool_round_live_streams_clean_answer():
+    # Live mode: the reasoning/whitespace preamble may still reach the client,
+    # but no tool-call structure ever does, the search executes server-side,
+    # and the answer round streams through.
+    round1 = [
+        _reasoning_chunk("deciding whether to look it up"),
+        _content_chunk("\n\n"),
+        _tool_chunk(0, "call_incident", "infinitum_memory_search", '{"query": "database"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    round2 = [_content_chunk("PostgreSQL 17."), _finish_chunk("stop"), _DONE]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(round1, None), (round2, None)])
+            response = _chat(client, "incident-live", extra={"stream": True})
+            assert response.status_code == 200
+            text = response.content.decode()
+            assert "PostgreSQL 17." in text
+            assert "infinitum_memory_search" not in text  # zero-leak lock
+            assert "call_" not in text  # zero-leak lock: no call ids either
+            assert upstream.calls == 2
+            events = _events(client, "incident-live")
+            tool_events = [e for e in events if e["event_type"] == "memory.tool_call"]
+            assert len(tool_events) == 1
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1
+            assert assistants[0]["content"] == "PostgreSQL 17."
+
+
+def test_stream_incident_whitespace_content_tool_round_buffered_stays_silent():
+    # Buffered twin: the suppressed round contributes ZERO bytes — the client
+    # sees round 2's bytes verbatim, nothing else.
+    round1 = [
+        _reasoning_chunk("deciding whether to look it up"),
+        _content_chunk("\n\n"),
+        _tool_chunk(0, "call_incident", "infinitum_memory_search", '{"query": "database"}'),
+        _finish_chunk("tool_calls"),
+        _DONE,
+    ]
+    round2 = [_content_chunk("PostgreSQL 17."), _finish_chunk("stop"), _DONE]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            app.state.runtime.config.memory.stream_reasoning = "buffered"
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(round1, None), (round2, None)])
+            response = _chat(client, "incident-buffered", extra={"stream": True})
+            assert response.status_code == 200
+            assert response.content == b"".join(round2)  # zero bytes from round 1
+            assert upstream.calls == 2
+            events = _events(client, "incident-buffered")
+            tool_events = [e for e in events if e["event_type"] == "memory.tool_call"]
+            assert len(tool_events) == 1
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1
+            assert assistants[0]["content"] == "PostgreSQL 17."
+
+
+@pytest.mark.asyncio
+async def test_stream_disconnect_recording_parity_live_rounds():
+    # Disconnect-recording parity across tool-loop rounds (todo 3(d) companion).
+    # httpx buffers the ASGI call, so an in-process disconnect is simulated
+    # exactly the way a real server does it: aclose() on the response body
+    # iterator, which throws GeneratorExit through _counted/_prefixed into
+    # _rounds_stream and runs its recording finally (asyncgen aclose finalizes
+    # the sub-generators too, so completed() lands — the plain-cancel path in
+    # test_stream_disconnect_drains_counter can never land that await).
+    # (i) a content-only answer round interrupted mid-stream records exactly
+    # ONE assistant event whose content is a non-empty prefix of the answer;
+    # (ii) a suppressed round never leaves a stale in_terminal behind:
+    # round 1 (preamble text + our call) suppresses, round 2 (reasoning + our
+    # call) is interrupted ⇒ ZERO assistant events.
+    import asyncio
+
+    from infinitum.routes.openai import chat_completions
+    from starlette.requests import Request
+
+    def _request(app: object, session: str) -> Request:
+        payload = json.dumps(
+            {"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+        ).encode()
+
+        async def receive() -> dict:
+            return {"type": "http.request", "body": payload, "more_body": False}
+
+        return Request(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.4"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/v1/chat/completions",
+                "raw_path": b"/v1/chat/completions",
+                "query_string": b"",
+                "root_path": "",
+                "client": ("test", 1234),
+                "server": ("infinitum.test", 80),
+                "app": app,
+                "headers": [
+                    (b"host", b"infinitum.test"),
+                    (b"content-type", b"application/json"),
+                    (b"x-infinitum-session-id", session.encode()),
+                ],
+            },
+            receive=receive,
+        )
+
+    # (i) content-only round: two chunks land, the third never gets pulled.
+    full_answer = "Partial answer  continued and never delivered tail"
+    with tempfile.TemporaryDirectory() as tmp:
+        app, rt = await _stream_runtime(tmp)
+        try:
+            async def content_body():
+                yield _content_chunk("Partial answer ")
+                yield _content_chunk(" continued")
+                yield _content_chunk(" and never delivered tail")
+                yield _finish_chunk("stop")
+                yield _DONE
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                return httpx.Response(200, content=content_body())
+
+            rt.upstream.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            response = await chat_completions(_request(app, "disc-content-only"))
+            agen = response.body_iterator
+            streamed = [await agen.__anext__(), await agen.__anext__()]
+            await agen.aclose()
+            # The recording lands via the asyncgen finalizer, a loop tick later.
+            await asyncio.sleep(0.01)
+            joined = b"".join(streamed)
+            assert b"Partial answer " in joined
+            assert b"never delivered tail" not in joined
+            events = await rt.db.list_events(session_id="disc-content-only", limit=1000)
+            assistants = [e for e in events if e.event_type == "message.assistant"]
+            assert len(assistants) == 1
+            assert assistants[0].content  # non-empty prefix...
+            assert full_answer.startswith(assistants[0].content)  # ...of the answer
+            assert assistants[0].metadata["stream_complete"] is False  # never saw [DONE]
+        finally:
+            await rt.upstream.client.aclose()
+            await rt.db.close()
+
+    # (ii) suppressed rounds only: a disconnect inside round 2 records nothing.
+    with tempfile.TemporaryDirectory() as tmp:
+        app, rt = await _stream_runtime(tmp)
+        park = asyncio.Event()
+        calls: list[dict] = []
+        try:
+            async def round1_body():
+                yield _content_chunk("preamble text")
+                yield _tool_chunk(0, "disc-a", "infinitum_memory_search", '{"query": "db"}')
+                yield _finish_chunk("tool_calls")
+                yield _DONE
+
+            async def round2_body():
+                yield _reasoning_chunk("round2 thinking before the cut")
+                yield _tool_chunk(0, "disc-b", "infinitum_memory_search", '{"query": "db2"}')
+                await park.wait()
+                yield _finish_chunk("tool_calls")
+                yield _DONE
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                calls.append(json.loads(request.content))
+                return httpx.Response(
+                    200, content=(round1_body() if len(calls) == 1 else round2_body())
+                )
+
+            rt.upstream.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            response = await chat_completions(_request(app, "disc-suppressed"))
+            agen = response.body_iterator
+            await agen.__anext__()  # round-1 preamble text (teed, round still ours)
+            await agen.__anext__()  # round 1 suppressed + executed; round 2 now live
+            await agen.aclose()
+            await asyncio.sleep(0)
+            park.set()
+            await asyncio.sleep(0)
+            assert len(calls) == 2
+            events = await rt.db.list_events(session_id="disc-suppressed", limit=1000)
+            assert not any(e.event_type == "message.assistant" for e in events)
+            # The interrupted attempt must not leak the disconnect either.
+            assert rt.active_requests.value == 0
+        finally:
+            park.set()
+            await rt.upstream.client.aclose()
+            await rt.db.close()
