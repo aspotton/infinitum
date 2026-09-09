@@ -147,7 +147,6 @@ class RequestContextConfig(BaseModel):
     user_headers: list[str] = Field(
         default_factory=lambda: [
             "x-infinitum-user-id",
-            "x-context-user-id",
             "x-opencode-user-id",
             "x-opencode-user",
             "x-headroom-user-id",
@@ -157,7 +156,6 @@ class RequestContextConfig(BaseModel):
     project_headers: list[str] = Field(
         default_factory=lambda: [
             "x-infinitum-project-id",
-            "x-context-project-id",
             "x-opencode-project-id",
             "x-opencode-project",
             "x-headroom-project-id",
@@ -166,7 +164,6 @@ class RequestContextConfig(BaseModel):
     cwd_headers: list[str] = Field(
         default_factory=lambda: [
             "x-infinitum-cwd",
-            "x-context-cwd",
             "x-opencode-directory",
             "x-opencode-cwd",
             "x-headroom-cwd",

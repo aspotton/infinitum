@@ -108,23 +108,17 @@ request_context:
 
   user_headers:
     - x-infinitum-user-id
-    # Legacy pre-0.2 alias:
-    - x-context-user-id
     - x-opencode-user-id
     - x-opencode-user
     - x-headroom-user-id
     - x-litellm-user-id
   project_headers:
     - x-infinitum-project-id
-    # Legacy pre-0.2 alias:
-    - x-context-project-id
     - x-opencode-project-id
     - x-opencode-project
     - x-headroom-project-id
   cwd_headers:
     - x-infinitum-cwd
-    # Legacy pre-0.2 alias:
-    - x-context-cwd
     - x-opencode-directory
     - x-opencode-cwd
     - x-headroom-cwd

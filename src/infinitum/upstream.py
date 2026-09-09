@@ -52,7 +52,6 @@ class UpstreamClient:
             if (
                 lower in _HOP_BY_HOP
                 or lower.startswith("x-infinitum-")
-                or lower.startswith("x-context-")
                 or lower in consumed
             ):
                 continue
