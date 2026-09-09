@@ -31,8 +31,6 @@ X-Infinitum-Project-ID: infinitum
 X-Infinitum-CWD: /home/adam/infinitum
 ```
 
-Pre-v0.2 `X-Context-User-ID`, `X-Context-Project-ID`, and `X-Context-CWD` are still accepted as lower-priority compatibility aliases.
-
 An explicit project ID is preferred. If it is omitted but CWD is supplied, the runtime normalizes the path and derives a stable local key such as `cwd:infinitum:<hash>`. The full CWD is stored separately for provenance.
 
 The default resolver also accepts common aliases so an existing OpenCode/Headroom setup can be reused:

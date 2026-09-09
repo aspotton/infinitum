@@ -11,7 +11,7 @@ This file is the working guide for coding agents contributing to Infinitum.
 - Primary CLI: `infinitum`
 - Current release line: `0.2.x`
 
-The pre-0.2 project name was **Context Runtime**. Compatibility shims remain for the old `context_runtime` Python namespace, `context-runtime` CLI, `CONTEXT_RUNTIME_CONFIG` environment variable, and `X-Context-*` HTTP headers. Do not use the old name in new public APIs, examples, or prose except when documenting migration/compatibility.
+The pre-0.2 project name was **Context Runtime**. All pre-0.2 compatibility shims (the old Python namespace, the old CLI alias, the old config environment variable, and the old header aliases) were removed. Do not use the old name in new public APIs, examples, or prose except in historical notes.
 
 ## Purpose
 
@@ -44,7 +44,7 @@ Primary code lives in `src/infinitum/`.
 - `routes/openai.py` — OpenAI-compatible proxy endpoints and per-request controls
 - `routes/memory.py` — memory management/search endpoints
 - `routes/admin.py` — health, event, topic, and request-context diagnostics
-- `config.py` — configuration models and loading (incl. legacy-DB reuse)
+- `config.py` — configuration models and loading
 - `database.py` — SQLite schema, persistence, durable jobs, provenance (largest module)
 - `request_context.py` — user/project/CWD header resolution
 - `retrieval.py` — hybrid scoring and context affinity
@@ -55,8 +55,6 @@ Primary code lives in `src/infinitum/`.
 - `embeddings.py` — OpenAI-compatible embedding client
 - `upstream.py` — transparent OpenAI-compatible upstream transport
 - `models.py` — event/memory/request-context models
-
-`src/context_runtime/` is compatibility-only. Do not add new behavior there; implement it in `src/infinitum/` and expose a wrapper only if old imports need to keep working.
 
 ## Public naming and compatibility
 
@@ -76,11 +74,11 @@ Use these canonical names in new code/docs:
 
 A tool call whose name starts with `infinitum_` but was not exposed this request and is not client-defined is a hallucination: reject it server-side with an instructive tool result, never forward it to the client, and let the loop continue. On a mixed terminal round, where memory-namespace calls sit alongside client tool calls, non-client `infinitum_` calls are stripped from the forwarded response on both the stream and non-stream paths rather than forwarded, and are recorded as `memory.tool_call` events with `stripped: true` and never answered.
 
-Legacy `X-Context-*` headers remain accepted but should be lower priority than canonical Infinitum headers. Runtime-only headers must be stripped before normal upstream forwarding. Headroom forwarding, when explicitly enabled, should be generated from the already-resolved request context rather than blindly forwarding inbound identity-like headers.
+Runtime-only headers must be stripped before normal upstream forwarding. Headroom forwarding, when explicitly enabled, should be generated from the already-resolved request context rather than blindly forwarding inbound identity-like headers.
 
 ## Database compatibility
 
-Existing v0.1.x SQLite databases must remain usable unless a migration is explicitly introduced. The old implicit filename was `context-runtime.db`; the new default is `infinitum.db`. `load_config()` intentionally reuses an existing legacy DB when no database path is explicitly configured and no new default DB exists.
+The default database filename is `infinitum.db`. There is no legacy-database auto-detection; when an older SQLite database is pointed at via an explicit `memory.database_path`, it is opened and its schema migrates in place.
 
 Schema changes must be additive/migratable and must preserve immutable events and existing memory IDs unless a documented migration absolutely requires otherwise.
 
@@ -167,11 +165,8 @@ Before packaging a release, verify at minimum:
 
 - `import infinitum` works;
 - the `infinitum` CLI resolves;
-- legacy `import context_runtime` still works during the compatibility period;
-- canonical `X-Infinitum-*` headers win over legacy aliases;
-- legacy `X-Context-*` controls are still accepted;
 - runtime-only headers do not leak upstream;
-- an existing v0.1.x DB can be opened without losing data;
+- an older SQLite DB opened via an explicit path still migrates in place;
 - all tests pass.
 
 ## Roadmap direction

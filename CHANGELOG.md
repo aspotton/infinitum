@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+Removed:
+
+- The pre-0.2 `context_runtime` Python namespace and the `context-runtime` command alias; the `infinitum` package and CLI are now the only entry points.
+- The `CONTEXT_RUNTIME_CONFIG` environment variable; `INFINITUM_CONFIG` is the only config-file override.
+- The pre-0.2 `x-context-*` request-context, control, and session header aliases; canonical `X-Infinitum-*` headers and the OpenCode/Headroom/LiteLLM integration aliases are unchanged, and a leftover `x-context-*` header from an old client now passes through to the upstream like any other header.
+- Automatic reuse of an `./context-runtime.db` file under a default configuration; such installs now start on a fresh `infinitum.db`, and an older database must be named explicitly via `memory.database_path`, where in-place schema migration still applies.
+- The migration guide that shipped with the rename.
+
 ## 0.2.11
 
 - Huge learn-time queries (up to `learning.max_tokens`) no longer stall learning and retrieval; the expensive phrase term is now skipped or capped when a size bound proves it cannot move the score by 0.005, so normal-sized scores stay byte-identical.

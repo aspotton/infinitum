@@ -80,8 +80,6 @@ X-Infinitum-CWD: /home/adam/infinitum
 X-Infinitum-Debug: true
 ```
 
-The corresponding pre-v0.2 `X-Context-*` control headers are still accepted for compatibility, but new clients should use the Infinitum names.
-
 `X-Infinitum-Debug: true` adds response metadata such as the number of detailed memories injected, token budget used, resolved user/project IDs, and whether project identity was derived from CWD. It intentionally does not return the full CWD in response headers.
 
 ## Memory drill-down tools
