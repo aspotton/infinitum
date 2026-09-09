@@ -7,6 +7,7 @@ the server-side tool loop can feed them back to the model.
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Iterable, Sequence
 from typing import Any, Protocol
@@ -364,6 +365,19 @@ def is_rejectable_memory_name(
     )
 
 
+def is_memory_namespace_call(name: object, client_names: set[str] | None) -> bool:
+    """True for calls strippable from client-forwarded output: Infinitum's
+    prefix and not client-defined. Unlike `is_rejectable_memory_name` this
+    INCLUDES our own injected names — stripping is a forwarding concern, and a
+    terminal round's memory calls must never reach a client that cannot run
+    them. Nameless/None calls are never strippable by name."""
+    return (
+        isinstance(name, str)
+        and name.lower().startswith("infinitum_")
+        and name not in (client_names or set())
+    )
+
+
 def build_reject_result(name: str, exposed: list[str]) -> str:
     """Tool-result JSON telling the model the memory tool name does not exist."""
     return json.dumps(
@@ -435,6 +449,169 @@ def reassemble_stream_tool_calls(chunks: list[dict]) -> list[dict]:
         elif calls:
             calls[-1]["function"]["arguments"] += chunk.get("arguments") or ""
     return calls
+
+
+def strip_response_tool_calls(
+    parsed: dict, client_names: set[str] | None
+) -> tuple[dict, list[dict]]:
+    """Remove strippable memory-namespace calls from a non-stream response body.
+
+    Returns `(body, stripped_calls)`: the input object unchanged when nothing
+    stripped, otherwise a deep copy with `choices[0].message.tool_calls`
+    pruned (key removed when the list empties). Entries resolve their verdict
+    by name; a nameless entry follows the verdict last set for its `index`
+    (stream-shaped bodies), unknown or absent indexes are kept. The caller's
+    `parsed` is never mutated: events are truth, only the forwarded copy is
+    sanitized.
+    """
+    choices = parsed.get("choices")
+    if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
+        return parsed, []
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        return parsed, []
+    calls = message.get("tool_calls")
+    if not isinstance(calls, list):
+        return parsed, []
+    verdicts: dict[Any, bool] = {}
+    flags: list[bool] = []
+    for call in calls:
+        name = idx = None
+        if isinstance(call, dict):
+            function = call.get("function") or {}
+            name = function.get("name") if isinstance(function, dict) else None
+            idx = call.get("index")
+        if isinstance(name, str) and name:
+            verdict = is_memory_namespace_call(name, client_names)
+            if idx is not None:
+                verdicts[idx] = verdict
+        else:
+            verdict = bool(verdicts.get(idx)) if idx is not None else False
+        flags.append(verdict)
+    if not any(flags):
+        return parsed, []
+    new_parsed = copy.deepcopy(parsed)
+    new_calls = new_parsed["choices"][0]["message"]["tool_calls"]
+    stripped = [call for call, flag in zip(new_calls, flags, strict=True) if flag]
+    if kept := [call for call, flag in zip(new_calls, flags, strict=True) if not flag]:
+        new_parsed["choices"][0]["message"]["tool_calls"] = kept
+    else:
+        del new_parsed["choices"][0]["message"]["tool_calls"]
+    return new_parsed, stripped
+
+
+class ForwardStripper:
+    """Incremental SSE byte filter removing memory-namespace tool-call deltas.
+
+    Line-buffered like `StreamClassifier.consume`: only newline-terminated
+    lines are parsed; every byte otherwise forwards. Per tool-call index the
+    FIRST non-empty `function.name` fragment decides strippable; later
+    nameless fragments continue that verdict, and an index never named is
+    kept. Strippable entries are removed from `delta.tool_calls` (empty list
+    = key removed) and the line is re-emitted via `json.dumps`; every other
+    byte — non-data lines, [DONE], comments, finish_reason, content/reasoning
+    deltas, and lines with no removal — passes through byte-identical.
+    Removed `{name, id, arguments}` records land in `.stripped`.
+
+    HARD REQUIREMENT: one instance per upstream attempt (or `reset()` between
+    rounds): SSE tool-call indexes restart every attempt, so stale verdicts
+    would mis-strip a later round's client calls reusing the same index.
+
+    ponytail: the first-fragment verdict matches the classifier's own
+    assumption (see StreamClassifier._scan_line) — a name split *inside* the
+    infinitum_ prefix trips both, existing behavior; the upgrade path is
+    buffering fragments per index until the name resolves.
+    """
+
+    def __init__(self, client_names: set[str] | None = None) -> None:
+        self._client_names = client_names or set()
+        self._line_buf = bytearray()
+        self._verdicts: dict[Any, bool] = {}
+        self._last_stripped: dict[Any, dict[str, Any]] = {}
+        self.stripped: list[dict[str, Any]] = []
+
+    def consume(self, chunk: bytes) -> bytes:
+        """Filter one network chunk; return its bytes with strippables removed."""
+        self._line_buf.extend(chunk)
+        out = bytearray()
+        while (newline := self._line_buf.find(b"\n")) >= 0:
+            line = bytes(self._line_buf[: newline + 1])
+            del self._line_buf[: newline + 1]
+            out.extend(self._scan_line(line))
+        return bytes(out)
+
+    def flush(self) -> bytes:
+        """Process the unterminated tail at end of stream."""
+        tail = bytes(self._line_buf)
+        self._line_buf.clear()
+        return self._scan_line(tail) if tail else b""
+
+    def reset(self) -> None:
+        """Fresh start for the next attempt: clears verdicts and `.stripped`
+        (harvest `.stripped` before calling this)."""
+        self._line_buf.clear()
+        self._verdicts.clear()
+        self._last_stripped.clear()
+        self.stripped = []
+
+    def _scan_line(self, line: bytes) -> bytes:
+        text = line.rstrip(b"\r").decode("utf-8", errors="replace").strip()
+        if not text.startswith("data:"):
+            return line
+        payload = text[5:].strip()
+        if not payload or payload == "[DONE]":
+            return line
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return line
+        choices = data.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            return line
+        delta = choices[0].get("delta") or {}
+        calls = delta.get("tool_calls")
+        if not isinstance(calls, list):
+            return line
+        kept: list[Any] = []
+        removed = False
+        for call in calls:
+            if not isinstance(call, dict):
+                kept.append(call)
+                continue
+            function = call.get("function") or {}
+            name = function.get("name") if isinstance(function, dict) else None
+            idx = call.get("index")
+            if isinstance(name, str) and name:
+                verdict = is_memory_namespace_call(name, self._client_names)
+                if idx is not None:
+                    self._verdicts[idx] = verdict
+            else:
+                verdict = bool(self._verdicts.get(idx)) if idx is not None else False
+            if not verdict:
+                kept.append(call)
+                continue
+            removed = True
+            arguments = function.get("arguments") or ""
+            if isinstance(name, str) and name:
+                record = {"name": name, "id": call.get("id"), "arguments": arguments}
+                self.stripped.append(record)
+                if idx is not None:
+                    self._last_stripped[idx] = record
+            elif (record := self._last_stripped.get(idx)) is not None:
+                record["arguments"] += arguments
+        if not removed:
+            return line
+        if kept:
+            delta["tool_calls"] = kept
+        else:
+            delta.pop("tool_calls", None)
+        pos = max(line.find(b"data:"), -1) + 5  # -1 (dirty decode) -> rewrite whole tail
+        while line[pos : pos + 1] in (b" ", b"\t"):
+            pos += 1
+        end = len(line)
+        while end > pos and line[end - 1 : end] in (b" ", b"\t", b"\r", b"\n"):
+            end -= 1
+        return line[:pos] + json.dumps(data, ensure_ascii=False).encode() + line[end:]
 
 
 def _cap_payload(payload: Any, items_key: str = "results") -> str:

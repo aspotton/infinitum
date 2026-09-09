@@ -577,6 +577,9 @@ def test_qa_c_client_tool_call_forwarded_verbatim():
 
 
 def test_qa_d_mixed_tool_calls_terminal_not_looped():
+    # Contract change (mixed-round-strip T2): the terminal round is still NOT
+    # looped, but memory-namespace calls are stripped from the forwarded body;
+    # only the client-callable call survives.
     reply = _tool_reply(
         [
             ("infinitum_memory_search", '{"query": "db"}', "call_s"),
@@ -589,8 +592,10 @@ def test_qa_d_mixed_tool_calls_terminal_not_looped():
             _seed_memory(client)
             upstream = _ScriptedUpstream(app.state.runtime, [reply])
             response = _chat(client, "qa-d")
-            assert response.json() == reply
             assert upstream.calls == 1
+            forwarded = response.json()["choices"][0]["message"]["tool_calls"]
+            assert forwarded == reply["choices"][0]["message"]["tool_calls"][1:]
+            assert b"infinitum_" not in response.content
 
 
 def test_qa_g_get_unknown_id_error_result_roundtrip():
@@ -1234,6 +1239,14 @@ def _rejected_events(events: list[dict]) -> list[dict]:
     ]
 
 
+def _stripped_events(events: list[dict]) -> list[dict]:
+    return [
+        e
+        for e in events
+        if e["event_type"] == "memory.tool_call" and e["metadata"].get("stripped") is True
+    ]
+
+
 def _tool_messages(body: dict) -> list[dict]:
     return [m for m in body["messages"] if m.get("role") == "tool"]
 
@@ -1359,18 +1372,31 @@ def test_reject_mixed_with_client_tool_forwards():
             _seed_memory(client)
             upstream = _ScriptedUpstream(app.state.runtime, [reply])
             response = _chat(client, "reject-mixed", extra={"tools": [client_tool]})
-            assert response.json() == reply
             assert upstream.calls == 1
-            assert not any(
-                e["event_type"] == "memory.tool_call" for e in _events(client, "reject-mixed")
-            )
+            forwarded = response.json()["choices"][0]["message"]["tool_calls"]
+            assert forwarded == [reply["choices"][0]["message"]["tool_calls"][1]]
+            assert b"infinitum_" not in response.content
+            stripped = _stripped_events(_events(client, "reject-mixed"))
+            assert {e["metadata"]["name"] for e in stripped} == {
+                "infinitum_memory_search",
+                "infinitum_retrieve",
+            }
 
 
-def test_reject_skipped_on_forced_round():
+def test_reject_applies_on_forced_round():
     replies = [
         _tool_reply([("infinitum_retrieve", '{"query": "db"}', f"call_f{i}")])
-        for i in range(memory_tools.MAX_ITERATIONS + 1)
+        for i in range(memory_tools.MAX_ITERATIONS)
     ]
+    # Non-blank content keeps the forced round out of the blank-pre-synthesis
+    # branch, so the (now forced-inclusive) reject partition fires, the loop
+    # exhausts, and the post-loop last_suppressed synthesis answers.
+    replies.append(
+        _tool_reply(
+            [("infinitum_retrieve", '{"query": "db"}', f"call_f{memory_tools.MAX_ITERATIONS}")],
+            content="Let me check...",
+        )
+    )
     with tempfile.TemporaryDirectory() as tmp:
         app = _chat_app(tmp)
         with TestClient(app) as client:
@@ -1384,7 +1410,7 @@ def test_reject_skipped_on_forced_round():
             assert choice["message"]["content"]
             assert "tool_calls" not in choice["message"]
             rejected = _rejected_events(_events(client, "reject-forced"))
-            assert len(rejected) == memory_tools.MAX_ITERATIONS
+            assert len(rejected) == memory_tools.MAX_ITERATIONS + 1
 
 
 def test_memory_off_header_forwards_hallucination_verbatim():
@@ -1430,6 +1456,123 @@ def test_debug_header_reject_count_absent_without_rejects():
             assert response.status_code == 200
             assert response.headers["x-infinitum-memory-tool-calls"] == "1"
             assert "x-infinitum-memory-tool-rejects" not in response.headers
+
+
+# --- Mixed-round strip: non-stream terminal sanitizing + exhausted synthesis ----
+
+
+def test_strip_mixed_non_stream_forwards_client_call_only():
+    our_call = ("infinitum_memory_search", '{"query": "db"}', "call_t2a")
+    reply = _tool_reply([our_call, ("bash", '{"cmd": "ls"}', "call_t2b")])
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, [reply])
+            response = _chat(client, "strip-mixed", headers={"X-Infinitum-Debug": "true"})
+            assert response.status_code == 200
+            assert b"infinitum_" not in response.content
+            choice = response.json()["choices"][0]
+            assert choice["message"]["tool_calls"] == [
+                reply["choices"][0]["message"]["tool_calls"][1]
+            ]
+            assert choice["finish_reason"] == "tool_calls"
+            assert upstream.calls == 1
+            events = _events(client, "strip-mixed")
+            assert sum(e["event_type"] == "message.assistant" for e in events) == 1
+            stripped = _stripped_events(events)
+            assert [e["metadata"]["name"] for e in stripped] == ["infinitum_memory_search"]
+            assert response.headers["x-infinitum-memory-tool-rejects"] == "1"
+
+
+def test_strip_exhausted_forced_round_with_content_synthesizes():
+    call = ("infinitum_memory_search", '{"query": "db"}', "call_t2c")
+    replies = [_tool_reply([call]) for _ in range(memory_tools.MAX_ITERATIONS)]
+    # tool_choice ignored: the forced round re-emits our call beside content.
+    replies.append(_tool_reply([call], content="Let me check..."))
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, replies)
+            response = _chat(client, "strip-forced", headers={"X-Infinitum-Debug": "true"})
+            assert upstream.calls == memory_tools.MAX_ITERATIONS + 1
+            choice = response.json()["choices"][0]
+            assert choice["message"]["content"].startswith("Based on the retrieved memories:")
+            assert "tool_calls" not in choice["message"]
+            assert choice["finish_reason"] == "stop"
+            assert b"infinitum_" not in response.content
+
+
+def test_strip_guard_off_mixed_round_forwards_verbatim():
+    reply = _tool_reply(
+        [
+            ("infinitum_memory_search", '{"query": "db"}', "call_t2d"),
+            ("bash", "{}", "call_t2e"),
+        ]
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _ScriptedUpstream(app.state.runtime, [reply])
+            response = _chat(
+                client, "strip-off", headers={"X-Infinitum-Memory": "off"}
+            )
+            assert response.json() == reply
+            assert upstream.calls == 1
+            assert "tools" not in upstream.bodies[0]
+            assert not any(
+                e["event_type"] == "memory.tool_call" for e in _events(client, "strip-off")
+            )
+
+
+def test_strip_assistant_event_keeps_raw_stripped_call():
+    our_call = ("infinitum_memory_search", '{"query": "db"}', "call_t2f")
+    reply = _tool_reply([our_call, ("bash", "{}", "call_t2g")])
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            _ScriptedUpstream(app.state.runtime, [reply])
+            response = _chat(client, "strip-raw-parity")
+            assert b"infinitum_" not in response.content
+            assistant = [
+                e
+                for e in _events(client, "strip-raw-parity")
+                if e["event_type"] == "message.assistant"
+            ]
+            assert len(assistant) == 1
+            names = [
+                c["function"]["name"] for c in assistant[0]["metadata"]["tool_calls"]
+            ]
+            assert "infinitum_memory_search" in names
+
+
+def test_strip_4xx_after_suppressed_round_forwards_error_verbatim():
+    our_call = ("infinitum_memory_search", '{"query": "db"}', "call_t2h")
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            calls: list[dict] = []
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                calls.append(json.loads(request.content))
+                if len(calls) == 1:
+                    return httpx.Response(200, json=_tool_reply([our_call]))
+                return httpx.Response(409, content=b'{"error":{"message":"conflict"}}')
+
+            app.state.runtime.upstream.client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            response = _chat(client, "strip-4xx-after")
+            assert response.status_code == 409
+            assert response.content == b'{"error":{"message":"conflict"}}'
+            assert len(calls) == 2
+            assert not any(
+                e["event_type"] == "message.assistant" for e in _events(client, "strip-4xx-after")
+            )
 
 
 # --- Hallucination guard: streaming classifier reject path ----------------------
@@ -1512,8 +1655,9 @@ def test_stream_reject_case_variant():
 
 
 def test_stream_reject_mixed_foreign_replays():
-    # Rejectable + genuinely foreign name in one stream: the whole stream is
-    # passthrough/replayed verbatim (current contract pinned, not improved).
+    # Rejectable + genuinely foreign name in one stream: terminal forwarding
+    # STRIPS the memory-namespace call the client cannot run and keeps the
+    # foreign bytes; the stripped call lands as one stripped:true event.
     chunks = [
         _tool_chunk(0, "call_sh3", "infinitum_retrieve", '{"query": "db"}'),
         _tool_chunk(1, "call_sh4", "get_weather", '{"city": "Oslo"}'),
@@ -1527,13 +1671,16 @@ def test_stream_reject_mixed_foreign_replays():
             upstream = _SseUpstream(app.state.runtime, [(chunks, None)])
             response = _chat(client, "stream-reject-mixed", extra={"stream": True})
             assert response.status_code == 200
-            assert response.content == b"".join(chunks)
-            assert b"infinitum_retrieve" in response.content
+            assert b"infinitum_retrieve" not in response.content
+            assert b"call_sh3" not in response.content
+            assert b"get_weather" in response.content
+            assert b"call_sh4" in response.content
+            assert _finish_chunk("tool_calls") in response.content
+            assert response.content.endswith(_DONE)
             assert upstream.calls == 1
-            assert not any(
-                e["event_type"] == "memory.tool_call"
-                for e in _events(client, "stream-reject-mixed")
-            )
+            stripped = _stripped_events(_events(client, "stream-reject-mixed"))
+            assert [e["metadata"]["name"] for e in stripped] == ["infinitum_retrieve"]
+            assert stripped[0]["metadata"]["tool_call_id"] == "call_sh3"
 
 
 def test_stream_upstream_4xx_represented_verbatim():
@@ -2958,3 +3105,378 @@ def test_cap_exhausted_stream_with_forced_round_suppressed_synthesizes():
             assert assistants[0]["content"].startswith("Based on the retrieved memories:")
             assert "PostgreSQL 17" in assistants[0]["content"]
             assert assistants[0]["metadata"]["stream_complete"] is True
+
+
+# --- Batch 7: mixed-round forward strip primitives ----------------------------
+
+
+def _msg_call(call_id: str, name: str | None, index: int | None = None) -> dict:
+    """Message-shaped tool_call entry; name=None builds a nameless continuation."""
+    function: dict = {"arguments": "{}"}
+    if name is not None:
+        function["name"] = name
+    call: dict = {"id": call_id, "type": "function", "function": function}
+    if index is not None:
+        call["index"] = index
+    return call
+
+
+def _nonstream_body(calls: list[dict]) -> dict:
+    return {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": None, "tool_calls": calls},
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+
+
+def test_is_memory_namespace_call_table():
+    assert memory_tools.is_memory_namespace_call("infinitum_memory_search", set()) is True
+    assert memory_tools.is_memory_namespace_call("bash", set()) is False
+    # A client tool that happens to carry our prefix stays client-owned.
+    assert memory_tools.is_memory_namespace_call("infinitum_foo", {"infinitum_foo"}) is False
+    assert memory_tools.is_memory_namespace_call("Infinitum_X", set()) is True
+    assert memory_tools.is_memory_namespace_call(None, set()) is False
+    assert memory_tools.is_memory_namespace_call("", set()) is False
+
+
+def test_strip_response_tool_calls_mixed_returns_stripped_call():
+    parsed = _nonstream_body(
+        [
+            _msg_call("call_a", "infinitum_memory_search", index=0),
+            _msg_call("call_b", "bash", index=1),
+        ]
+    )
+    out, stripped = memory_tools.strip_response_tool_calls(parsed, set())
+    assert out is not parsed
+    calls = out["choices"][0]["message"]["tool_calls"]
+    assert [c["function"]["name"] for c in calls] == ["bash"]
+    assert len(stripped) == 1
+    assert stripped[0]["id"] == "call_a"
+    assert stripped[0]["function"]["name"] == "infinitum_memory_search"
+    # Events are truth: the caller's raw parsed body is never mutated.
+    assert len(parsed["choices"][0]["message"]["tool_calls"]) == 2
+
+
+def test_strip_response_tool_calls_all_client_identity_no_op():
+    parsed = _nonstream_body([_msg_call("call_b", "bash"), _msg_call("call_c", "get_weather")])
+    out, stripped = memory_tools.strip_response_tool_calls(parsed, set())
+    assert out is parsed
+    assert stripped == []
+
+
+def test_strip_response_tool_calls_nameless_continuation_follows_index():
+    parsed = _nonstream_body(
+        [
+            _msg_call("call_a", "infinitum_memory_get", index=0),
+            _msg_call("call_a", None, index=0),  # continuation of a strippable index
+            _msg_call("call_z", None, index=5),  # index never named -> kept
+            _msg_call("call_b", "bash", index=1),
+        ]
+    )
+    out, stripped = memory_tools.strip_response_tool_calls(parsed, set())
+    calls = out["choices"][0]["message"]["tool_calls"]
+    assert [c["id"] for c in calls] == ["call_z", "call_b"]
+    assert [c["id"] for c in stripped] == ["call_a", "call_a"]
+
+
+def test_forward_stripper_byte_identical_when_nothing_strippable():
+    stream = b"".join(
+        [
+            b": ok\n\n",
+            b"data: {}\n\n",
+            _content_chunk("hello"),
+            _delta_event({"reasoning": "r"}),
+            # Index never named: nameless continuations are kept.
+            _delta_event({"tool_calls": [{"index": 9, "function": {"arguments": "x"}}]}),
+            _tool_chunk(0, "call_b", "bash", '{"c": 1}'),
+            _finish_chunk("stop"),
+            _DONE,
+        ]
+    )
+    whole = memory_tools.ForwardStripper(set())
+    assert whole.consume(stream) + whole.flush() == stream
+    per_byte = memory_tools.ForwardStripper(set())
+    out = b"".join(per_byte.consume(stream[i : i + 1]) for i in range(len(stream)))
+    assert out + per_byte.flush() == stream
+
+
+def test_forward_stripper_strips_pi_incident_mixed_stream():
+    # Chunk shapes from the Pi incident: idx0 carries our whole name in its
+    # first fragment, idx1 is the client's bash call, args interleave after.
+    stream = b"".join(
+        [
+            _delta_event({"reasoning": "checking memory"}),
+            _delta_event({"content": "Let me "}),
+            _delta_event(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_a",
+                            "function": {"name": "infinitum_memory_search", "arguments": ""},
+                        },
+                        {
+                            "index": 1,
+                            "id": "call_b",
+                            "function": {"name": "bash", "arguments": ""},
+                        },
+                    ]
+                }
+            ),
+            _tool_chunk(0, None, None, '{"query": "db"}'),
+            _tool_chunk(1, None, None, '{"command": "ls -la"}'),
+            _finish_chunk("tool_calls"),
+            _DONE,
+        ]
+    )
+    stripper = memory_tools.ForwardStripper(set())
+    out = stripper.consume(stream) + stripper.flush()
+    assert b"infinitum_" not in out
+    assert b"call_a" not in out
+    # The client's call survives: name, id, and interleaved arg fragments.
+    assert b"call_b" in out
+    assert b"bash" in out
+    # The kept lines (client call start + arg continuation) survive verbatim;
+    # the stripped index's arg-only line is gone.
+    assert _tool_chunk(1, None, None, '{"command": "ls -la"}') in out
+    assert _tool_chunk(0, None, None, '{"query": "db"}') not in out
+    # Content, reasoning, finish, and [DONE] survive verbatim.
+    assert _content_chunk("Let me ") in out
+    assert _delta_event({"reasoning": "checking memory"}) in out
+    assert _finish_chunk("tool_calls") in out
+    assert out.endswith(_DONE)
+    assert stripper.stripped == [
+        {"name": "infinitum_memory_search", "id": "call_a", "arguments": '{"query": "db"}'}
+    ]
+
+
+def test_forward_stripper_reset_clears_index_verdicts():
+    # SSE tool-call indices restart every attempt; a stale strippable verdict
+    # must not mis-strip the next attempt's client call reusing index 0.
+    stripper = memory_tools.ForwardStripper(set())
+    stripper.consume(_tool_chunk(0, "call_a", "infinitum_memory_get", "{}"))
+    stripper.reset()
+    chunk = _tool_chunk(0, "call_b", "bash", "{}")
+    assert stripper.consume(chunk) == chunk
+    assert stripper.stripped == []
+
+
+# --- Batch 7: streaming mixed-round strip (T3, Pi incident regression) --------
+
+
+_PI_MIXED_CHUNKS = [
+    _delta_event({"reasoning": "checking memory"}),
+    _content_chunk("Let me "),
+    _delta_event(
+        {
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "call_a",
+                    "function": {"name": "infinitum_memory_search", "arguments": ""},
+                },
+                {
+                    "index": 1,
+                    "id": "call_b",
+                    "function": {"name": "bash", "arguments": ""},
+                },
+            ]
+        }
+    ),
+    _tool_chunk(0, None, None, '{"query": "db"}'),
+    _tool_chunk(1, None, None, '{"command": "ls -la"}'),
+    _finish_chunk("tool_calls"),
+    _DONE,
+]
+
+
+def _assert_pi_stream_stripped(response):
+    assert b"infinitum_" not in response.content
+    assert b"call_a" not in response.content
+    assert b"call_b" in response.content
+    assert b"bash" in response.content
+    assert _tool_chunk(1, None, None, '{"command": "ls -la"}') in response.content
+    assert _content_chunk("Let me ") in response.content
+    assert _delta_event({"reasoning": "checking memory"}) in response.content
+    assert _finish_chunk("tool_calls") in response.content
+    assert response.content.endswith(_DONE)
+
+
+def test_stream_strip_pi_incident_live_forwards_only_client_call():
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(_PI_MIXED_CHUNKS, None)])
+            response = _chat(client, "strip-pi-live", extra={"stream": True})
+            assert response.status_code == 200
+            _assert_pi_stream_stripped(response)
+            assert upstream.calls == 1
+            events = _events(client, "strip-pi-live")
+            stripped = _stripped_events(events)
+            assert [e["metadata"]["name"] for e in stripped] == ["infinitum_memory_search"]
+            assert stripped[0]["metadata"]["tool_call_id"] == "call_a"
+            assistants = [e for e in events if e["event_type"] == "message.assistant"]
+            assert len(assistants) == 1
+            names = [
+                (chunk.get("function") or {}).get("name")
+                for chunk in assistants[0]["metadata"].get("tool_call_chunks", [])
+            ]
+            assert "infinitum_memory_search" in names
+
+
+def test_stream_strip_pi_incident_buffered_replay_stripped():
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            app.state.runtime.config.memory.stream_reasoning = "buffered"
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(_PI_MIXED_CHUNKS, None)])
+            response = _chat(client, "strip-pi-buffered", extra={"stream": True})
+            assert response.status_code == 200
+            _assert_pi_stream_stripped(response)
+            assert upstream.calls == 1
+            stripped = _stripped_events(_events(client, "strip-pi-buffered"))
+            assert [e["metadata"]["name"] for e in stripped] == ["infinitum_memory_search"]
+
+
+def test_stream_strip_live_tee_content_verbatim_ours_suppressed():
+    rounds = [
+        (
+            [
+                _content_chunk("Let me check. "),
+                _tool_chunk(0, "call_a", "infinitum_memory_search", '{"query": "db"}'),
+                _finish_chunk("tool_calls"),
+                _DONE,
+            ],
+            None,
+        ),
+        ([_content_chunk("PostgreSQL 17."), _finish_chunk("stop"), _DONE], None),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, rounds)
+            response = _chat(client, "strip-tee", extra={"stream": True})
+            assert response.status_code == 200
+            assert b"infinitum_" not in response.content
+            assert b"tool_calls" not in response.content
+            assert _content_chunk("Let me check. ") in response.content
+            assert "PostgreSQL 17." in response.content.decode()
+            assert upstream.calls == 2
+            assert not _stripped_events(_events(client, "strip-tee"))
+
+
+def test_stream_strip_guard_off_mixed_stream_byte_identical():
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, [(_PI_MIXED_CHUNKS, None)])
+            response = _chat(
+                client,
+                "strip-guard-off",
+                extra={"stream": True},
+                headers={"X-Infinitum-Memory": "off"},
+            )
+            assert response.status_code == 200
+            assert response.content == b"".join(_PI_MIXED_CHUNKS)
+            assert upstream.calls == 1
+            assert not _stripped_events(_events(client, "strip-guard-off"))
+
+
+def test_stream_strip_per_attempt_reset_keeps_client_call_on_new_round():
+    rounds = [
+        (
+            [
+                _tool_chunk(0, "call_a", "infinitum_memory_search", '{"query": "db"}'),
+                _finish_chunk("tool_calls"),
+                _DONE,
+            ],
+            None,
+        ),
+        (
+            [
+                _tool_chunk(0, "call_b", "bash", '{"command": "ls"}'),
+                _finish_chunk("tool_calls"),
+                _DONE,
+            ],
+            None,
+        ),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(app.state.runtime, rounds)
+            response = _chat(client, "strip-reset", extra={"stream": True})
+            assert response.status_code == 200
+            assert b"call_b" in response.content
+            assert b"bash" in response.content
+            assert b"infinitum_" not in response.content
+            assert upstream.calls == 2
+            assert not _stripped_events(_events(client, "strip-reset"))
+
+
+def test_stream_strip_forced_round_nonblank_mixed_replays_stripped():
+    ours_round = (
+        [
+            _tool_chunk(0, "call_r", "infinitum_memory_search", '{"query": "db"}'),
+            _finish_chunk("tool_calls"),
+            _DONE,
+        ],
+        None,
+    )
+    forced = (
+        [
+            _content_chunk("wrapping up"),
+            _delta_event(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_f",
+                            "function": {"name": "infinitum_memory_get", "arguments": ""},
+                        },
+                        {
+                            "index": 1,
+                            "id": "call_g",
+                            "function": {"name": "bash", "arguments": ""},
+                        },
+                    ]
+                }
+            ),
+            _tool_chunk(0, None, None, '{"memory_id": "mem_x"}'),
+            _tool_chunk(1, None, None, '{"command": "ls"}'),
+            _finish_chunk("tool_calls"),
+            _DONE,
+        ],
+        None,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        app = _chat_app(tmp)
+        with TestClient(app) as client:
+            _seed_memory(client)
+            upstream = _SseUpstream(
+                app.state.runtime, [ours_round, ours_round, ours_round, ours_round, forced]
+            )
+            response = _chat(
+                client,
+                "strip-forced",
+                extra={"stream": True},
+                headers={"X-Infinitum-Debug": "true"},
+            )
+            assert response.status_code == 200
+            assert b"infinitum_" not in response.content
+            assert b"call_f" not in response.content
+            assert b"call_g" in response.content
+            assert _content_chunk("wrapping up") in response.content
+            assert b"x-infinitum-memory-tool-calls 4" in response.content
+            assert b"x-infinitum-memory-tool-rejects 1" in response.content
+            assert upstream.calls == 5
+            stripped = _stripped_events(_events(client, "strip-forced"))
+            assert [e["metadata"]["name"] for e in stripped] == ["infinitum_memory_get"]
