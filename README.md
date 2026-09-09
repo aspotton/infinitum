@@ -112,7 +112,7 @@ Retrieval is not just nearest-vector search. Each active memory is scored from a
 - topic relevance
 - optional user/project/CWD provenance affinity after the memory is already relevant
 
-Eligibility requires at least one genuine relevance signal (semantic, lexical, or topic) above `memory.minimum_relevance_score` (default `0.08`, set `0.0` to disable) before the query-independent terms like importance, confidence, and freshness can qualify a memory, with the high-importance goal/decision exemption unchanged. The same scorer, and hence the same gate, also backs the drill-down memory tools and `POST /memory/search`.
+Eligibility requires at least one genuine relevance signal (semantic, lexical, or topic) above `memory.minimum_relevance_score` (default `0.08`, set `0.0` to disable) before the query-independent terms like importance, confidence, and freshness can qualify a memory, with the high-importance goal/decision exemption unchanged. The same scorer, and hence the same gate, also backs the drill-down memory tools and `POST /memory/search`. The lexical phrase comparison is skipped when the two inputs are roughly 80:1 size-skewed, where the mathematical bound proves it cannot change any score by 0.005 or more.
 
 The Context Compiler then:
 
