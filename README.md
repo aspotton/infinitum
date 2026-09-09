@@ -24,7 +24,7 @@ Infinitum moves the memory out of the service and into a runtime that sits in fr
 
 Current release: **v0.2.11**.
 
-Full release history lives in [CHANGELOG.md](CHANGELOG.md). Upgrading from v0.1.x? See [the migration guide](docs/MIGRATION_FROM_CONTEXT_RUNTIME.md).
+Full release history lives in [CHANGELOG.md](CHANGELOG.md).
 
 ## Repository
 
@@ -278,13 +278,13 @@ With `passthrough_authorization: true`, the inbound `Authorization` header is fo
 
 Everything else is reference material in [docs/CONFIGURATION.md](docs/CONFIGURATION.md):
 
-- [Request-context and OpenCode headers](docs/CONFIGURATION.md#request-context-and-opencode-headers): canonical `X-Infinitum-*` headers are preferred, legacy `X-Context-*` aliases are still accepted.
+- [Request-context and OpenCode headers](docs/CONFIGURATION.md#request-context-and-opencode-headers): canonical `X-Infinitum-*` headers, plus the OpenCode/Headroom/LiteLLM integration aliases.
 - [Embeddings](docs/CONFIGURATION.md#embeddings) are optional and configured there.
 - Learning controls: a separate extraction model, timeouts, [deferral while the upstream is busy](docs/CONFIGURATION.md#deferring-learning-while-the-upstream-is-busy), and incremental [topic summaries](docs/CONFIGURATION.md#incremental-topic-summary-controls).
 
 ## Endpoints and request controls
 
-Infinitum exposes an OpenAI-compatible surface (`POST /v1/chat/completions`, `GET /v1/models`) plus runtime endpoints for inspecting memories, events, topics, and request context. Internal `X-Infinitum-*` control headers are stripped before forwarding upstream, and the pre-v0.2 `X-Context-*` controls remain accepted for compatibility. Full reference: [docs/API.md](docs/API.md).
+Infinitum exposes an OpenAI-compatible surface (`POST /v1/chat/completions`, `GET /v1/models`) plus runtime endpoints for inspecting memories, events, topics, and request context. Internal `X-Infinitum-*` control headers are stripped before forwarding upstream. Full reference: [docs/API.md](docs/API.md).
 
 ## Persistence
 

@@ -47,11 +47,9 @@ def test_request_context_header_priority_prefers_infinitum_headers():
     resolved = resolver.resolve(
         {
             "x-infinitum-user-id": "canonical-user",
-            "x-context-user-id": "legacy-user",
             "x-opencode-user-id": "opencode-user",
             "x-headroom-user-id": "headroom-user",
             "x-infinitum-project-id": "canonical-project",
-            "x-context-project-id": "legacy-project",
             "x-opencode-project": "opencode-project",
         }
     )
@@ -177,7 +175,7 @@ async def test_existing_v013_database_is_migrated_in_place():
             await db.close()
 
 
-@pytest.mark.parametrize("debug_header", ["x-infinitum-debug", "x-context-debug"])
+@pytest.mark.parametrize("debug_header", ["x-infinitum-debug"])
 def test_api_persists_context_and_strips_consumed_headers_upstream(debug_header):
     captured_headers: dict[str, str] = {}
 

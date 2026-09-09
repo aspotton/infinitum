@@ -28,14 +28,12 @@ dev = [
 
 [project.scripts]
 infinitum = "infinitum.__main__:main"
-# Compatibility alias for pre-0.2 installs.
-context-runtime = "infinitum.__main__:main"
 
 [tool.hatch.version]
 path = "src/infinitum/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/infinitum", "src/context_runtime"]
+packages = ["src/infinitum"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

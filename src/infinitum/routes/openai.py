@@ -33,11 +33,9 @@ def _session_id(request: Request, body: dict[str, Any]) -> str | None:
     """
     # OpenCode's OpenAI-compatible provider path commonly supplies X-Session-Id
     # / x-session-affinity; its own provider uses x-opencode-session. Prefer the
-    # canonical Infinitum header. The former x-context-* name remains accepted
-    # as a compatibility alias for pre-0.2 deployments.
+    # canonical Infinitum header.
     for name in (
         "x-infinitum-session-id",
-        "x-context-session-id",
         "x-opencode-session",
         "x-session-id",
         "x-session-affinity",
@@ -49,8 +47,6 @@ def _session_id(request: Request, body: dict[str, Any]) -> str | None:
     if isinstance(metadata, dict):
         if metadata.get("infinitum_session_id"):
             return str(metadata["infinitum_session_id"])
-        if metadata.get("context_session_id"):
-            return str(metadata["context_session_id"])
     return None
 
 
@@ -504,18 +500,16 @@ async def chat_completions(request: Request) -> Response:
         )
     )
 
-    def control_header(canonical: str, legacy: str, default: str) -> str:
-        return request.headers.get(canonical) or request.headers.get(legacy) or default
+    def control_header(canonical: str, default: str) -> str:
+        return request.headers.get(canonical) or default
 
-    memory_enabled = control_header("x-infinitum-memory", "x-context-memory", "on").lower() not in {
+    memory_enabled = control_header("x-infinitum-memory", "on").lower() not in {
         "off", "false", "0"
     }
-    learning_enabled = control_header(
-        "x-infinitum-learning", "x-context-learning", "on"
-    ).lower() not in {"off", "false", "0"}
-    debug = control_header("x-infinitum-debug", "x-context-debug", "false").lower() in {
-        "on", "true", "1"
+    learning_enabled = control_header("x-infinitum-learning", "on").lower() not in {
+        "off", "false", "0"
     }
+    debug = control_header("x-infinitum-debug", "false").lower() in {"on", "true", "1"}
 
     # Hallucination-guard state, computed once per request BEFORE any def
     # injection so client_names reflects the original inbound tool list.
