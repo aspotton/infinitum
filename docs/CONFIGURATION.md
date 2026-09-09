@@ -118,6 +118,22 @@ embeddings:
 
 Any OpenAI-compatible `/v1/embeddings` implementation can be used. When enabled, semantic similarity joins the hybrid blend of lexical, topic, importance, confidence, freshness, and optional provenance-affinity signals described in the [README's retrieval section](../README.md); when a memory has no usable vector or an embedding call fails, scoring degrades gracefully to the non-semantic signals rather than dropping the memory.
 
+## Memory drill-down tools
+
+The read-only drill-down tool behavior contract is in [API.md](./API.md); the keys below gate it.
+
+```yaml
+memory:
+  tools_enabled: true  # default: false
+  # "live" streams model reasoning deltas before a round decides;
+  # "buffered" holds everything until the decision (pre-0.2 behavior).
+  stream_reasoning: live  # default: live
+  # SSE delta field names that carry model reasoning for the live mode.
+  reasoning_delta_fields: [reasoning, reasoning_content]
+```
+
+Setting `stream_reasoning: buffered` restores the pre-0.2 hold-everything behavior, where streamed rounds are withheld until the tool-round decision resolves.
+
 ## Separate learning model
 
 ```yaml
