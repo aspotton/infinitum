@@ -101,8 +101,10 @@ async def _prefixed(first: bytes | None, rest: AsyncIterator[bytes]) -> AsyncIte
 async def _terminal_stream(
     accum: bytearray,
     live: AsyncIterator[bytes] | None,
-    comments: bytes,
+    comments: Callable[[], bytes],
     completed: Callable[[bytes], Awaitable[None]],
+    stripper: memory_tools.ForwardStripper | None = None,
+    record_stripped: Callable[[list[dict[str, Any]]], Awaitable[None]] | None = None,
 ) -> AsyncIterator[bytes]:
     """Emit a decided round: replay/passthrough bytes, then trailing debug comments.
 
@@ -111,16 +113,33 @@ async def _terminal_stream(
     replay whose rest was drained into `accum` in the route body). `completed`
     is awaited in the finally so normal completion AND client disconnect each
     record exactly once, exactly like the pre-0.3 stream_out.
+
+    `comments` is a thunk, not pre-baked bytes, so the stripped-call records
+    (harvested once every byte has passed the stripper) are already counted
+    into the reject value it renders. `stripper` filters only the forwarded
+    copy — `completed` still sees the raw accum, events stay truth; None
+    (guard off) bypasses it entirely.
     """
     try:
         if accum:
-            yield bytes(accum)
+            out = stripper.consume(bytes(accum)) if stripper is not None else bytes(accum)
+            if out:
+                yield out
         if live is not None:
             async for chunk in live:
                 accum.extend(chunk)
-                yield chunk
-        if comments:
-            yield comments
+                out = stripper.consume(chunk) if stripper is not None else chunk
+                if out:
+                    yield out
+        if stripper is not None:
+            tail = stripper.flush()
+            if tail:
+                yield tail
+            if stripper.stripped and record_stripped is not None:
+                await record_stripped(stripper.stripped)
+        comment_bytes = comments()
+        if comment_bytes:
+            yield comment_bytes
     finally:
         await completed(bytes(accum))
 
@@ -181,6 +200,47 @@ def _stream_assistant_message(classifier: memory_tools.StreamClassifier) -> dict
         assistant_message["content"] = assistant_content
     assistant_message["tool_calls"] = calls
     return assistant_message
+
+
+async def _record_stripped_calls(
+    runtime: Runtime,
+    stripped: list[dict[str, Any]],
+    assistant_message: dict[str, Any],
+    *,
+    session_id: str,
+    request_id: str,
+    request_context: RequestContext,
+) -> int:
+    """Record forward-stripped memory-namespace calls; return the count.
+
+    One memory.tool_call event per stripped call (same shape as the non-stream
+    terminal strip), counted into the caller's reject total. Events stay truth:
+    the round's assistant event is recorded RAW by completed(); only the
+    forwarded client bytes lost these calls the client cannot run.
+    """
+    for call in stripped:
+        await runtime.db.add_event(
+            Event(
+                session_id=session_id,
+                user_id=request_context.user_id,
+                project_id=request_context.project_id,
+                cwd=request_context.cwd,
+                request_id=request_id,
+                event_type="memory.tool_call",
+                role="tool",
+                content=call["arguments"],
+                metadata={
+                    "name": call["name"],
+                    "tool_call_id": call["id"],
+                    "assistant_message": {
+                        **assistant_message,
+                        "content": strip_memory_block(assistant_message.get("content") or ""),
+                    },
+                    "stripped": True,
+                },
+            )
+        )
+    return len(stripped)
 
 
 async def _run_tool_round(
@@ -548,6 +608,28 @@ async def chat_completions(request: Request) -> Response:
                 request_context=request_context,
             )
 
+        async def _record_forward_stripped(stripped: list[dict[str, Any]]) -> None:
+            # Phase-A handoff recorder: the classifier stopped being fed at
+            # the decision, so rebuild the raw round message from the bytes
+            # accum holds, then event each stripped call into the route's
+            # reject total (the comments thunk re-reads it after this runs).
+            nonlocal reject_count
+            text, meta = extract_stream_assistant(bytes(accum))
+            message: dict[str, Any] = {"role": "assistant"}
+            if text:
+                message["content"] = text
+            message["tool_calls"] = memory_tools.reassemble_stream_tool_calls(
+                meta.get("tool_call_chunks", [])
+            )
+            reject_count += await _record_stripped_calls(
+                runtime,
+                stripped,
+                message,
+                session_id=session_id,
+                request_id=request_id,
+                request_context=request_context,
+            )
+
         # Two-phase streaming. Buffered mode decides round 1 in the route body
         # (Phase A), observable-identical to the pre-0.3 loop, then hands
         # attempts 2..MAX+1 to ONE shared generator inside the returned
@@ -613,6 +695,15 @@ async def chat_completions(request: Request) -> Response:
                         tee_forward_enabled=(stream_mode == "live"),
                     )
                     accum = bytearray()
+                    # Fresh stripper PER ATTEMPT: SSE tool-call indices restart
+                    # every attempt, so a stale index verdict must never mis-
+                    # strip a later round's client call reusing that index.
+                    # Suppressed rounds land nothing in .stripped (tool lines
+                    # freeze before any tee), so harvesting only at terminal
+                    # branches loses nothing.
+                    stripper = (
+                        memory_tools.ForwardStripper(client_names) if guard_active else None
+                    )
                     try:
                         async for chunk in iterator:
                             accum.extend(chunk)
@@ -622,8 +713,15 @@ async def chat_completions(request: Request) -> Response:
                                 # its [DONE] must never beat a possible
                                 # blank-round synthesis to the wire (two
                                 # sentinels, synthesis after the stop).
-                                sent_bytes = True
-                                yield out
+                                # This site carries all three forwarded byte
+                                # kinds (tee lines, the passthrough flush
+                                # burst, raw after passthrough); the stripper
+                                # passes the tool-line-free ones unchanged.
+                                if stripper is not None:
+                                    out = stripper.consume(out)
+                                if out:
+                                    sent_bytes = True
+                                    yield out
                             if (
                                 classifier.decide() == "passthrough"
                                 or (
@@ -680,17 +778,32 @@ async def chat_completions(request: Request) -> Response:
                             synth_bytes = _synthesize_sse(body, model)
                             yield synth_bytes
                         elif raw:
-                            yield raw
+                            # Forced rounds stream nothing pre-decision, so
+                            # this replay is the round's only feed.
+                            yield stripper.consume(raw) if stripper is not None else raw
                     elif classifier.forwarded:
                         # Live tee: visible lines already streamed; release the
                         # frozen tail (or nothing, if passthrough decided early).
                         held = classifier.flush_held()
                         if held:
-                            yield held
+                            yield stripper.consume(held) if stripper is not None else held
                     elif raw:
                         # Buffered hold-all (or a live round with no visible
                         # lines): replay this round's bytes verbatim, once.
-                        yield raw
+                        yield stripper.consume(raw) if stripper is not None else raw
+                    if stripper is not None:
+                        tail = stripper.flush()
+                        if tail:
+                            yield tail
+                        if stripper.stripped:
+                            reject_count += await _record_stripped_calls(
+                                runtime,
+                                stripper.stripped,
+                                _stream_assistant_message(classifier),
+                                session_id=session_id,
+                                request_id=request_id,
+                                request_context=request_context,
+                            )
                     comments = _debug_stream_comments(
                         debug, ours_injected, tool_rounds, reject_count
                     )
@@ -822,10 +935,19 @@ async def chat_completions(request: Request) -> Response:
                         _terminal_stream(
                             accum,
                             live,
-                            _debug_stream_comments(
+                            # Thunk, not bytes: the stripped harvest inside
+                            # _terminal_stream bumps reject_count before this
+                            # renders, so the comment count includes them.
+                            lambda: _debug_stream_comments(
                                 debug, ours_injected, tool_rounds, reject_count
                             ),
                             completed,
+                            (
+                                memory_tools.ForwardStripper(client_names)
+                                if guard_active
+                                else None
+                            ),
+                            _record_forward_stripped,
                         ),
                         counter,
                     ),
