@@ -112,7 +112,7 @@ Retrieval is not just nearest-vector search. Each active memory is scored from a
 - topic relevance
 - optional user/project/CWD provenance affinity after the memory is already relevant
 
-Eligibility requires at least one genuine relevance signal (semantic, lexical, or topic) above `memory.minimum_relevance_score` (default `0.08`, set `0.0` to disable) before the query-independent terms like importance, confidence, and freshness can qualify a memory, with the high-importance goal/decision exemption unchanged. The same scorer, and hence the same gate, also backs the drill-down memory tools and `POST /memory/search`. The lexical phrase comparison is skipped when the two inputs are roughly 80:1 size-skewed, where the mathematical bound proves it cannot change any score by 0.005 or more.
+Eligibility requires at least one genuine relevance signal (semantic, lexical, or topic) before the query-independent terms like importance, confidence, and freshness can qualify a memory. The same scorer, and hence the same gate, also backs the drill-down memory tools and `POST /memory/search`.
 
 The Context Compiler then:
 
@@ -127,21 +127,11 @@ The Context Compiler then:
 
 The configured memory budget is a ceiling, not a target.
 
-The compiled block is built to be cache-stable across turns. `context.inject_position` defaults to `suffix`, placing the memory message immediately before the last user message so the system prompt and the full conversation history ahead of it stay byte-stable for upstream prompt caching (`prefix` restores the legacy position after the leading system messages). When `memory.tools_enabled` is on, the two drill-down tool definitions below are exposed statically on memory-enabled requests unless the client defines tools with the same names, so the tools region never flickers between turns. Within one session (same resolved user/project context) the compiled block is also pinned byte-for-byte until a memory or topic summary actually changes. A topic-summary refresh that produces an identical summary no longer bumps the invalidation watermark; memory-write updates still do, by design. Caveat: with the default `memory_message_role: system`, strict chat templates that raise on a system message that is not at index 0, or providers that reject mid-list system messages, must set `inject_position: prefix`. Echo protection is deliberately asymmetric: raw `request.received` events keep exactly what the client sent, while derived interaction text used for recording and learning has echoed `<infinitum_memory>` regions stripped so quoted context never re-enters memory, and that split should not be harmonized away.
+The compiled block is built to be cache-stable across turns; the mechanics are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Configuration keys are in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ### Deep retrieval tools
 
-The compiler injects a bounded memory block per request. When the model needs more than that block shows, optional read-only tools let it drill deeper:
-
-```yaml
-memory:
-  tools_enabled: true  # default: false
-  # "live" streams model reasoning deltas before a round decides;
-  # "buffered" holds everything until the decision (pre-0.2 behavior).
-  stream_reasoning: live  # default: live
-  # SSE delta field names that carry model reasoning for the live mode.
-  reasoning_delta_fields: [reasoning, reasoning_content]
-```
+The compiler injects a bounded memory block per request. When the model needs more than that block shows, optional read-only tools let it drill deeper.
 
 When enabled, Infinitum appends two function tools to the client's tool list on every memory-enabled request, as long as the client has not defined a tool of the same name:
 
@@ -150,15 +140,7 @@ When enabled, Infinitum appends two function tools to the client's tool list on 
 
 The tools use the same scorer as injection, so results are ranked identically. They read the same global namespace, and request user/project/CWD context stays a soft affinity, never an access-control filter.
 
-The tool loop runs server-side and is transparent to the client: intermediate tool-call rounds never appear in the client's response or stream, and the client sees only the final answer. The one caveat is plain model text on streaming responses: under the default `memory.stream_reasoning: live`, a round's visible output can reach the client as it streams, including reasoning deltas and even a plain-text preamble the model emits alongside an internal memory lookup, while that lookup itself runs server-side. Infinitum's own tool-call structures stay invisible even in a round where such text sits beside the call: visible text, invisible machinery. That transparency is now unconditional for memory-named tool calls: a hallucinated `infinitum_*` call is answered server-side and never forwarded, per the parser-hazard note below. Up to 4 tool rounds run per request. If the model keeps calling the memory tools past that cap, Infinitum makes one final forced answer round: its own tool definitions are removed and the standard `tool_choice: "none"` parameter is sent, so servers with automatic tool-call parsers must answer in text instead of re-emitting the tool calls, and the server-side transcript carries an explicit instruction to answer now from the gathered tool results, so a model that was mid-planning cannot end the turn with a dangling "Let me check..." line. If a server ignores `tool_choice` and the forced round still comes back blank, both the streaming and non-streaming paths synthesize an assistant answer from the already-gathered tool results, leading with `Based on the retrieved memories:`, rather than forwarding a null-content message or a dangling tool call. A tool loop that runs out of rounds with every round suppressed ends the same way, with a synthesized answer instead of silence. Suppressed rounds are recorded as `memory.tool_call` events, and rejected calls are recorded the same way with a `rejected` provenance flag plus the exact instructive result the model was told, and forward-stripped calls from a mixed terminal round are recorded alongside them with a `stripped` provenance flag and are never answered; only the final assistant message becomes an assistant event. With `X-Infinitum-Debug: true`, the response carries `x-infinitum-memory-tool-calls` with the round count and, when calls were rejected or forward-stripped, `x-infinitum-memory-tool-rejects` with the combined count. On streaming responses these two counters instead arrive as SSE comment lines after the final `[DONE]` in the stream body; comment lines are ignored by SDK parsers that stop reading at `[DONE]`, so treat them as proxy- and log-visible. Non-stream responses keep the headers.
-
-Latency edges worth knowing:
-
-- Streaming reasoning is controlled by `memory.stream_reasoning`. In the default `live` mode, model reasoning deltas stream out immediately while the rest of a round is held only until Infinitum can tell whether it is a memory tool call; `buffered` holds everything back until that decision. Tool calls and results are never forwarded in either mode, though a round's plain text and thinking may be visible in the stream under `live`. With memory tools enabled, a round's plain text no longer short-circuits that decision, since the round is classified on its tool-call structure, so in `buffered` mode an answer round is held until the upstream finishes generating it (a slower first token there, the price of not leaking tool bytes); the default `live` mode streams answer content incrementally and is unaffected.
-- Each tool round is a full extra upstream round-trip. A long loop multiplies upstream latency and a client-side timeout can fire mid-loop.
-- If your upstream rejects or mishandles tool definitions, turn the flag off; requests then behave exactly as before.
-
-Parser-hazard note: some upstreams run automatic tool-call parsers and emit tool calls on their own. A call to an `infinitum_*` name that Infinitum did not expose this request is rejected server-side: the model receives an instructive tool result listing the memory tools that actually exist, and the loop continues without the client seeing anything. That covers names Infinitum never had, such as `infinitum_retrieve`, and also Infinitum's own names when an upstream prompt-cache diff drops the tool definitions mid-conversation. Any other foreign name stays terminal and is forwarded to the client, except that any `infinitum_`-prefixed call the client did not define is dropped from the forwarded response, so the client sees only its own tool calls: visible text, invisible machinery now holds for mixed rounds too, where a memory lookup sits beside a client tool call. Names the client defines belong to the client: a client tool is forwarded even if its name starts with `infinitum_`.
+The tool loop runs server-side and is transparent to the client: visible text, invisible machinery. The behavior contract, latency edges, and parser notes are in [docs/API.md](docs/API.md), and enabling the tools via `memory.tools_enabled` is documented in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ## Learning
 
@@ -238,61 +220,11 @@ explicit correction / supersede ----------> never reinforce
 
 `observation_count` is deliberately **not** treated as truth or authority. It means that multiple distinct interactions supported the current canonical memory. One newer explicit correction may still supersede a memory that has many older observations. Reprocessing the same source event IDs is idempotent and does not increment the count again.
 
-Useful tuning controls:
-
-```yaml
-memory:
-  reinforce_similarity: 0.86
-  reinforce_semantic_similarity: 0.90
-  reinforce_hint_min_score: 0.55
-  reinforce_hint_min_lexical: 0.40
-  reinforce_hint_min_semantic: 0.72
-```
-
-The long-term roadmap replaces the integer-only evidence model with first-class `memory_observations` records so observation source, independence, evidence type, confidence, and weight are all auditable.
+Tuning knobs are documented in [docs/CONFIGURATION.md](docs/CONFIGURATION.md#reinforcement-tuning-knobs); the first-class `memory_observations` evidence model is roadmap work ([docs/ROADMAP.md](docs/ROADMAP.md)).
 
 ## A sample setup that works for me
 
-The primary maintainer runs a local Qwen model on an NVIDIA DGX Spark, with Infinitum pointing directly at it. This is the working configuration for that single-machine setup:
-
-```yaml
-upstream:
-  base_url: http://127.0.0.1:8889/v1
-  passthrough_authorization: true
-
-memory:
-  database_path: /home/adam/infinitum.db
-  minimum_retrieval_score: 0.30
-  minimum_relevance_score: 0.08
-  inject_max_memories: 6
-  tools_enabled: true
-
-learning:
-  enabled: true
-  timeout_seconds: 600
-  max_tokens: 1024
-  skip_when_upstream_busy: true
-  upstream_idle_grace_seconds: 5
-
-  topic_summaries: true
-  topic_summary_min_memories: 3
-
-  topic_summary_debounce_seconds: 30
-  topic_summary_update_threshold: 3
-
-  topic_summary_max_changed_memories: 6
-  topic_summary_context_memories: 4
-
-  topic_summary_bootstrap_max_memories: 8
-  topic_summary_max_tokens: 512
-
-  extra_body:
-    tool_choice: none
-    chat_template_kwargs:
-      enable_thinking: false
-```
-
-Your paths, ports, and tuning will differ; every key is documented in the Configuration section below.
+The primary maintainer runs a local Qwen model on an NVIDIA DGX Spark, with Infinitum pointing directly at it. The full working YAML lives in [docs/CONFIGURATION.md](docs/CONFIGURATION.md#sample-setup-that-works-for-me).
 
 ## Install
 
@@ -342,303 +274,21 @@ embeddings:
   enabled: false
 ```
 
-With `passthrough_authorization: true`, the inbound `Authorization` header is forwarded to the upstream. Background learning cannot reuse a per-request key after the request ends, so either configure a service key under `learning.api_key` or configure `upstream.api_key` when the learning endpoint requires authentication.
+With `passthrough_authorization: true`, the inbound `Authorization` header is forwarded to the upstream; the background-learning key caveat is documented in [docs/CONFIGURATION.md](docs/CONFIGURATION.md#minimal-config).
 
-### OpenCode / request-context headers
+Everything else is reference material in [docs/CONFIGURATION.md](docs/CONFIGURATION.md):
 
-V0.2.0 can associate an OpenAI request with a user/project/CWD while keeping the memory store globally visible. Prefer the canonical headers:
+- [Request-context and OpenCode headers](docs/CONFIGURATION.md#request-context-and-opencode-headers): canonical `X-Infinitum-*` headers are preferred, legacy `X-Context-*` aliases are still accepted.
+- [Embeddings](docs/CONFIGURATION.md#embeddings) are optional and configured there.
+- Learning controls: a separate extraction model, timeouts, [deferral while the upstream is busy](docs/CONFIGURATION.md#deferring-learning-while-the-upstream-is-busy), and incremental [topic summaries](docs/CONFIGURATION.md#incremental-topic-summary-controls).
 
-```text
-X-Infinitum-User-ID: adam
-X-Infinitum-Project-ID: infinitum
-X-Infinitum-CWD: /home/adam/infinitum
-```
+## Endpoints and request controls
 
-Pre-v0.2 `X-Context-User-ID`, `X-Context-Project-ID`, and `X-Context-CWD` are still accepted as lower-priority compatibility aliases.
-
-An explicit project ID is preferred. If it is omitted but CWD is supplied, the runtime normalizes the path and derives a stable local key such as `cwd:infinitum:<hash>`. The full CWD is stored separately for provenance.
-
-The default resolver also accepts common aliases so an existing OpenCode/Headroom setup can be reused:
-
-```text
-X-OpenCode-User-ID / X-OpenCode-User
-X-OpenCode-Project-ID / X-OpenCode-Project
-X-OpenCode-Directory / X-OpenCode-CWD
-
-X-Headroom-User-ID
-X-Headroom-Project-ID
-X-Headroom-CWD
-
-X-LiteLLM-User-ID
-```
-
-Header priority is the order configured under `request_context.*_headers`; canonical `X-Infinitum-*` values are first by default. Header names are configurable. OpenCode's own server/client path uses `x-opencode-directory` for directory context, so V0.2.0 recognizes it directly.
-
-For session continuity, the Chat Completions route also recognizes `X-Infinitum-Session-ID`, `X-OpenCode-Session`, `X-Session-Id`, and `X-Session-Affinity` in that order. This lets OpenCode's normal compatible-provider session headers become the Infinitum `session_id` without extra client configuration.
-
-A typical OpenCode provider configuration can send the local user and launch directory as custom headers, for example:
-
-```jsonc
-{
-  "provider": {
-    "infinitum": {
-      "options": {
-        "baseURL": "http://infinitum:8788/v1",
-        "headers": {
-          "x-infinitum-user-id": "{env:USER}",
-          "x-infinitum-cwd": "{env:PWD}"
-        }
-      }
-    }
-  }
-}
-```
-
-If you have a stable project identifier, send `x-infinitum-project-id` as well rather than depending only on CWD. `PWD` reflects the environment presented to the OpenCode process; it is not a repository-discovery protocol.
-
-The resolved context affects retrieval only as a **soft affinity**:
-
-```text
-normal global relevance scoring
-        |
-        +-- below relevance floor -> reject
-        |
-        +-- relevant -> add bounded affinity bonus
-                         same project > same user > exact CWD
-```
-
-This means a same-project memory can outrank an equally relevant memory learned elsewhere, but an unrelated same-project memory cannot become eligible solely because of project affinity. All V0.2.0 memory is still globally visible. These headers are therefore **not authentication and not a security boundary**. Hard user/project isolation is still Phase 3/4 roadmap work and must filter scope before semantic retrieval.
-
-Useful configuration:
-
-```yaml
-request_context:
-  enabled: true
-  derive_project_from_cwd: true
-  user_affinity_bonus: 0.03
-  project_affinity_bonus: 0.07
-  cwd_affinity_bonus: 0.01
-  forward_to_headroom: false
-```
-
-Consumed aliases are stripped from normal upstream forwarding. When the immediate upstream is Headroom, set `forward_to_headroom: true`; Infinitum will emit canonical `x-headroom-*` values from the resolved context instead of blindly forwarding inbound identity-like headers.
-
-`X-Infinitum-Debug: true` additionally returns the resolved user/project IDs (when present) and whether the project was derived from CWD. `GET /request-context` can be called directly to inspect resolution without invoking a model.
-
-### Embeddings
-
-Embeddings are optional and, in this build, supported but not yet exercised in day-to-day use — the wiring is fully in place (config, write-on-create, embed-on-search, and a semantic term in the hybrid scorer), but it ships disabled by default and the retrieval tuning so far has been done without them. Without embeddings, retrieval stays fully functional using lexical, topic, recency, importance, and confidence signals.
-
-Semantic search is the single largest relevance signal available to Infinitum (it carries the heaviest retrieval weight), so it is intentionally left as head room rather than something already maxed out. Every accuracy and recall improvement tuned so far — the relevance gate, lexical and topic scoring, freshness decay, and the reinforcement guards — was developed and calibrated with that signal absent. Turning embeddings on and testing them against a real embedding server is expected to make recall and ranking measurably better, especially for memories that matter but are phrased differently from today's query, where lexical matching alone can miss the connection.
-
-```yaml
-embeddings:
-  enabled: true
-  base_url: http://embedding-server:8000/v1
-  api_key: ${EMBEDDING_API_KEY:-}
-  model: text-embedding-3-small
-```
-
-Any OpenAI-compatible `/v1/embeddings` implementation can be used. When enabled, semantic similarity joins the blend described in [Retrieval and context compilation](#retrieval-and-context-compilation); when a memory has no usable vector or an embedding call fails, scoring degrades gracefully to the non-semantic signals rather than dropping the memory.
-
-### Separate learning model
-
-```yaml
-learning:
-  enabled: true
-  base_url: http://litellm:4000/v1
-  api_key: ${LEARNING_API_KEY:-}
-  model: memory-extractor
-  timeout_seconds: 600
-  max_tokens: 2048
-```
-
-If `learning.model` is empty, the original answering model is reused.
-
-
-### Slow local learning models and timeouts
-
-Memory extraction runs after the foreground response and uses a non-streaming
-Chat Completions request. V0.1.1+ gives learning its own timeout and caps the
-completion length so reasoning/local models cannot silently inherit an
-unbounded generation budget.
-
-```yaml
-learning:
-  timeout_seconds: 600
-  max_tokens: 2048
-  extra_body: {}
-```
-
-If a learning request times out, the user's original chat response is unaffected.
-The durable job remains eligible for retry up to `learning.max_attempts`. For a
-slow local model, increase `timeout_seconds`; if the model tends to reason at
-length, configure a faster dedicated extraction model or disable thinking for
-background learning when your OpenAI-compatible server exposes such a control.
-
-For OpenAI-compatible servers that support `chat_template_kwargs` (or an equivalent vendor switch), a useful setup is:
-
-```yaml
-learning:
-  extra_body:
-    tool_choice: none
-    chat_template_kwargs:
-      enable_thinking: false
-```
-
-`extra_body` is merged only into background learning Chat Completions. Infinitum's
-core `model`, `messages`, `stream: false`, and configured token cap remain authoritative.
-
-### Deferring learning while the upstream is busy
-
-When the extraction model is the same server as the answering model, background
-learning competes with foreground requests for the same GPU/CPU. With
-`skip_when_upstream_busy` enabled, the learning worker skips claiming jobs
-while a proxy request is in flight:
-
-```yaml
-learning:
-  enabled: true
-  skip_when_upstream_busy: true
-```
-
-Deferred turns are never lost: learning work lives in the durable job queue, so
-a skipped job simply stays pending and runs once the proxy is idle. The boundary
-is honest. Only job *start* is deferred: a job already running continues to
-completion within `learning.timeout_seconds`, and a hung streaming request keeps
-learning deferred while it counts as active. `GET /health` reports the live
-`active_requests` count so you can see why the worker is idle. Set
-`learning.upstream_idle_grace_seconds` (default `0`) to keep learning deferred
-until the upstream has been continuously idle for that long after traffic
-drains; any new foreground request restarts the window.
-
-### Incremental topic-summary controls
-
-V0.1.2+ no longer regenerates a topic summary from up to 100 topic memories after every learned interaction. Changed memory IDs are persisted as dirty topic state, and one debounced background job updates the existing summary.
-
-```yaml
-learning:
-  topic_summaries: true
-  topic_summary_min_memories: 3
-  topic_summary_debounce_seconds: 30
-  topic_summary_update_threshold: 5
-  topic_summary_max_changed_memories: 24
-  topic_summary_context_memories: 8
-  topic_summary_bootstrap_max_memories: 32
-  topic_summary_max_tokens: 1024
-  topic_summary_fallback_memories: 12
-```
-
-- `debounce_seconds`: wait for a quiet period before summarizing a burst of changes.
-- `update_threshold`: if this many dirty memories accumulate, make the summary job immediately eligible.
-- `max_changed_memories`: maximum dirty records consumed by one summary call.
-- `context_memories`: small active-topic sample supplied beside the changed records.
-- `bootstrap_max_memories`: bounded sample used only when a topic has no existing summary yet.
-- `fallback_memories`: maximum active canonical memories used when the learning model returns no final summary text.
-
-Dirty state is cleared only after a usable model summary or the deterministic active-memory fallback has been persisted. If new evidence arrives while a summary is running, it remains dirty and is scheduled for a follow-up rather than being lost.
-
-## OpenAI-compatible endpoints
-
-### `POST /v1/chat/completions`
-
-Supports normal and streaming Chat Completions. Unknown request fields are preserved and forwarded upstream.
-
-### `GET /v1/models`
-
-Transparent upstream passthrough.
-
-## Runtime-specific endpoints
-
-### `GET /health`
-
-Returns service and feature status.
-
-### `GET /memory`
-
-Lists memories. Optional `status` query parameter.
-
-### `POST /memory`
-
-Manually inserts a memory.
-
-```json
-{
-  "memory_type": "goal",
-  "topic": "runtime",
-  "content": "Build an effective persistent memory layer for LLMs.",
-  "importance": 1.0,
-  "confidence": 1.0
-}
-```
-
-### `POST /memory/search`
-
-```json
-{
-  "query": "database choice",
-  "limit": 20
-}
-```
-
-### `GET /memory/{id}`
-
-Returns memory plus provenance event IDs.
-
-### `DELETE /memory/{id}`
-
-Archives the memory rather than destroying historical events.
-
-### `GET /events`
-
-Inspects immutable events. `session_id`, `user_id`, and `project_id` can be supplied to filter.
-
-### `GET /request-context`
-
-Returns the user/project/CWD context resolved from the current request headers. This is a diagnostic endpoint and does not authenticate the caller.
-
-### `GET /topics`
-
-Lists generated multi-memory topic summaries.
-
-## Per-request controls
-
-Internal headers are stripped before forwarding upstream.
-
-```text
-X-Infinitum-Memory: off
-X-Infinitum-Learning: off
-X-Infinitum-Session-ID: my-session-id
-# Also accepted: X-OpenCode-Session / X-Session-Id / X-Session-Affinity
-X-Infinitum-User-ID: adam
-X-Infinitum-Project-ID: infinitum
-X-Infinitum-CWD: /home/adam/infinitum
-X-Infinitum-Debug: true
-```
-
-The corresponding pre-v0.2 `X-Context-*` control headers are still accepted for compatibility, but new clients should use the Infinitum names.
-
-`X-Infinitum-Debug: true` adds response metadata such as the number of detailed memories injected, token budget used, resolved user/project IDs, and whether project identity was derived from CWD. It intentionally does not return the full CWD in response headers.
+Infinitum exposes an OpenAI-compatible surface (`POST /v1/chat/completions`, `GET /v1/models`) plus runtime endpoints for inspecting memories, events, topics, and request context. Internal `X-Infinitum-*` control headers are stripped before forwarding upstream, and the pre-v0.2 `X-Context-*` controls remain accepted for compatibility. Full reference: [docs/API.md](docs/API.md).
 
 ## Persistence
 
-The current global-memory prototype intentionally uses one SQLite database so the complete system can run with no external infrastructure.
-
-Main tables:
-
-- `events`
-- `memories`
-- `memory_sources`
-- `memory_embeddings`
-- `topics`
-- `topic_updates` (dirty incremental-summary state)
-- `requests`
-- `request_memories`
-- `jobs`
-
-`events` and `requests` carry nullable `user_id`, `project_id`, and `cwd` provenance columns in V0.2.0. Existing databases are migrated in place.
-
-SQLite WAL mode is enabled. FTS5 is used when available. Embedding vectors are stored as float32 blobs and searched in-process, which is deliberately simple and appropriate for the first global-memory prototype.
+The current global-memory prototype intentionally uses one SQLite database so the complete system can run with no external infrastructure, and existing databases are migrated in place. SQLite WAL mode is enabled, FTS5 is used when available, and embedding vectors are stored as float32 blobs and searched in-process. Table list and ER detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#storage-model).
 
 ## Headroom and LiteLLM
 
@@ -646,17 +296,7 @@ Infinitum is independent of both. The configured upstream can be either one.
 
 ```text
 OpenCode -> Infinitum -> Headroom -> LiteLLM -> model
-```
-
-or:
-
-```text
 OpenCode -> Infinitum -> LiteLLM -> model
-```
-
-or:
-
-```text
 application -> Infinitum -> vLLM
 ```
 
@@ -666,7 +306,7 @@ The intended responsibility split is:
 - **Headroom:** how can the selected context be represented efficiently?
 - **LiteLLM:** authentication, routing, provider policy, budgets, fallbacks.
 
-When Headroom is the immediate upstream, `request_context.forward_to_headroom: true` forwards the resolved context as canonical `x-headroom-*` headers. Leave it false when the downstream does not need those hints.
+Context forwarding is configured in [docs/CONFIGURATION.md](docs/CONFIGURATION.md#request-context-and-opencode-headers).
 
 ## Current limitations
 
