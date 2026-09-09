@@ -683,7 +683,7 @@ V0.2.0 is deliberately not yet a multi-user production memory service.
 - raw request-message events may contain sensitive content and require appropriate storage controls;
 - no document ingestion or graph retrieval yet.
 
-See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the intended evolution and enough design detail to implement it without changing the core event/memory model.
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the intended evolution and enough design detail to implement it without changing the core event/memory model. The research papers and systems techniques that shaped these design choices are recorded in [`docs/REFERENCES.md`](docs/REFERENCES.md).
 
 ## Design principles
 
