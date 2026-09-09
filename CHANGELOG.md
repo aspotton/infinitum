@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Fixed a mixed-round leak where a memory-tool call emitted alongside a client tool call on a terminal round was forwarded to the client, streaming and non-streaming alike. Such calls are now stripped from the forwarded response, so the client sees only its own tool calls and "visible text, invisible machinery" holds for mixed rounds too. Stripped calls are never answered, are recorded as `memory.tool_call` events with a `stripped` provenance flag, and count into the `x-infinitum-memory-tool-rejects` debug counter alongside rejected calls. Requests with memory tools off stay byte-for-byte unchanged.
+- Fixed forced answer rounds that ignored `tool_choice: "none"` and came back re-emitting the memory tools alongside text: those calls are now rejected like the same calls on any other round, and a loop that runs out of rounds this way ends with an answer synthesized from the tool results already gathered instead of a dangling tool call.
+- Known limitation: an upstream that splits a tool-call name across stream chunks is decided on its first name fragment, matching the round classifier's own verdict, so a name split inside the `infinitum_` prefix slips past both the stripper and the classifier.
+
 ## 0.2.10
 
 - Learn jobs that crashed mid-flight are now re-queued instead of stranding in `running` state: a startup pass in `build_runtime` requeues jobs that were running when the process died, and job claims adopt stale `running` locks once they pass a lease of `learning.timeout_seconds + 60s`. The lease is derived from `learning.timeout_seconds`, so there is no new config key.
