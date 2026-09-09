@@ -50,7 +50,7 @@ Primary code lives in `src/infinitum/`.
 - `retrieval.py` — hybrid scoring and context affinity
 - `compiler.py` — token-aware memory selection/rendering/injection
 - `learning.py` — extraction, reinforcement, supersession, incremental topic summaries, worker
-- `text.py` — shared scoring primitives: normalization, lexical/topic similarity, freshness decay (used by retrieval and reinforcement guards)
+- `text.py` — shared scoring primitives: normalization, lexical/topic similarity, bounded phrase comparison (length-bound skip + 8192-char backstop), freshness decay (used by retrieval and reinforcement guards)
 - `tokenizer.py` — `TokenCounter` feeding the compiler token budget
 - `embeddings.py` — OpenAI-compatible embedding client
 - `upstream.py` — transparent OpenAI-compatible upstream transport
