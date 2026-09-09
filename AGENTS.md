@@ -189,4 +189,6 @@ Read `docs/ROADMAP.md` before implementing larger features. Key future work incl
 - Responses API support;
 - observability and admin/inspection tooling.
 
+Reference docs: `docs/ARCHITECTURE.md` (mechanisms), `docs/CONFIGURATION.md` (config keys), `docs/API.md` (HTTP surface and memory-tool contract), `docs/ROADMAP.md`, and `docs/REFERENCES.md`.
+
 The long-term goal is not merely to store more history. It is to give otherwise stateless models coherent continuity while keeping memory current, explainable, bounded, and replaceable as models improve.
