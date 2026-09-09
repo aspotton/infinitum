@@ -221,24 +221,12 @@ class AppConfig(BaseModel):
 
 def load_config(path: str | Path | None = None) -> AppConfig:
     if path is None:
-        path = os.getenv("INFINITUM_CONFIG") or os.getenv("CONTEXT_RUNTIME_CONFIG")
+        path = os.getenv("INFINITUM_CONFIG")
     if path:
         data = yaml.safe_load(Path(path).read_text()) or {}
     else:
         data = {}
 
     config = AppConfig.model_validate(_expand_env(data))
-
-    # Upgrade convenience for pre-Infinitum installs: when database_path was
-    # never explicitly configured, prefer an existing legacy database rather
-    # than silently starting with an empty ./infinitum.db. Explicit config
-    # always wins.
-    memory_data = data.get("memory") if isinstance(data, dict) else None
-    explicit_database_path = isinstance(memory_data, dict) and "database_path" in memory_data
-    if not explicit_database_path:
-        legacy = Path("./context-runtime.db")
-        current = Path(config.memory.database_path)
-        if legacy.exists() and not current.exists():
-            config.memory.database_path = str(legacy)
 
     return config

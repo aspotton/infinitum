@@ -14,7 +14,7 @@ def main() -> None:
     serve = sub.add_parser("serve", help="run the HTTP service")
     serve.add_argument(
         "--config",
-        default=os.getenv("INFINITUM_CONFIG") or os.getenv("CONTEXT_RUNTIME_CONFIG"),
+        default=os.getenv("INFINITUM_CONFIG"),
         help="YAML config path",
     )
     args = parser.parse_args()
