@@ -99,6 +99,7 @@ Prefer concise current-state facts, decisions, preferences, goals, procedures, l
 If the user explicitly corrects or replaces an existing memory, set operation_hint='supersede', explicit_correction=true, and list only relevant existing memory IDs.
 If this merely confirms an existing memory, use operation_hint='reinforce', set reinforces_memory_id to that existing memory ID, and copy that memory's memory_type and topic exactly.
 The request context below is provenance/affinity metadata. Use it only to disambiguate nearby memories; do not save the user ID, project ID, or CWD as a memory unless the interaction explicitly discusses them.
+Add valid_from/valid_until (YYYY-MM-DD) only when the conversation states when a fact began or ended; otherwise omit them.
 
 Request context:\n{context_text}
 
@@ -107,7 +108,7 @@ Existing nearby memories:\n{chr(10).join(existing_lines) or '(none)'}
 Interaction:\nUSER: {query}\nASSISTANT: {assistant}
 
 Schema:
-{{"memories":[{{"memory_type":"fact|decision|preference|goal|procedure|lesson|episodic","topic":"short-stable-topic","content":"durable statement","importance":0.0,"confidence":0.0,"operation_hint":"new|reinforce|supersede","reinforces_memory_id":null,"supersedes_memory_ids":[],"explicit_correction":false,"reason":"brief"}}]}}
+{{"memories":[{{"memory_type":"fact|decision|preference|goal|procedure|lesson|episodic","topic":"short-stable-topic","content":"durable statement","importance":0.0,"confidence":0.0,"operation_hint":"new|reinforce|supersede","reinforces_memory_id":null,"supersedes_memory_ids":[],"explicit_correction":false,"valid_from":null,"valid_until":null,"reason":"brief"}}]}}
 """
         result = await self.upstream.learning_chat_completion(
             model=model,
@@ -334,6 +335,8 @@ Schema:
                 "extraction_reason": candidate.reason,
                 "origin_context": request_context.compact() if request_context else {},
             },
+            valid_from=candidate.valid_from,
+            valid_until=candidate.valid_until,
         )
         await self.db.create_memory(new_memory)
         vector = await self.embeddings.embed(new_memory.content)

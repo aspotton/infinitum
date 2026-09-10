@@ -85,6 +85,9 @@ class Database:
             updated_at TEXT NOT NULL,
             last_accessed_at TEXT,
             superseded_by TEXT,
+            valid_from TEXT,
+            valid_until TEXT,
+            observed_at TEXT,
             metadata_json TEXT NOT NULL DEFAULT '{}',
             FOREIGN KEY(superseded_by) REFERENCES memories(id)
         );
@@ -169,6 +172,7 @@ class Database:
         """
         await self.executescript(schema)
         await self._ensure_request_context_columns()
+        await self._ensure_temporal_columns()
         await self._initialize_fts()
 
     async def _ensure_request_context_columns(self) -> None:
@@ -202,6 +206,27 @@ class Database:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_requests_project_created ON requests(project_id, created_at)"
         )
+        self._conn.commit()
+
+    async def _ensure_temporal_columns(self) -> None:
+        """Upgrade pre-temporal databases in place with the temporal columns.
+
+        Same PRAGMA-probe pattern as _ensure_request_context_columns: the
+        CREATE block only affects fresh databases, so an existing memories
+        table needs additive nullable ALTERs that preserve every existing row
+        (new columns read back NULL).
+        """
+
+        async with self._lock:
+            await asyncio.to_thread(self._ensure_temporal_columns_sync)
+
+    def _ensure_temporal_columns_sync(self) -> None:
+        assert self._conn is not None
+        rows = self._conn.execute("PRAGMA table_info(memories)").fetchall()
+        existing = {row["name"] for row in rows}
+        for column in ("valid_from", "valid_until", "observed_at"):
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE memories ADD COLUMN {column} TEXT")
         self._conn.commit()
 
     async def _initialize_fts(self) -> None:
@@ -348,10 +373,21 @@ class Database:
 
     # Memories ---------------------------------------------------------------
     async def create_memory(self, memory: Memory) -> Memory:
+        # observed_at is the earliest moment the memory's evidence was seen;
+        # derive it from source events unless it was already carried in.
+        observed_at = memory.observed_at
+        if observed_at is None and memory.source_event_ids:
+            placeholders = ",".join("?" for _ in memory.source_event_ids)
+            row = await self.fetchone(
+                f"SELECT MIN(created_at) AS m FROM events WHERE id IN ({placeholders})",
+                tuple(memory.source_event_ids),
+            )
+            observed_at = row["m"] if row else None
         await self.execute(
             "INSERT INTO memories(id, memory_type, topic, content, status, importance, confidence, "
-            "observation_count, created_at, updated_at, last_accessed_at, superseded_by, metadata_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "observation_count, created_at, updated_at, last_accessed_at, superseded_by, metadata_json, "
+            "valid_from, valid_until, observed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 memory.id,
                 memory.memory_type,
@@ -366,6 +402,9 @@ class Database:
                 _iso(memory.last_accessed_at),
                 memory.superseded_by,
                 json.dumps(memory.metadata, separators=(",", ":")),
+                memory.valid_from,
+                memory.valid_until,
+                observed_at,
             ),
         )
         for event_id in memory.source_event_ids:
@@ -447,6 +486,9 @@ class Database:
             superseded_by=row["superseded_by"],
             metadata=json.loads(row["metadata_json"] or "{}"),
             source_event_ids=[r["event_id"] for r in sources],
+            valid_from=row["valid_from"],
+            valid_until=row["valid_until"],
+            observed_at=row["observed_at"],
         )
 
     async def archive_memory(self, memory_id: str) -> bool:
@@ -461,9 +503,13 @@ class Database:
         return True
 
     async def supersede_memory(self, old_id: str, new_id: str) -> None:
+        now = _iso(utc_now())
+        # Closing validity is a derived-state transition: an explicit past
+        # valid_until survives (COALESCE), otherwise "now" ends the old fact.
         await self.execute(
-            "UPDATE memories SET status='superseded', superseded_by=?, updated_at=? WHERE id=?",
-            (new_id, _iso(utc_now()), old_id),
+            "UPDATE memories SET status='superseded', superseded_by=?, updated_at=?, "
+            "valid_until=COALESCE(valid_until, ?) WHERE id=?",
+            (new_id, now, now, old_id),
         )
         await self._refresh_fts_memory(old_id)
 
