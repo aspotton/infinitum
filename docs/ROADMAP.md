@@ -6,6 +6,41 @@ The phases are ordered so each one can be built and validated independently.
 
 ---
 
+## Progress at a glance
+
+Status as of **v0.3.0 (2026-09-10)**. A checked box means the item is shipped; unchecked headings with checked sub-items are partially complete. Details and caveats live in each section below.
+
+- [x] **Phase 0 — Global intelligent memory** — shipped through v0.3.x
+  - [x] Event-sourced global memory, hybrid retrieval, bounded context compilation, async learning
+  - [x] Request-context provenance and soft affinity (`X-Infinitum-*` headers)
+  - [x] Every-interaction learning and incremental topic summaries
+  - [x] Learning-output resilience (V0.2.1) and structured-output transport resilience (V0.2.2)
+- [ ] **Phase 1 — Evaluation and memory quality loop** — mostly complete
+  - [x] 1.1 Golden benchmark corpus, offline runner, pytest corpus gate, live replay
+  - [ ] 1.2 Retrieval feedback — injection recording works offline; outcome-signal ingestion deferred
+  - [x] 1.3 Temporal truth at minimum depth — validity windows + temporal views (no typed edges; natural-expiry cache caveat)
+  - [x] 1.4 First-class evidence ledger — idempotent observations; ranking integration deferred
+  - [ ] 1.5 Periodic deep consolidation — deferred, scheduled as its own update
+- [ ] **Phase 2 — Progressive and tool-assisted retrieval** — partial
+  - [ ] 2.1 Native memory tools — `infinitum_memory_search`/`infinitum_memory_get` shipped; `memory_history`/`event_get` open
+  - [x] 2.2 Progressive context — cache-stable injection (v0.2.3) plus tool-loop drill-down with deeper-detail hints
+  - [ ] 2.3 Retrieval planning — not started
+- [ ] **Phase 3 — User-global and project memory** — not started (`RequestContext` groundwork only)
+- [ ] **Phase 4 — Authenticated LiteLLM edge integration** — not started
+- [ ] **Phase 5 — Organization, team, and authoritative directives** — not started
+- [ ] **Phase 6 — Goal engine** — not started
+- [ ] **Phase 7 — Documents, files, and source expansion** — not started
+- [ ] **Phase 8 — Headroom context optimization** — not started
+- [ ] **Phase 9 — PostgreSQL/pgvector production storage** — not started
+- [ ] **Phase 10 — Responses API and protocol adapters** — not started
+- [ ] **Phase 11 — Adaptive context compiler optimizer** — not started
+- [ ] **Phase 12 — Knowledge relationships without a mandatory graph** — not started
+- [ ] **Phase 13 — Enterprise security and governance** — not started
+- [ ] **Phase 14 — Admin and inspection UI** — not started
+- [ ] **Phase 15 — Long-term event-derived intelligence** — not started
+
+---
+
 ## Phase 0 — V0.2.0 global intelligent memory
 
 **Status:** implemented in this project.
