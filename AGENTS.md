@@ -45,7 +45,7 @@ Primary code lives in `src/infinitum/`.
 - `routes/memory.py` — memory management/search endpoints
 - `routes/admin.py` — health, event, topic, and request-context diagnostics
 - `config.py` — configuration models and loading
-- `database.py` — SQLite schema, persistence, durable jobs, provenance (largest module)
+- `database.py` — SQLite schema, persistence, durable jobs, provenance, `memory_observations`/`memory_observation_sources` evidence ledger, and additive temporal columns on `memories` (largest module)
 - `request_context.py` — user/project/CWD header resolution
 - `retrieval.py` — hybrid scoring and context affinity
 - `compiler.py` — token-aware memory selection/rendering/injection
@@ -55,6 +55,8 @@ Primary code lives in `src/infinitum/`.
 - `embeddings.py` — OpenAI-compatible embedding client
 - `upstream.py` — transparent OpenAI-compatible upstream transport
 - `models.py` — event/memory/request-context models
+
+Dev-only evaluation code lives in `benchmarks/` (not an installed package; run everything from the repo root via `python -m benchmarks.run` / `python -m benchmarks.replay`; see `benchmarks/README.md`): a golden-scenario YAML corpus, a deterministic offline runner with a scripted extractor, extraction/retrieval precision-recall + token metrics, and live-replay against a running instance.
 
 ## Public naming and compatibility
 
@@ -173,9 +175,7 @@ Before packaging a release, verify at minimum:
 
 Read `docs/ROADMAP.md` before implementing larger features. Key future work includes:
 
-- benchmark/evaluation harness for extraction and retrieval quality;
-- first-class `memory_observations` and evidence weighting;
-- periodic deep consolidation and canonicalization;
+- the Phase 1 evaluation loop is implemented in `benchmarks/` (golden corpus, offline runner, precision/recall + token metrics, live replay); the remaining Phase 1 item is periodic deep consolidation, deferred to its own future update;
 - hard user/project/session/agent memory scopes;
 - authenticated identity from a trusted LiteLLM edge;
 - organization/team memory and authoritative directives/goals;

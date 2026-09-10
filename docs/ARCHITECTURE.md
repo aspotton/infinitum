@@ -27,6 +27,8 @@ Echo protection is deliberately asymmetric: raw `request.received` events keep e
 
 Eligibility requires at least one genuine relevance signal (semantic, lexical, or topic) above `memory.minimum_relevance_score` (default `0.08`, set `0.0` to disable) before query-independent terms such as importance, confidence, and freshness can qualify a memory, with the high-importance goal/decision exemption unchanged. The same scorer, and hence the same gate, also backs the drill-down memory tools and `POST /memory/search`. The lexical phrase comparison is skipped on roughly 80:1 size-skewed inputs, where the mathematical bound proves it cannot change any score by 0.005 or more.
 
+Temporal eligibility is a pre-scoring filter on the same path: views `current` (only facts whose `valid_from`/`valid_until` window covers now), `all` (every active memory, the retrieval-side default that preserves pre-temporal behavior), and `as_of` (a window evaluated against an explicit date). A memory with no temporal columns set is unbounded and always eligible; supersession closes the superseded memory's `valid_until` at the moment of supersession. Known limitation: natural expiry (a `valid_until` date passing with no row write) never bumps `updated_at`, so a session-pinned context block stays cached until the next memory write invalidates the watermark.
+
 ## Server-side memory tool loop
 
 With `memory.tools_enabled` and an injected memory block, the request path may run a transparent tool loop before responding:
@@ -54,6 +56,9 @@ erDiagram
     EVENTS ||--o{ MEMORY_SOURCES : supports
     MEMORIES ||--o{ MEMORY_SOURCES : derived_from
     MEMORIES ||--o| MEMORY_EMBEDDINGS : has
+    MEMORIES ||--o{ MEMORY_OBSERVATIONS : supported_by
+    MEMORY_OBSERVATIONS ||--o{ MEMORY_OBSERVATION_SOURCES : cites
+    EVENTS ||--o{ MEMORY_OBSERVATION_SOURCES : evidences
     REQUESTS ||--o{ REQUEST_MEMORIES : injects
     MEMORIES ||--o{ REQUEST_MEMORIES : selected
 
@@ -80,6 +85,24 @@ erDiagram
       real confidence
       int observation_count
       text superseded_by
+      text valid_from
+      text valid_until
+      text observed_at
+    }
+    MEMORY_OBSERVATIONS {
+      text id PK
+      text memory_id FK
+      text observed_at
+      text session_id
+      text evidence_type
+      real evidence_weight
+      real confidence
+      text fingerprint
+      text metadata_json
+    }
+    MEMORY_OBSERVATION_SOURCES {
+      text observation_id FK
+      text event_id FK
     }
     REQUESTS {
       text id PK

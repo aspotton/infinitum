@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+Added:
+
+- A dev-only evaluation harness in `benchmarks/`: golden conversation scenarios declared as YAML, a deterministic offline runner with a scripted extractor, extraction/retrieval precision-recall and context-token metrics, a pytest corpus gate that runs every scenario on each check, and a live-replay command that replays the same corpus against a running instance and prints the memories learned per turn. No client-facing behavior changes.
+- Additive temporal metadata on memories: nullable `valid_from`, `valid_until`, and `observed_at` columns, migrated in place. Superseding a memory now closes the superseded memory's validity window at that moment instead of rewriting history.
+- Temporal search views on `POST /memory/search`: `temporal_view: "current"` (default; facts whose validity window has passed are dropped), `"all"` (no temporal filtering), and `"as_of"` with an ISO date or datetime (facts whose window covers that moment). Invalid view or `as_of` values return HTTP 400. The injected-context retrieval path keeps its prior all-rows behavior unchanged.
+- A first-class evidence ledger: every memory create and reinforcement records an observation row with an idempotency fingerprint, so retried or replayed evidence writes zero duplicates and cannot inflate `observation_count`; `observation_count` is now a cached counter derived from these rows. `GET /memory/{id}` gained an `observations` array. Memories that predate the ledger are backfilled once at startup with weight-0.5 `legacy` rows derived from their source events.
+
 Removed:
 
 - The pre-0.2 `context_runtime` Python namespace and the `context-runtime` command alias; the `infinitum` package and CLI are now the only entry points.
