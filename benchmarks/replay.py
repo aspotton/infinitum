@@ -37,11 +37,11 @@ def _context_headers(scenario: Scenario) -> dict[str, str]:
     return {"X-Infinitum-User-ID": "eval", "X-Infinitum-Project-ID": scenario.name}
 
 
-def _post_turn(client: httpx.Client, scenario: Scenario, user: str) -> None:
+def _post_turn(client: httpx.Client, scenario: Scenario, user: str, model: str) -> None:
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": _REPLAY_MODEL,
+            "model": model,
             "messages": [{"role": "user", "content": user}],
         },
         headers=_context_headers(scenario),
@@ -145,13 +145,13 @@ def _eval_probe(
 
 
 def _run_scenario(
-    scenario: Scenario, client: httpx.Client, emit: Callable[[str], None]
+    scenario: Scenario, client: httpx.Client, emit: Callable[[str], None], model: str
 ) -> int:
     headers = _context_headers(scenario)
     prev: dict[str, dict[str, Any]] = {}
     warnings = 0
     for turn_index, turn in enumerate(scenario.turns):
-        _post_turn(client, scenario, turn.user)
+        _post_turn(client, scenario, turn.user, model)
         current = _active_memories(client)
         emit(f"{scenario.name} turn {turn_index}:")
         _print_diff(prev, current, emit)
@@ -169,17 +169,20 @@ def replay_scenarios(
     client: httpx.Client,
     *,
     strict: bool = False,
+    model: str = _REPLAY_MODEL,
     emit: Callable[[str], None] = print,
 ) -> int:
     """Replay scenarios through ``client``; return the process exit code.
 
     ``client`` is the injection seam: the CLI builds its own httpx.Client from
     ``--base-url``; tests pass a client wired to an in-process ASGI app.
+    ``model`` is the request ``model`` field for every turn (some upstreams
+    reject unknown model names).
     """
     warnings = 0
     for scenario in scenarios:
         try:
-            warnings += _run_scenario(scenario, client, emit)
+            warnings += _run_scenario(scenario, client, emit, model)
         except httpx.HTTPError as exc:
             emit(f"ERROR scenario {scenario.name}: {exc} (scenario aborted)")
     return 1 if strict and warnings else 0
@@ -202,6 +205,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--strict", action="store_true", help="exit 1 when any WARN line was printed"
     )
+    parser.add_argument(
+        "--model",
+        default=_REPLAY_MODEL,
+        help=f"model name for turn requests (default {_REPLAY_MODEL}; "
+        "use your upstream's model when it validates names)",
+    )
     args = parser.parse_args(argv)
 
     scenarios = load_scenarios(_SCENARIOS_DIR)
@@ -213,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
         scenarios = [by_name[name] for name in args.scenario]
 
     with httpx.Client(base_url=args.base_url, timeout=_TIMEOUT) as client:
-        return replay_scenarios(scenarios, client, strict=args.strict)
+        return replay_scenarios(scenarios, client, strict=args.strict, model=args.model)
 
 
 if __name__ == "__main__":

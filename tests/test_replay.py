@@ -148,3 +148,25 @@ def test_replay_cli_unknown_scenario_exits_two() -> None:
     with pytest.raises(SystemExit) as excinfo:
         replay_main(["--scenario", "no-such-scenario"])
     assert excinfo.value.code == 2
+
+
+def test_replay_model_override_and_default() -> None:
+    """``model=`` replaces the turn-request model; default stays infinitum-replay."""
+
+    captured: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.content:
+            captured.append(json.loads(request.content))
+        return httpx.Response(200, json=[])
+
+    def turn_models(client: httpx.Client, **kwargs: object) -> list[str]:
+        captured.clear()
+        replay_scenarios([_scenario("model-flag")], client, emit=lambda _: None, **kwargs)
+        return [body["model"] for body in captured if "messages" in body]
+
+    with httpx.Client(
+        base_url="http://instance", transport=httpx.MockTransport(handler)
+    ) as client:
+        assert turn_models(client, model="qwen") == ["qwen", "qwen"]
+        assert turn_models(client) == ["infinitum-replay", "infinitum-replay"]
