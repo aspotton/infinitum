@@ -159,6 +159,8 @@ stateDiagram-v2
 
 The current implementation creates the replacement memory first and only then marks validated old memories as superseded. Source events remain untouched.
 
+Supersede validation is deterministic: the target must be active and must have been shown to the extractor. Implicit supersede additionally requires an exact topic match and lexical similarity at or above the configured floor. An explicit correction bypasses the topic gate and the similarity floor, but never the shown-set or active-status checks. Known limitation: in the flat global namespace, one project's memory can still supersede another's when topic strings and similarity align; scoped memory is the roadmap remedy.
+
 ## Reinforcement equivalence
 
 V0.2.0 retains the V0.1.3 rule that retrieval and reinforcement are different decisions. Retrieval may be broad; reinforcement is a mutation and therefore requires stricter compatibility.

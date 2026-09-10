@@ -93,6 +93,7 @@ Per interaction, the learner should see the current interaction plus a bounded n
 For candidate mutation:
 
 - explicit correction/supersession takes precedence over reinforcement;
+- an explicit correction may supersede across a drifted topic as a replacement of the target memory, not a merge; implicit supersede and reinforcement remain type/topic-gated (invariant 4 unchanged);
 - reinforcement requires exact memory type/topic compatibility;
 - near-identical lexical matches may reinforce deterministically;
 - high semantic similarity may reinforce when embeddings are available;
