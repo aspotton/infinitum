@@ -32,6 +32,16 @@ def _observation_fingerprint(memory_id: str, evidence_type: str, source_ids: lis
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _legacy_fingerprint(memory_id: str) -> str:
+    """Identity of the one backfilled evidence row for a pre-migration memory.
+
+    A deliberately different formula from :func:`_observation_fingerprint` so a
+    legacy row can never collide with (nor block) a future real observation.
+    """
+
+    return hashlib.sha256(f"legacy|{memory_id}".encode()).hexdigest()
+
+
 def _dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
@@ -217,6 +227,7 @@ class Database:
         await self._ensure_request_context_columns()
         await self._ensure_temporal_columns()
         await self._initialize_fts()
+        await self._backfill_observations()
 
     async def _ensure_request_context_columns(self) -> None:
         """Upgrade V0.1.3-and-earlier databases in place.
@@ -270,6 +281,51 @@ class Database:
         for column in ("valid_from", "valid_until", "observed_at"):
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE memories ADD COLUMN {column} TEXT")
+        self._conn.commit()
+
+    async def _backfill_observations(self) -> None:
+        """Give every observation-less memory one legacy evidence row.
+
+        Memories created before the observations tables existed have no
+        fingerprint rows; this records one 'legacy' observation per such memory
+        so every memory has at least one traceable evidence record. The NOT
+        EXISTS probe plus the memory_id index make repeat boots O(missing rows)
+        (zero after the first), and a crash between runs re-derives the exact
+        same set, so initialize() is safe to call any number of times.
+        memories.observation_count is a cached counter: it is preserved here,
+        incremented only when a fresh observation row is inserted by
+        _record_observation, and NEVER recomputed from these rows.
+        """
+
+        async with self._lock:
+            await asyncio.to_thread(self._backfill_observations_sync)
+
+    def _backfill_observations_sync(self) -> None:
+        assert self._conn is not None
+        # SQLite has no sha256; register the Python helper for the SELECT side.
+        self._conn.create_function(
+            "_infinitum_legacy_fp", 1, _legacy_fingerprint, deterministic=True
+        )
+        # 'legacy' is not in _FULL_WEIGHT_EVIDENCE, so it takes the half weight.
+        self._conn.execute(
+            "INSERT OR IGNORE INTO memory_observations"
+            "(id, memory_id, observed_at, evidence_type, evidence_weight, confidence, fingerprint) "
+            "SELECT 'obs_' || lower(hex(randomblob(16))), m.id, m.created_at, "
+            "'legacy', ?, m.confidence, "
+            "_infinitum_legacy_fp(m.id) FROM memories AS m "
+            "WHERE NOT EXISTS (SELECT 1 FROM memory_observations WHERE memory_id = m.id)",
+            (1.0 if "legacy" in _FULL_WEIGHT_EVIDENCE else 0.5,),
+        )
+        # Mirror provenance once: only legacy rows that have no evidence links
+        # yet, so later reinforce-attached sources are never back-annotated
+        # onto the migration row.
+        self._conn.execute(
+            "INSERT OR IGNORE INTO memory_observation_sources(observation_id, event_id) "
+            "SELECT mo.id, ms.event_id FROM memory_observations AS mo "
+            "JOIN memory_sources AS ms ON ms.memory_id = mo.memory_id "
+            "WHERE mo.evidence_type = 'legacy' AND NOT EXISTS "
+            "(SELECT 1 FROM memory_observation_sources WHERE observation_id = mo.id)"
+        )
         self._conn.commit()
 
     async def _initialize_fts(self) -> None:

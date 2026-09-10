@@ -47,10 +47,12 @@ async def search_memory(request: Request, body: MemorySearchRequest):
 
 @router.get("/{memory_id}")
 async def get_memory(request: Request, memory_id: str):
-    memory = await _runtime(request).db.get_memory(memory_id)
+    runtime = _runtime(request)
+    memory = await runtime.db.get_memory(memory_id)
     if not memory:
         raise HTTPException(404, "memory not found")
-    return memory
+    observations = await runtime.db.list_observations(memory_id)
+    return {**memory.model_dump(), "observations": [obs.model_dump() for obs in observations]}
 
 
 @router.delete("/{memory_id}")
