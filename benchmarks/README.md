@@ -45,6 +45,16 @@ and depends on the configured extraction model. Pass `--strict` to make any
 line, is skipped, and does not affect the exit code; the remaining scenarios
 are still attempted.
 
+Because memory is currently one global namespace, replaying several scenarios
+into a *shared* store lets scenarios that narrate the same topic legitimately
+supersede each other: a later scenario's decision about a subject can replace
+the earlier scenario's memory for it. The known instance is the
+`subtle-supersession` probe (`must_include: "DynamoDB tables"`), which FAILs
+against a shared store because `temporal-supersession-history` corrects the
+same session-store topic afterwards. This is expected until hard memory
+scopes land (see docs/ROADMAP.md); grade those probes against a fresh
+database per scenario.
+
 For semantic grading of a **live** store against this corpus (paraphrase-tolerant), use the `.opencode/skills/infinitum-eval` skill from an agent session in this repo.
 
 ## Scenario corpus format

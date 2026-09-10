@@ -62,6 +62,8 @@ What V0.2.0 deliberately does **not** do:
 
 Phase 3 should reuse this `RequestContext` and provenance data but change retrieval from soft affinity to hard **eligible-scope construction before similarity search**. Phase 4 should replace client-trusted user identity with a trusted/signed edge identity.
 
+Known evaluation impact until Phase 3 scoping lands: the `subtle-supersession` corpus probe (`must_include: "DynamoDB tables"`) fails when the ten benchmark scenarios share a single store, because `temporal-supersession-history` explicitly corrects the same session-store topic afterwards. That is cross-scope interference by design, not a learner defect, and it is the concrete test expectation that scoped retrieval is expected to retire.
+
 ### Memory processing cadence: every / incremental / periodic
 
 The memory runtime should deliberately operate on three different timescales rather than repeatedly feeding an ever-growing memory corpus back into an LLM. This is a core design principle for future versions.
