@@ -1,0 +1,38 @@
+name: temporary-fact
+description: >-
+  A today-only experiment that must never become memory, sitting next to a
+  durable quarterly goal that must; the probe wants the goal and must not leak
+  the day's experiment.
+context:
+  user_id: eval
+  project_id: temporary-fact
+turns:
+  - user: "Just today I'm testing the request coalescing experiment on staging behind the feature flag, so ignore any weird latency numbers you see in my screenshots."
+    assistant: "Understood - I'll treat today's staging traffic as part of the coalescing experiment and discount the latency noise."
+    learn: []
+    expect:
+      ignored: ["request coalescing experiment"]
+
+  - user: "More permanently: our Q3 performance goal is getting cold start latency under 200 milliseconds for the API."
+    assistant: "Noted - cold start latency under 200ms is the Q3 target for the API."
+    learn:
+      - operation: new
+        memory_type: goal
+        topic: performance-goals
+        content: "Q3 performance goal is cold start latency under 200 milliseconds for the API"
+        importance: 0.8
+        confidence: 0.9
+    expect:
+      created: ["cold start latency under 200 milliseconds"]
+
+  - user: "Can you suggest somewhere to add a timing log in the boot path?"
+    assistant: "Wrap the module import phase and the connection warmup separately - those two dominate the boot path."
+    learn: []
+
+  - user: "Remind me what we're trying to hit on cold starts this quarter."
+    assistant: "The Q3 goal is cold start latency under 200 milliseconds for the API."
+    learn: []
+    probe:
+      query: "cold start latency goal this quarter"
+      must_include: ["cold start latency under 200 milliseconds"]
+      must_not_include: ["request coalescing experiment"]

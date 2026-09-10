@@ -21,7 +21,7 @@ async def list_memories(request: Request, limit: int = Query(100, ge=1, le=1000)
 async def create_memory(request: Request, body: MemoryCreateRequest):
     runtime = _runtime(request)
     memory = Memory(**body.model_dump())
-    await runtime.db.create_memory(memory)
+    await runtime.db.create_memory(memory, evidence_type="manual_admin")
     vector = await runtime.embeddings.embed(memory.content)
     if vector is not None:
         await runtime.db.set_embedding(memory.id, runtime.config.embeddings.model, vector)
@@ -32,18 +32,27 @@ async def create_memory(request: Request, body: MemoryCreateRequest):
 async def search_memory(request: Request, body: MemorySearchRequest):
     runtime = _runtime(request)
     request_context = runtime.request_context.resolve(request.headers)
-    results = await runtime.retriever.search(
-        body.query, limit=body.limit, request_context=request_context
-    )
+    try:
+        results = await runtime.retriever.search(
+            body.query,
+            limit=body.limit,
+            request_context=request_context,
+            temporal_view=body.temporal_view,
+            as_of=body.as_of,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return [item.model_dump() for item in results]
 
 
 @router.get("/{memory_id}")
 async def get_memory(request: Request, memory_id: str):
-    memory = await _runtime(request).db.get_memory(memory_id)
+    runtime = _runtime(request)
+    memory = await runtime.db.get_memory(memory_id)
     if not memory:
         raise HTTPException(404, "memory not found")
-    return memory
+    observations = await runtime.db.list_observations(memory_id)
+    return {**memory.model_dump(), "observations": [obs.model_dump() for obs in observations]}
 
 
 @router.delete("/{memory_id}")

@@ -45,9 +45,21 @@ Manually inserts a memory.
 }
 ```
 
+Optional temporal parameters:
+
+```json
+{
+  "query": "database choice",
+  "temporal_view": "as_of",
+  "as_of": "2024-03-15"
+}
+```
+
+`temporal_view` selects the validity window applied before scoring: `"current"` (default; rows whose `valid_until` is already past are dropped), `"all"` (no temporal filtering), or `"as_of"` (rows whose validity window covers `as_of`, an ISO date or datetime; a date-only value counts as 00:00:00 UTC that day). An `"as_of"` view without an `as_of` value, an unparseable `as_of`, or an unknown view string returns HTTP 400.
+
 ### `GET /memory/{id}`
 
-Returns memory plus provenance event IDs.
+Returns memory plus provenance event IDs. The response also carries an `observations` array: the memory's first-class evidence records, ordered by `observed_at` (fields: `id`, `memory_id`, `observed_at`, `session_id`, `evidence_type`, `evidence_weight`, `confidence`, `fingerprint`, `metadata_json`, `source_event_ids`). Memories predating the observations ledger carry weight-0.5 `legacy` rows derived from their source events.
 
 ### `DELETE /memory/{id}`
 

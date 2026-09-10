@@ -1,0 +1,30 @@
+Task 1: learner supersede topic drift fix
+Branch: feat/phase1-eval-quality-loop (base 42d582a)
+
+RED RUN (before fix) — .venv/bin/python -m pytest -q tests/test_reinforcement.py
+    affected = await learner._apply(candidate, [], {existing.id})
+>   assert existing.id in affected
+E   AssertionError: assert 'mem_29c2d52fcf74492d835ebff64ee2f590' in {'mem_c1bcae64c5c146ad980eff89641de009'}
+E    +  where 'mem_29c2d52fcf74492d835ebff64ee2f590' = Memory(id='mem_29c2d52fcf74492d835ebff64ee2f590', memory_type='decision', topic='session-store-a', content='Memcached ...sed_at=None, superseded_by=None, metadata={}, source_event_ids=[], valid_from=None, valid_until=None, observed_at=None).id
+
+tests/test_reinforcement.py:275: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_reinforcement.py::test_explicit_correction_supersedes_across_topic_drift
+1 failed, 5 passed in 0.35s
+
+Note: assertion trips at `existing.id in affected` rather than the later
+`old.status == "superseded"` line, but the root cause is identical: the
+supersede was silently dropped by the topic-equality guard, so the old memory
+stays active and never enters `affected`. test_implicit_supersede_remains_topic_gated
+passed in the red run (behavior pin, as expected).
+
+GREEN RUN (after splitting the guard in learning.py _apply) — focused:
+......                                                                   [100%]
+6 passed in 0.33s
+
+GREEN RUN — full suite (.venv/bin/python -m pytest -q):
+316 passed, 2 warnings in 12.39s
+
+RUFF DELTA:
+- ruff check src/infinitum/learning.py --output-format=concise | grep -c ":"  -> 16 (unchanged)
+- ruff check tests/test_reinforcement.py -> All checks passed!

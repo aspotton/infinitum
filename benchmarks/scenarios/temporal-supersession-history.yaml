@@ -1,0 +1,42 @@
+name: temporal-supersession-history
+description: >-
+  A decision stated, then reversed by an explicit correction. Supersession is
+  asserted structurally (expect.superseded + expect.created) plus a current-view
+  probe that hides the old phrasing. There is deliberately NO as_of probe on the
+  superseded row: retrieval draws only ACTIVE memories, so no temporal view can
+  ever surface a status-superseded memory - the historical-view case is covered
+  by temporal-validity.yaml's naturally-expiring active fact.
+context:
+  user_id: eval
+  project_id: temporal-supersession-history
+turns:
+  - user: "We decided session storage uses Memcached - the platform team standardized on it last quarter."
+    assistant: "Noted - session storage uses Memcached per the platform team's standard."
+    learn:
+      - operation: new
+        memory_type: decision
+        topic: session-storage
+        content: "Session storage uses Memcached"
+        importance: 0.7
+        confidence: 0.85
+    expect:
+      created: ["Session storage uses Memcached"]
+
+  - user: "Actually, that's outdated - session storage moved to the Redis cluster after the failover incident."
+    assistant: "Updated - session storage now uses the Redis cluster following the failover incident."
+    learn:
+      - operation: supersede
+        memory_type: decision
+        topic: session-storage
+        content: "Session storage uses the Redis cluster"
+        importance: 0.7
+        confidence: 0.9
+        explicit_correction: true
+        supersedes_match: "Session storage uses Memcached"
+    expect:
+      created: ["Session storage uses the Redis cluster"]
+      superseded: ["Session storage uses Memcached"]
+    probe:
+      query: "session storage technology choice"
+      must_include: ["Session storage uses the Redis cluster"]
+      must_not_include: ["Session storage uses Memcached"]

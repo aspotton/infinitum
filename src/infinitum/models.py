@@ -4,10 +4,31 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 MemoryType = Literal["fact", "decision", "preference", "goal", "procedure", "lesson", "episodic"]
 MemoryStatus = Literal["active", "superseded", "contested", "archived"]
+
+
+def _coerce_iso_or_none(value: Any) -> str | None:
+    """Keep an ISO date/datetime string, NULL anything else.
+
+    Used by the temporal field validators below. It never raises: an
+    unparseable value (a bare word, a number, garbage) becomes ``None`` so a
+    candidate carrying a malformed date is still created, only without the
+    temporal annotation. Losing a whole candidate to a bad date string is worse
+    than dropping the date.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return value
+    return None
 
 
 def utc_now() -> datetime:
@@ -79,6 +100,37 @@ class Memory(BaseModel):
     superseded_by: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     source_event_ids: list[str] = Field(default_factory=list)
+    # Temporal validity. ISO date/datetime strings, always optional. ``observed_at``
+    # is derived (earliest source event) and not extraction-settable.
+    valid_from: str | None = None
+    valid_until: str | None = None
+    observed_at: str | None = None
+
+    @field_validator("valid_from", "valid_until", "observed_at", mode="before")
+    @classmethod
+    def _validate_temporal(cls, value: Any) -> str | None:
+        return _coerce_iso_or_none(value)
+
+
+class Observation(BaseModel):
+    """One piece of evidence supporting a memory, as a first-class record.
+
+    ``observation_count`` on :class:`Memory` remains a cached counter; these
+    rows are the ground it derives from. The UNIQUE ``fingerprint`` (memory +
+    evidence kind + exact source-event set) makes replayed evidence
+    structurally idempotent.
+    """
+
+    id: str = Field(default_factory=lambda: new_id("obs"))
+    memory_id: str
+    observed_at: datetime = Field(default_factory=utc_now)
+    session_id: str | None = None
+    evidence_type: str
+    evidence_weight: float = 1.0
+    confidence: float | None = None
+    fingerprint: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    source_event_ids: list[str] = Field(default_factory=list)
 
 
 class MemoryCandidate(BaseModel):
@@ -95,6 +147,14 @@ class MemoryCandidate(BaseModel):
     supersedes_memory_ids: list[str] = Field(default_factory=list)
     explicit_correction: bool = False
     reason: str = ""
+    # Optional temporal bounds the extraction model may propose.
+    valid_from: str | None = None
+    valid_until: str | None = None
+
+    @field_validator("valid_from", "valid_until", mode="before")
+    @classmethod
+    def _validate_temporal(cls, value: Any) -> str | None:
+        return _coerce_iso_or_none(value)
 
 
 class ScoredMemory(BaseModel):
@@ -131,3 +191,7 @@ class MemorySearchRequest(BaseModel):
     query: str
     limit: int = Field(default=20, ge=1, le=200)
     include_archived: bool = False
+    # Diagnostic searches default to now-true facts; the retriever's own
+    # default stays "all" so compiler/tool injection behavior is untouched.
+    temporal_view: str = "current"
+    as_of: str | None = None

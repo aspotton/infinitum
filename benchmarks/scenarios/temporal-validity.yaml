@@ -1,0 +1,48 @@
+name: temporal-validity
+description: >-
+  A durable anchor fact plus a fact with an explicitly stated, clearly-past
+  validity window. The memory row stays ACTIVE forever - expiry is purely
+  temporal - so an as_of probe inside the window must surface it while the
+  default-current probe must not, and the anchor keeps both probes honest.
+context:
+  user_id: eval
+  project_id: temporal-validity
+turns:
+  - user: "For the record, our analytics service runs on PostgreSQL 16 - that's our standing database choice."
+    assistant: "Noted - your analytics service runs on PostgreSQL 16 as the standing database choice."
+    learn:
+      - operation: new
+        memory_type: fact
+        topic: analytics-database
+        content: "Analytics service runs on PostgreSQL 16"
+        importance: 0.7
+        confidence: 0.85
+    expect:
+      created: ["Analytics service runs on PostgreSQL 16"]
+
+  - user: "We booked the team offsite at the Lisbon office for the first half of 2024, from January 1st until June 30th."
+    assistant: "Got it - the team offsite is held at the Lisbon office, valid from 2024-01-01 until 2024-06-30."
+    learn:
+      - operation: new
+        memory_type: fact
+        topic: team-offsite-venue
+        content: "Team offsite is held at the Lisbon office"
+        importance: 0.5
+        confidence: 0.8
+        valid_from: "2024-01-01"
+        valid_until: "2024-06-30"
+    expect:
+      created: ["Team offsite is held at the Lisbon office"]
+    probe:
+      query: "team offsite venue Lisbon office"
+      temporal_view: as_of
+      as_of: "2024-03-15"
+      must_include: ["Team offsite is held at the Lisbon office"]
+
+  - user: "How do I rotate database credentials in a FastAPI app without downtime?"
+    assistant: "Use a dual-user switchover: add the new credential to the pool config, reload, then drop the old user."
+    learn: []
+    probe:
+      query: "analytics service database choice"
+      must_include: ["Analytics service runs on PostgreSQL 16"]
+      must_not_include: ["Team offsite is held at the Lisbon office"]

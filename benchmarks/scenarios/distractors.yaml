@@ -1,0 +1,39 @@
+name: distractors
+description: >-
+  Three unrelated how-to chats sandwich one real preference; the probe must
+  find only the preference and none of the transient how-to chatter.
+context:
+  user_id: eval
+  project_id: distractors
+turns:
+  - user: "How do I unstage a file without losing my changes?"
+    assistant: "Run git restore --staged <file> - the edits stay in your working tree."
+    learn: []
+
+  - user: "What's the clean way to wipe local docker compose volumes before a reseed?"
+    assistant: "docker compose down -v removes the containers and named volumes, then compose up recreates them fresh."
+    learn: []
+
+  - user: "One thing to remember about how I work: I prefer pytest output without the -v flag, just the summary lines."
+    assistant: "Noted - pytest runs for you stay on the default concise output, no -v."
+    learn:
+      - operation: new
+        memory_type: preference
+        topic: test-output-preference
+        content: "User prefers pytest output without the -v flag, summary lines only"
+        importance: 0.6
+        confidence: 0.9
+    expect:
+      created: ["pytest output without the -v flag"]
+
+  - user: "And how do I squash my last two local commits?"
+    assistant: "git rebase -i HEAD~2 and mark the second commit as a squash of the first."
+    learn: []
+
+  - user: "How should I run the test suite for my taste?"
+    assistant: "Plain pytest with the default concise output - summary lines only, no -v."
+    learn: []
+    probe:
+      query: "pytest output preference verbose flag summary"
+      must_include: ["pytest output without the -v flag"]
+      must_not_include: ["git restore --staged", "docker compose down -v", "git rebase -i HEAD~2"]

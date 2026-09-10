@@ -1,0 +1,42 @@
+name: repeated-confirmation
+description: >-
+  A deploy procedure stated once and restated in a later turn; the restatement
+  must reinforce the existing memory exactly once, not create a duplicate.
+context:
+  user_id: eval
+  project_id: repeated-confirmation
+turns:
+  - user: "For the record, the staging deploy procedure is: run scripts/deploy.sh staging, then tail the release log until you see the green marker."
+    assistant: "Recorded - staging deploys go through scripts/deploy.sh staging followed by watching the release log for the green marker."
+    learn:
+      - operation: new
+        memory_type: procedure
+        topic: staging-deploy-procedure
+        content: "Staging deploys run scripts/deploy.sh staging then tail the release log for the green marker"
+        importance: 0.75
+        confidence: 0.9
+    expect:
+      created: ["scripts/deploy.sh staging"]
+
+  - user: "Deploying staging again - same drill as always, scripts/deploy.sh staging and watch the log for the green marker."
+    assistant: "Right, same procedure: scripts/deploy.sh staging, then watch the release log."
+    learn:
+      - operation: reinforce
+        memory_type: procedure
+        topic: staging-deploy-procedure
+        content: "Staging deploys run scripts/deploy.sh staging then tail the release log for the green marker"
+        importance: 0.75
+        confidence: 0.9
+    expect:
+      reinforced: ["scripts/deploy.sh staging"]
+
+  - user: "Oh - what's the git command to see who last changed a specific line?"
+    assistant: "git blame <file> or git log -L <start>,<end>:<file> will show the per-line history."
+    learn: []
+
+  - user: "What's the staging deploy command again?"
+    assistant: "It's scripts/deploy.sh staging, then watch the release log for the green marker."
+    learn: []
+    probe:
+      query: "how to deploy to staging deploy script"
+      must_include: ["scripts/deploy.sh staging"]

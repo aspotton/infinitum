@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
+from typing import Literal
 
 import numpy as np
 
@@ -20,6 +21,29 @@ def cosine_similarity(a: np.ndarray | None, b: np.ndarray | None) -> float:
     return max(-1.0, min(1.0, float(np.dot(a, b) / denom)))
 
 
+def _temporal_bound(value: str | None, *, end_of_day: bool = False) -> datetime | None:
+    """Normalize a stored ISO validity bound to an aware UTC datetime.
+
+    A date-only ``YYYY-MM-DD`` string is midnight UTC as a start bound and
+    ``23:59:59`` UTC as an end bound (``end_of_day``), so a fact valid until
+    today stays current through today. Naive datetimes are assumed UTC; full
+    datetimes compare as stored. An unparseable value is treated as no bound
+    (NULL), mirroring the coerce-never-raise policy of the Memory validators:
+    the model path never stores garbage, only raw SQL writes could.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    if end_of_day and len(value) == 10:
+        parsed = parsed.replace(hour=23, minute=59, second=59)
+    return parsed
+
+
 def _is_high_authority(memory: Memory) -> bool:
     """High-authority persistent goals/decisions that survive wording mismatch."""
     return memory.memory_type in {"goal", "decision"} and memory.importance >= 0.85
@@ -36,7 +60,41 @@ class MemoryRetriever:
         query: str,
         limit: int | None = None,
         request_context: RequestContext | None = None,
+        temporal_view: Literal["all", "current", "as_of"] = "all",
+        as_of: str | None = None,
     ) -> list[ScoredMemory]:
+        """Hybrid-scored search over active memories.
+
+        ``temporal_view`` filters ACTIVE candidate rows by their validity
+        bounds before scoring (eligibility before ranking, AGENTS.md
+        invariant 10); it never enters base_score or the relevance gate.
+        The default ``"all"`` skips the filter and is byte-identical to
+        pre-temporal behavior for every existing caller. ``"current"`` drops
+        rows whose ``valid_until`` is in the past; ``"as_of"`` keeps rows
+        covering the given ISO date/datetime (a date-only ``as_of`` counts as
+        00:00:00 UTC that day, so "as of today" agrees with the current view).
+        Rows with any non-active status (superseded, archived, contested) are
+        retrievable under NO view: the candidate set stays
+        ``list_active_memories``; supersession history is inspected via memory
+        detail, never retrieval.
+
+        Limitation: a naturally expiring memory (``valid_until`` passing with
+        no row write) does not move the session-block invalidation watermark,
+        which is MAX(updated_at)-based (``Database.memory_state_watermark``,
+        database.py:577-592). A session-pinned compiled block can therefore
+        keep showing a naturally-expired fact until the next memory write
+        bumps the watermark.
+        """
+        as_of_dt: datetime | None = None
+        if temporal_view == "as_of":
+            if as_of is None:
+                raise ValueError("temporal_view 'as_of' requires an as_of value")
+            as_of_dt = _temporal_bound(as_of)
+            if as_of_dt is None:
+                raise ValueError(f"invalid as_of: {as_of!r}")
+        elif temporal_view not in ("all", "current"):
+            raise ValueError(f"unknown temporal_view: {temporal_view!r}")
+
         if not self.config.memory.enabled or not query.strip():
             return []
 
@@ -67,6 +125,19 @@ class MemoryRetriever:
         )
         scored: list[ScoredMemory] = []
         for memory in active:
+            # Temporal eligibility filter, before scoring (pre-ranking
+            # eligibility, AGENTS.md invariant 10). Default "all" skips it.
+            if temporal_view == "current":
+                until = _temporal_bound(memory.valid_until, end_of_day=True)
+                if until is not None and until < now:
+                    continue
+            elif temporal_view == "as_of":
+                start = _temporal_bound(memory.valid_from)
+                until = _temporal_bound(memory.valid_until, end_of_day=True)
+                if (start is not None and start > as_of_dt) or (
+                    until is not None and until <= as_of_dt
+                ):
+                    continue
             lexical = lexical_similarity(query, memory.content)
             if memory.id in fts_ids:
                 lexical = min(1.0, lexical + 0.15)

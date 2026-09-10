@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -9,11 +10,36 @@ from typing import Any
 
 import numpy as np
 
-from .models import Event, Memory, RequestContext, TopicSummary, new_id, utc_now
+from .models import Event, Memory, Observation, RequestContext, TopicSummary, new_id, utc_now
+
+# Evidence kinds that carry full authority; paraphrases and derived
+# observations count half as much as direct evidence.
+_FULL_WEIGHT_EVIDENCE = frozenset({"user_assertion", "tool_verified", "manual_admin"})
 
 
 def _iso(dt: datetime | None) -> str | None:
     return dt.isoformat() if dt else None
+
+
+def _observation_fingerprint(memory_id: str, evidence_type: str, source_ids: list[str]) -> str:
+    """Stable identity of one observation.
+
+    The same memory, evidence kind, and exact source-event set can never be
+    recorded twice: replays collide on this UNIQUE value and change no row.
+    """
+
+    payload = f"{memory_id}|{evidence_type}|{'|'.join(sorted(source_ids))}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _legacy_fingerprint(memory_id: str) -> str:
+    """Identity of the one backfilled evidence row for a pre-migration memory.
+
+    A deliberately different formula from :func:`_observation_fingerprint` so a
+    legacy row can never collide with (nor block) a future real observation.
+    """
+
+    return hashlib.sha256(f"legacy|{memory_id}".encode()).hexdigest()
 
 
 def _dt(value: str | None) -> datetime | None:
@@ -85,6 +111,9 @@ class Database:
             updated_at TEXT NOT NULL,
             last_accessed_at TEXT,
             superseded_by TEXT,
+            valid_from TEXT,
+            valid_until TEXT,
+            observed_at TEXT,
             metadata_json TEXT NOT NULL DEFAULT '{}',
             FOREIGN KEY(superseded_by) REFERENCES memories(id)
         );
@@ -98,6 +127,33 @@ class Database:
             event_id TEXT NOT NULL,
             PRIMARY KEY(memory_id, event_id),
             FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+            FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
+        );
+
+        -- First-class evidence records. memories.observation_count remains a
+        -- cached counter; these rows are the ground it derives from. The
+        -- UNIQUE fingerprint makes reprocessing the same interaction
+        -- idempotent (INSERT OR IGNORE -> no new row, no count bump).
+        CREATE TABLE IF NOT EXISTS memory_observations (
+            id TEXT PRIMARY KEY,
+            memory_id TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            session_id TEXT,
+            evidence_type TEXT NOT NULL,
+            evidence_weight REAL NOT NULL DEFAULT 1.0,
+            confidence REAL,
+            fingerprint TEXT NOT NULL UNIQUE,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_observations_memory
+            ON memory_observations(memory_id);
+
+        CREATE TABLE IF NOT EXISTS memory_observation_sources (
+            observation_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            PRIMARY KEY(observation_id, event_id),
+            FOREIGN KEY(observation_id) REFERENCES memory_observations(id) ON DELETE CASCADE,
             FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
         );
 
@@ -169,7 +225,9 @@ class Database:
         """
         await self.executescript(schema)
         await self._ensure_request_context_columns()
+        await self._ensure_temporal_columns()
         await self._initialize_fts()
+        await self._backfill_observations()
 
     async def _ensure_request_context_columns(self) -> None:
         """Upgrade V0.1.3-and-earlier databases in place.
@@ -201,6 +259,72 @@ class Database:
         )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_requests_project_created ON requests(project_id, created_at)"
+        )
+        self._conn.commit()
+
+    async def _ensure_temporal_columns(self) -> None:
+        """Upgrade pre-temporal databases in place with the temporal columns.
+
+        Same PRAGMA-probe pattern as _ensure_request_context_columns: the
+        CREATE block only affects fresh databases, so an existing memories
+        table needs additive nullable ALTERs that preserve every existing row
+        (new columns read back NULL).
+        """
+
+        async with self._lock:
+            await asyncio.to_thread(self._ensure_temporal_columns_sync)
+
+    def _ensure_temporal_columns_sync(self) -> None:
+        assert self._conn is not None
+        rows = self._conn.execute("PRAGMA table_info(memories)").fetchall()
+        existing = {row["name"] for row in rows}
+        for column in ("valid_from", "valid_until", "observed_at"):
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE memories ADD COLUMN {column} TEXT")
+        self._conn.commit()
+
+    async def _backfill_observations(self) -> None:
+        """Give every observation-less memory one legacy evidence row.
+
+        Memories created before the observations tables existed have no
+        fingerprint rows; this records one 'legacy' observation per such memory
+        so every memory has at least one traceable evidence record. The NOT
+        EXISTS probe plus the memory_id index make repeat boots O(missing rows)
+        (zero after the first), and a crash between runs re-derives the exact
+        same set, so initialize() is safe to call any number of times.
+        memories.observation_count is a cached counter: it is preserved here,
+        incremented only when a fresh observation row is inserted by
+        _record_observation, and NEVER recomputed from these rows.
+        """
+
+        async with self._lock:
+            await asyncio.to_thread(self._backfill_observations_sync)
+
+    def _backfill_observations_sync(self) -> None:
+        assert self._conn is not None
+        # SQLite has no sha256; register the Python helper for the SELECT side.
+        self._conn.create_function(
+            "_infinitum_legacy_fp", 1, _legacy_fingerprint, deterministic=True
+        )
+        # 'legacy' is not in _FULL_WEIGHT_EVIDENCE, so it takes the half weight.
+        self._conn.execute(
+            "INSERT OR IGNORE INTO memory_observations"
+            "(id, memory_id, observed_at, evidence_type, evidence_weight, confidence, fingerprint) "
+            "SELECT 'obs_' || lower(hex(randomblob(16))), m.id, m.created_at, "
+            "'legacy', ?, m.confidence, "
+            "_infinitum_legacy_fp(m.id) FROM memories AS m "
+            "WHERE NOT EXISTS (SELECT 1 FROM memory_observations WHERE memory_id = m.id)",
+            (1.0 if "legacy" in _FULL_WEIGHT_EVIDENCE else 0.5,),
+        )
+        # Mirror provenance once: only legacy rows that have no evidence links
+        # yet, so later reinforce-attached sources are never back-annotated
+        # onto the migration row.
+        self._conn.execute(
+            "INSERT OR IGNORE INTO memory_observation_sources(observation_id, event_id) "
+            "SELECT mo.id, ms.event_id FROM memory_observations AS mo "
+            "JOIN memory_sources AS ms ON ms.memory_id = mo.memory_id "
+            "WHERE mo.evidence_type = 'legacy' AND NOT EXISTS "
+            "(SELECT 1 FROM memory_observation_sources WHERE observation_id = mo.id)"
         )
         self._conn.commit()
 
@@ -260,14 +384,16 @@ class Database:
         self._conn.executescript(script)
         self._conn.commit()
 
-    async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+    async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
+        """Run one statement and return sqlite3's changed-row count."""
         async with self._lock:
-            await asyncio.to_thread(self._execute_sync, sql, params)
+            return await asyncio.to_thread(self._execute_sync, sql, params)
 
-    def _execute_sync(self, sql: str, params: tuple[Any, ...]) -> None:
+    def _execute_sync(self, sql: str, params: tuple[Any, ...]) -> int:
         assert self._conn is not None
-        self._conn.execute(sql, params)
+        cursor = self._conn.execute(sql, params)
         self._conn.commit()
+        return cursor.rowcount
 
     async def fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
         async with self._lock:
@@ -347,11 +473,71 @@ class Database:
         )
 
     # Memories ---------------------------------------------------------------
-    async def create_memory(self, memory: Memory) -> Memory:
+    async def _record_observation(
+        self,
+        memory_id: str,
+        *,
+        evidence_type: str,
+        confidence: float | None,
+        source_ids: list[str],
+        session_id: str | None = None,
+    ) -> bool:
+        """INSERT OR IGNORE one fingerprint-keyed observation row.
+
+        Returns True only when a genuinely new row was written. Replays of the
+        same memory/evidence-kind/source-event set collide on the UNIQUE
+        fingerprint and change nothing.
+        """
+
+        observation_id = new_id("obs")
+        weight = 1.0 if evidence_type in _FULL_WEIGHT_EVIDENCE else 0.5
+        inserted = await self.execute(
+            "INSERT OR IGNORE INTO memory_observations(id, memory_id, observed_at, session_id, "
+            "evidence_type, evidence_weight, confidence, fingerprint) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                observation_id,
+                memory_id,
+                _iso(utc_now()),
+                session_id,
+                evidence_type,
+                weight,
+                confidence,
+                _observation_fingerprint(memory_id, evidence_type, source_ids),
+            ),
+        )
+        if not inserted:
+            return False
+        for event_id in source_ids:
+            await self.execute(
+                "INSERT OR IGNORE INTO memory_observation_sources(observation_id, event_id) "
+                "VALUES (?, ?)",
+                (observation_id, event_id),
+            )
+        return True
+
+    async def create_memory(
+        self,
+        memory: Memory,
+        *,
+        evidence_type: str = "user_assertion",
+        session_id: str | None = None,
+    ) -> Memory:
+        # observed_at is the earliest moment the memory's evidence was seen;
+        # derive it from source events unless it was already carried in.
+        observed_at = memory.observed_at
+        if observed_at is None and memory.source_event_ids:
+            placeholders = ",".join("?" for _ in memory.source_event_ids)
+            row = await self.fetchone(
+                f"SELECT MIN(created_at) AS m FROM events WHERE id IN ({placeholders})",
+                tuple(memory.source_event_ids),
+            )
+            observed_at = row["m"] if row else None
         await self.execute(
             "INSERT INTO memories(id, memory_type, topic, content, status, importance, confidence, "
-            "observation_count, created_at, updated_at, last_accessed_at, superseded_by, metadata_json) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "observation_count, created_at, updated_at, last_accessed_at, superseded_by, metadata_json, "
+            "valid_from, valid_until, observed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 memory.id,
                 memory.memory_type,
@@ -366,10 +552,23 @@ class Database:
                 _iso(memory.last_accessed_at),
                 memory.superseded_by,
                 json.dumps(memory.metadata, separators=(",", ":")),
+                memory.valid_from,
+                memory.valid_until,
+                observed_at,
             ),
         )
         for event_id in memory.source_event_ids:
             await self.add_memory_source(memory.id, event_id)
+        # Creation is the memory's first observation; observation_count stays
+        # whatever the caller carried in (1 by default), it is a counter not a
+        # derivation of these rows.
+        await self._record_observation(
+            memory.id,
+            evidence_type=evidence_type,
+            confidence=memory.confidence,
+            source_ids=memory.source_event_ids,
+            session_id=session_id,
+        )
         await self._refresh_fts_memory(memory.id)
         return memory
 
@@ -447,7 +646,39 @@ class Database:
             superseded_by=row["superseded_by"],
             metadata=json.loads(row["metadata_json"] or "{}"),
             source_event_ids=[r["event_id"] for r in sources],
+            valid_from=row["valid_from"],
+            valid_until=row["valid_until"],
+            observed_at=row["observed_at"],
         )
+
+    async def list_observations(self, memory_id: str) -> list[Observation]:
+        """Every evidence row recorded for one memory, oldest first."""
+        rows = await self.fetchall(
+            "SELECT * FROM memory_observations WHERE memory_id=? ORDER BY observed_at, id",
+            (memory_id,),
+        )
+        observations: list[Observation] = []
+        for row in rows:
+            sources = await self.fetchall(
+                "SELECT event_id FROM memory_observation_sources WHERE observation_id=?"
+                " ORDER BY event_id",
+                (row["id"],),
+            )
+            observations.append(
+                Observation(
+                    id=row["id"],
+                    memory_id=row["memory_id"],
+                    observed_at=_dt(row["observed_at"]),
+                    session_id=row["session_id"],
+                    evidence_type=row["evidence_type"],
+                    evidence_weight=float(row["evidence_weight"]),
+                    confidence=row["confidence"],
+                    fingerprint=row["fingerprint"],
+                    metadata=json.loads(row["metadata_json"] or "{}"),
+                    source_event_ids=[s["event_id"] for s in sources],
+                )
+            )
+        return observations
 
     async def archive_memory(self, memory_id: str) -> bool:
         row = await self.fetchone("SELECT id FROM memories WHERE id=?", (memory_id,))
@@ -461,9 +692,13 @@ class Database:
         return True
 
     async def supersede_memory(self, old_id: str, new_id: str) -> None:
+        now = _iso(utc_now())
+        # Closing validity is a derived-state transition: an explicit past
+        # valid_until survives (COALESCE), otherwise "now" ends the old fact.
         await self.execute(
-            "UPDATE memories SET status='superseded', superseded_by=?, updated_at=? WHERE id=?",
-            (new_id, _iso(utc_now()), old_id),
+            "UPDATE memories SET status='superseded', superseded_by=?, updated_at=?, "
+            "valid_until=COALESCE(valid_until, ?) WHERE id=?",
+            (new_id, now, now, old_id),
         )
         await self._refresh_fts_memory(old_id)
 
@@ -475,6 +710,8 @@ class Database:
         importance: float,
         source_event_ids: list[str],
         reinforcement_metadata: dict[str, Any] | None = None,
+        evidence_type: str = "user_assertion",
+        session_id: str | None = None,
     ) -> Memory | None:
         memory = await self.get_memory(memory_id)
         if not memory:
@@ -487,10 +724,22 @@ class Database:
         new_source_ids = [
             event_id for event_id in source_event_ids if event_id not in existing_sources
         ]
+        # Record the evidence row before the early return so replayed payloads
+        # collide on the UNIQUE fingerprint instead of writing anything.
+        observed_new = await self._record_observation(
+            memory_id,
+            evidence_type=evidence_type,
+            confidence=memory.confidence,
+            source_ids=source_event_ids,
+            session_id=session_id,
+        )
         if source_event_ids and not new_source_ids:
             return memory
 
-        count = memory.observation_count + 1
+        # Increment gate: observation_count == 1 (creation) + the number of
+        # genuinely new observation rows since creation. The fingerprint makes
+        # replays insert zero rows, so a reprocessed job never inflates it.
+        count = memory.observation_count + (1 if observed_new else 0)
         # More evidence should make confidence converge upward without allowing a
         # single noisy candidate to overwrite established state.
         new_conf = min(1.0, memory.confidence + (confidence - memory.confidence) / count + 0.02)

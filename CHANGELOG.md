@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
+
+Added:
+
+- A dev-only evaluation harness in `benchmarks/`: golden conversation scenarios declared as YAML, a deterministic offline runner with a scripted extractor, extraction/retrieval precision-recall and context-token metrics, a pytest corpus gate that runs every scenario on each check, and a live-replay command that replays the same corpus against a running instance and prints the memories learned per turn. No client-facing behavior changes.
+- Additive temporal metadata on memories: nullable `valid_from`, `valid_until`, and `observed_at` columns, migrated in place. Superseding a memory now closes the superseded memory's validity window at that moment instead of rewriting history.
+- Temporal search views on `POST /memory/search`: `temporal_view: "current"` (default; facts whose validity window has passed are dropped), `"all"` (no temporal filtering), and `"as_of"` with an ISO date or datetime (facts whose window covers that moment). Invalid view or `as_of` values return HTTP 400. The injected-context retrieval path keeps its prior all-rows behavior unchanged.
+- A first-class evidence ledger: every memory create and reinforcement records an observation row with an idempotency fingerprint, so retried or replayed evidence writes zero duplicates and cannot inflate `observation_count`; `observation_count` is now a cached counter derived from these rows. `GET /memory/{id}` gained an `observations` array. Memories that predate the ledger are backfilled once at startup with weight-0.5 `legacy` rows derived from their source events.
+
+Fixed:
+
+- Explicit corrections may now supersede across topic drift: a supersede proposal the extractor marked as an explicit correction was previously dropped in silence whenever its topic string differed from the target memory's. The topic gate now applies to implicit supersede only, which still requires an exact topic match plus similarity at or above the floor; the shown-set and active-status checks gate every supersede.
+- The extraction prompt now tells the model to copy the superseded memory's `memory_type` and topic exactly when superseding — reducing the drift that caused dropped corrections — and excludes facts the user marks as temporary or today-only.
+- Supersede skips are logged at debug level with the failing check, so dropped corrections are traceable without code changes.
 
 Removed:
 

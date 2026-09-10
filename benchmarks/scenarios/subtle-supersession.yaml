@@ -1,0 +1,46 @@
+name: subtle-supersession
+description: >-
+  A decision quietly replaced: the newer statement never negates or mentions
+  the old one, so supersession must happen via supersedes_match without an
+  explicit-correction flag.
+context:
+  user_id: eval
+  project_id: subtle-supersession
+turns:
+  - user: "For the session layer, we chose Redis for the session store when we started the rewrite."
+    assistant: "Understood - Redis is the session store for the rewritten service."
+    learn:
+      - operation: new
+        memory_type: decision
+        topic: session-store
+        content: "Session store uses Redis"
+        importance: 0.7
+        confidence: 0.85
+    expect:
+      created: ["Session store uses Redis"]
+
+  - user: "How do I set a TTL on a Redis key from Python?"
+    assistant: "Use redis_client.set(key, value, ex=seconds), or expire(key, seconds) after the write."
+    learn: []
+
+  - user: "After the capacity review, we use DynamoDB tables for the session store going forward."
+    assistant: "Noted - the session store now runs on DynamoDB tables following the capacity review."
+    learn:
+      - operation: supersede
+        memory_type: decision
+        topic: session-store
+        content: "Session store uses DynamoDB tables after the capacity review"
+        importance: 0.7
+        confidence: 0.85
+        supersedes_match: "Session store uses Redis"
+    expect:
+      created: ["DynamoDB tables after the capacity review"]
+      superseded: ["Session store uses Redis"]
+
+  - user: "Where are user sessions persisted these days?"
+    assistant: "Sessions live in DynamoDB tables since the capacity review."
+    learn: []
+    probe:
+      query: "where are sessions stored session store"
+      must_include: ["DynamoDB tables"]
+      must_not_include: ["Session store uses Redis"]

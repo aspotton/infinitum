@@ -62,6 +62,8 @@ What V0.2.0 deliberately does **not** do:
 
 Phase 3 should reuse this `RequestContext` and provenance data but change retrieval from soft affinity to hard **eligible-scope construction before similarity search**. Phase 4 should replace client-trusted user identity with a trusted/signed edge identity.
 
+Known evaluation impact until Phase 3 scoping lands: the `subtle-supersession` corpus probe (`must_include: "DynamoDB tables"`) fails when the ten benchmark scenarios share a single store, because `temporal-supersession-history` explicitly corrects the same session-store topic afterwards. That is cross-scope interference by design, not a learner defect, and it is the concrete test expectation that scoped retrieval is expected to retire.
+
 ### Memory processing cadence: every / incremental / periodic
 
 The memory runtime should deliberately operate on three different timescales rather than repeatedly feeding an ever-growing memory corpus back into an LLM. This is a core design principle for future versions.
@@ -114,6 +116,8 @@ Before adding tenancy, improve and measure the core memory behavior.
 
 ### 1.1 Golden memory benchmark
 
+**Status: implemented.** The reproducible corpus and deterministic offline runner live in [`benchmarks/`](../benchmarks/README.md): golden scenario YAML files, a scripted-extraction runner, precision/recall + token-cost metrics, a pytest corpus gate, and a live-replay command against a running instance.
+
 Create a reproducible evaluation corpus of conversation sequences containing:
 
 - durable facts;
@@ -141,6 +145,8 @@ Track precision/recall separately for extraction and retrieval. Also track conte
 
 ### 1.2 Retrieval feedback
 
+**Status: implemented as offline analysis.** The `request_memories` table records which memory was injected into each request, and the benchmark harness consumes that recorded state for offline evaluation. Feedback ingestion (the outcome signals listed below) is deferred: no client exists today to post such signals, so there is nothing to ingest yet.
+
 The `request_memories` table already records which memory was injected. Extend request outcomes with signals such as:
 
 - user correction on the next turn;
@@ -152,6 +158,8 @@ The `request_memories` table already records which memory was injected. Extend r
 Use these signals first for offline evaluation. Do not immediately create a self-reinforcing online ranking loop.
 
 ### 1.3 Better temporal truth
+
+**Status: implemented at minimum depth.** Memories gained nullable `valid_from`/`valid_until`/`observed_at` columns; supersession now closes the superseded memory's `valid_until` at the moment of supersession (history closes without being rewritten); and retrieval plus `POST /memory/search` expose temporal views (`current`, `all`, `as_of`). No typed `supersedes`/`contradicts` edges were added; supersession chains are traversed via the existing `superseded_by` link. Known limitation: natural expiry (a `valid_until` date passing with no row write) never bumps `updated_at`, so session-pinned context blocks stay cached until the next memory write.
 
 Add structured temporal metadata:
 
@@ -166,6 +174,8 @@ contradicts
 The consolidator should reason explicitly about current state versus historical state. Queries such as "what do we use now?" and "what did we use before PostgreSQL?" can then choose different views.
 
 ### 1.4 First-class observation/evidence records
+
+**Status: implemented (storage layer).** The `memory_observations` and `memory_observation_sources` tables exist with idempotent UNIQUE fingerprints, so retried or replayed evidence writes zero duplicate rows; every create and reinforcement records an observation, memories pre-dating the tables were backfilled with weight-0.5 `legacy` rows, and `observation_count` is now a derived cache that is never recomputed. Retrieval ranking still ignores the evidence features described below; that integration remains deferred.
 
 V0.2.0 retains the V0.1.3 improvements that make the existing integer `observation_count` safer by deduplicating retries and by merging more semantically equivalent observations. The longer-term model should make the evidence itself first-class rather than encoding all support in a counter and a flat source-event list.
 
@@ -217,6 +227,8 @@ Each observation should have an idempotency `fingerprint` derived from the under
 Retrieval ranking can later use bounded evidence features such as `log1p(independent_evidence_count)` rather than linearly rewarding repetition. This prevents frequently repeated but stale facts from overpowering a single newer authoritative correction.
 
 ### 1.5 Periodic deep consolidation scheduler
+
+**Status: Deferred - scheduled as its own future update; design preserved below.**
 
 V0.1.2+ already handles the **incremental** layer, so the next scheduler should be explicitly slower and deeper rather than another per-turn summarizer. It should operate on dirty/high-churn topics first, then optionally across topic boundaries.
 
@@ -611,10 +623,6 @@ If raw event volume eventually becomes very large, move immutable payload bodies
 
 ---
 
-## V0.2.1 learning-output resilience
-
-The current global-memory runtime now treats model-generated summaries as an optimization rather than a single point of failure. Empty final output from a reasoning-capable learning model falls back to bounded active canonical memories, and deployment-specific background controls can be supplied through `learning.extra_body`. This principle should carry into periodic consolidation: expensive LLM maintenance must be restartable and optional, while canonical detailed memory and immutable evidence remain usable without it.
-
 ## Phase 10 — Responses API and broader protocol adapters
 
 Add OpenAI-compatible `/v1/responses` while preserving the core library boundary.
@@ -630,10 +638,6 @@ Create adapters so the memory engine can also be used:
 The HTTP gateway should remain one consumer of the core Infinitum, not the architecture itself.
 
 ---
-
-## V0.2.1 learning-output resilience
-
-The current global-memory runtime now treats model-generated summaries as an optimization rather than a single point of failure. Empty final output from a reasoning-capable learning model falls back to bounded active canonical memories, and deployment-specific background controls can be supplied through `learning.extra_body`. This principle should carry into periodic consolidation: expensive LLM maintenance must be restartable and optional, while canonical detailed memory and immutable evidence remain usable without it.
 
 ## Phase 11 — Context compiler as an adaptive optimizer
 
@@ -669,10 +673,6 @@ When credible active memories conflict and the runtime cannot deterministically 
 
 ---
 
-## V0.2.1 learning-output resilience
-
-The current global-memory runtime now treats model-generated summaries as an optimization rather than a single point of failure. Empty final output from a reasoning-capable learning model falls back to bounded active canonical memories, and deployment-specific background controls can be supplied through `learning.extra_body`. This principle should carry into periodic consolidation: expensive LLM maintenance must be restartable and optional, while canonical detailed memory and immutable evidence remain usable without it.
-
 ## Phase 12 — Knowledge relationships without making a graph mandatory
 
 Start by adding explicit typed relationships to memories/events:
@@ -690,10 +690,6 @@ part_of
 Use them for local graph expansion during retrieval. A dedicated graph database should be introduced only if query patterns justify it; relational edges in PostgreSQL are sufficient initially.
 
 ---
-
-## V0.2.1 learning-output resilience
-
-The current global-memory runtime now treats model-generated summaries as an optimization rather than a single point of failure. Empty final output from a reasoning-capable learning model falls back to bounded active canonical memories, and deployment-specific background controls can be supplied through `learning.extra_body`. This principle should carry into periodic consolidation: expensive LLM maintenance must be restartable and optional, while canonical detailed memory and immutable evidence remain usable without it.
 
 ## Phase 13 — Enterprise security and governance
 
@@ -717,10 +713,6 @@ Memory retrieval should fail closed with respect to identity. If project/user id
 
 ---
 
-## V0.2.1 learning-output resilience
-
-The current global-memory runtime now treats model-generated summaries as an optimization rather than a single point of failure. Empty final output from a reasoning-capable learning model falls back to bounded active canonical memories, and deployment-specific background controls can be supplied through `learning.extra_body`. This principle should carry into periodic consolidation: expensive LLM maintenance must be restartable and optional, while canonical detailed memory and immutable evidence remain usable without it.
-
 ## Phase 14 — Admin and inspection UI
 
 A memory system needs observability that humans can understand.
@@ -741,10 +733,6 @@ The UI should provide:
 A key operational requirement is the ability to answer: **"Why did the model know/believe this?"**
 
 ---
-
-## V0.2.1 learning-output resilience
-
-The current global-memory runtime now treats model-generated summaries as an optimization rather than a single point of failure. Empty final output from a reasoning-capable learning model falls back to bounded active canonical memories, and deployment-specific background controls can be supplied through `learning.extra_body`. This principle should carry into periodic consolidation: expensive LLM maintenance must be restartable and optional, while canonical detailed memory and immutable evidence remain usable without it.
 
 ## Phase 15 — Long-term event-derived intelligence
 

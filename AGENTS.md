@@ -9,7 +9,7 @@ This file is the working guide for coding agents contributing to Infinitum.
 - Repository slug: `infinitum`
 - Python distribution/package: `infinitum`
 - Primary CLI: `infinitum`
-- Current release line: `0.2.x`
+- Current release line: `0.3.x`
 
 The pre-0.2 project name was **Context Runtime**. All pre-0.2 compatibility shims (the old Python namespace, the old CLI alias, the old config environment variable, and the old header aliases) were removed. Do not use the old name in new public APIs, examples, or prose except in historical notes.
 
@@ -45,7 +45,7 @@ Primary code lives in `src/infinitum/`.
 - `routes/memory.py` — memory management/search endpoints
 - `routes/admin.py` — health, event, topic, and request-context diagnostics
 - `config.py` — configuration models and loading
-- `database.py` — SQLite schema, persistence, durable jobs, provenance (largest module)
+- `database.py` — SQLite schema, persistence, durable jobs, provenance, `memory_observations`/`memory_observation_sources` evidence ledger, and additive temporal columns on `memories` (largest module)
 - `request_context.py` — user/project/CWD header resolution
 - `retrieval.py` — hybrid scoring and context affinity
 - `compiler.py` — token-aware memory selection/rendering/injection
@@ -55,6 +55,8 @@ Primary code lives in `src/infinitum/`.
 - `embeddings.py` — OpenAI-compatible embedding client
 - `upstream.py` — transparent OpenAI-compatible upstream transport
 - `models.py` — event/memory/request-context models
+
+Dev-only evaluation code lives in `benchmarks/` (not an installed package; run everything from the repo root via `python -m benchmarks.run` / `python -m benchmarks.replay`; see `benchmarks/README.md`): a golden-scenario YAML corpus, a deterministic offline runner with a scripted extractor, extraction/retrieval precision-recall + token metrics, and live-replay against a running instance. For paraphrase-tolerant semantic grading of a **live** store against this corpus, use the `.opencode/skills/infinitum-eval` skill from an agent session in this repo.
 
 ## Public naming and compatibility
 
@@ -91,6 +93,7 @@ Per interaction, the learner should see the current interaction plus a bounded n
 For candidate mutation:
 
 - explicit correction/supersession takes precedence over reinforcement;
+- an explicit correction may supersede across a drifted topic as a replacement of the target memory, not a merge; implicit supersede and reinforcement remain type/topic-gated (invariant 4 unchanged);
 - reinforcement requires exact memory type/topic compatibility;
 - near-identical lexical matches may reinforce deterministically;
 - high semantic similarity may reinforce when embeddings are available;
@@ -173,9 +176,7 @@ Before packaging a release, verify at minimum:
 
 Read `docs/ROADMAP.md` before implementing larger features. Key future work includes:
 
-- benchmark/evaluation harness for extraction and retrieval quality;
-- first-class `memory_observations` and evidence weighting;
-- periodic deep consolidation and canonicalization;
+- the Phase 1 evaluation loop is implemented in `benchmarks/` (golden corpus, offline runner, precision/recall + token metrics, live replay); the remaining Phase 1 item is periodic deep consolidation, deferred to its own future update;
 - hard user/project/session/agent memory scopes;
 - authenticated identity from a trusted LiteLLM edge;
 - organization/team memory and authoritative directives/goals;

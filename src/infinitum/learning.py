@@ -92,13 +92,19 @@ class MemoryLearner:
         if request_context.cwd:
             context_lines.append(f"cwd={request_context.cwd}")
         context_text = "\n".join(context_lines) or "(none)"
+        temporal_hint = (
+            "Add valid_from/valid_until (YYYY-MM-DD) only when the conversation "
+            "states when a fact began or ended; otherwise omit them."
+        )
 
         prompt = f"""Extract durable memories from this interaction. Return JSON only. Do not call tools or functions.
-Do not save transient chit-chat, guesses, assistant inventions, or obvious restatements.
+Do not save transient chit-chat, guesses, assistant inventions, or obvious restatements, \
+or facts the user marks as temporary or today-only.
 Prefer concise current-state facts, decisions, preferences, goals, procedures, lessons, or episodic events.
-If the user explicitly corrects or replaces an existing memory, set operation_hint='supersede', explicit_correction=true, and list only relevant existing memory IDs.
+If the user explicitly corrects or replaces an existing memory, set operation_hint='supersede', explicit_correction=true, list only relevant existing memory IDs, and copy that memory's memory_type and topic exactly.
 If this merely confirms an existing memory, use operation_hint='reinforce', set reinforces_memory_id to that existing memory ID, and copy that memory's memory_type and topic exactly.
 The request context below is provenance/affinity metadata. Use it only to disambiguate nearby memories; do not save the user ID, project ID, or CWD as a memory unless the interaction explicitly discusses them.
+{temporal_hint}
 
 Request context:\n{context_text}
 
@@ -107,7 +113,7 @@ Existing nearby memories:\n{chr(10).join(existing_lines) or '(none)'}
 Interaction:\nUSER: {query}\nASSISTANT: {assistant}
 
 Schema:
-{{"memories":[{{"memory_type":"fact|decision|preference|goal|procedure|lesson|episodic","topic":"short-stable-topic","content":"durable statement","importance":0.0,"confidence":0.0,"operation_hint":"new|reinforce|supersede","reinforces_memory_id":null,"supersedes_memory_ids":[],"explicit_correction":false,"reason":"brief"}}]}}
+{{"memories":[{{"memory_type":"fact|decision|preference|goal|procedure|lesson|episodic","topic":"short-stable-topic","content":"durable statement","importance":0.0,"confidence":0.0,"operation_hint":"new|reinforce|supersede","reinforces_memory_id":null,"supersedes_memory_ids":[],"explicit_correction":false,"valid_from":null,"valid_until":null,"reason":"brief"}}]}}
 """
         result = await self.upstream.learning_chat_completion(
             model=model,
@@ -311,6 +317,9 @@ Schema:
                 confidence=candidate.confidence,
                 importance=candidate.importance,
                 source_event_ids=source_ids,
+                # The learner's evidence is the user's own statements, even for
+                # explicit_correction candidates.
+                evidence_type="user_assertion",
                 reinforcement_metadata={
                     "method": reinforcement_reason,
                     "operation_hint": candidate.operation_hint,
@@ -334,8 +343,10 @@ Schema:
                 "extraction_reason": candidate.reason,
                 "origin_context": request_context.compact() if request_context else {},
             },
+            valid_from=candidate.valid_from,
+            valid_until=candidate.valid_until,
         )
-        await self.db.create_memory(new_memory)
+        await self.db.create_memory(new_memory, evidence_type="user_assertion")
         vector = await self.embeddings.embed(new_memory.content)
         if vector is not None:
             await self.db.set_embedding(new_memory.id, self.config.embeddings.model, vector)
@@ -344,17 +355,31 @@ Schema:
         if candidate.operation_hint == "supersede":
             for old_id in candidate.supersedes_memory_ids:
                 if old_id not in allowed_ids:
+                    log.debug("supersede skipped: id %s not in shown memory set", old_id)
                     continue
                 old = await self.db.get_memory(old_id)
-                if not old or old.status != "active" or old.topic != candidate.topic:
+                if not old or old.status != "active":
+                    log.debug(
+                        "supersede skipped: id %s not active (%s)",
+                        old_id,
+                        "missing" if not old else old.status,
+                    )
                     continue
-                related = (
-                    lexical_similarity(old.content, candidate.content)
-                    >= self.config.memory.supersede_similarity_floor
-                )
+                if old.topic != candidate.topic and not candidate.explicit_correction:
+                    log.debug(
+                        "supersede skipped: id %s topic mismatch (%s != %s)",
+                        old_id,
+                        old.topic,
+                        candidate.topic,
+                    )
+                    continue
+                lexical = lexical_similarity(old.content, candidate.content)
+                related = lexical >= self.config.memory.supersede_similarity_floor
                 if related or candidate.explicit_correction:
                     await self.db.supersede_memory(old.id, new_memory.id)
                     affected.add(old.id)
+                else:
+                    log.debug("supersede skipped: similarity %.3f below floor", lexical)
         return affected
 
     def _reinforcement_reason(self, candidate: MemoryCandidate, best: Any) -> str | None:

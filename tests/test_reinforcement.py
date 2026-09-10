@@ -1,3 +1,4 @@
+import logging
 import tempfile
 from unittest.mock import AsyncMock
 
@@ -232,6 +233,138 @@ async def test_explicit_supersede_is_not_accidentally_reinforced():
             active = await db.list_memories(limit=10, status="active")
             assert len(active) == 1
             assert active[0].content.startswith("PostgreSQL 17")
+        finally:
+            await upstream.close()
+            await embeddings.close()
+            await db.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_correction_supersedes_across_topic_drift():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, db, embeddings, upstream, retriever, learner = await _learner(tmp)
+        try:
+            existing = await db.create_memory(
+                Memory(
+                    memory_type="decision",
+                    topic="session-store-a",
+                    content="Memcached is the session store for the checkout service.",
+                )
+            )
+            retriever.search = AsyncMock(
+                return_value=[
+                    ScoredMemory(
+                        memory=existing,
+                        score=0.90,
+                        semantic_score=0.92,
+                        lexical_score=0.60,
+                        topic_score=0.3,
+                        freshness_score=1.0,
+                    )
+                ]
+            )
+            candidate = MemoryCandidate(
+                memory_type="decision",
+                topic="session-store-b",
+                content="Redis is now the session store for the checkout service.",
+                operation_hint="supersede",
+                supersedes_memory_ids=[existing.id],
+                explicit_correction=True,
+            )
+
+            affected = await learner._apply(candidate, [], {existing.id})
+            assert existing.id in affected
+            old = await db.get_memory(existing.id)
+            assert old is not None
+            assert old.status == "superseded"
+            active = await db.list_memories(limit=10, status="active")
+            assert len(active) == 1
+            assert active[0].topic == "session-store-b"
+        finally:
+            await upstream.close()
+            await embeddings.close()
+            await db.close()
+
+
+@pytest.mark.asyncio
+async def test_implicit_supersede_remains_topic_gated():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, db, embeddings, upstream, retriever, learner = await _learner(tmp)
+        try:
+            existing = await db.create_memory(
+                Memory(
+                    memory_type="decision",
+                    topic="session-store-a",
+                    content="Memcached is the session store for the checkout service.",
+                )
+            )
+            retriever.search = AsyncMock(
+                return_value=[
+                    ScoredMemory(
+                        memory=existing,
+                        score=0.90,
+                        semantic_score=0.92,
+                        lexical_score=0.60,
+                        topic_score=0.3,
+                        freshness_score=1.0,
+                    )
+                ]
+            )
+            candidate = MemoryCandidate(
+                memory_type="decision",
+                topic="session-store-b",
+                content="Redis is now the session store for the checkout service.",
+                operation_hint="supersede",
+                supersedes_memory_ids=[existing.id],
+                explicit_correction=False,
+            )
+
+            await learner._apply(candidate, [], {existing.id})
+            old = await db.get_memory(existing.id)
+            assert old is not None
+            assert old.status == "active"
+        finally:
+            await upstream.close()
+            await embeddings.close()
+            await db.close()
+
+
+@pytest.mark.asyncio
+async def test_supersede_topic_mismatch_is_logged_at_debug(caplog):
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, db, embeddings, upstream, retriever, learner = await _learner(tmp)
+        try:
+            existing = await db.create_memory(
+                Memory(
+                    memory_type="decision",
+                    topic="session-store-a",
+                    content="Memcached is the session store for the checkout service.",
+                )
+            )
+            retriever.search = AsyncMock(
+                return_value=[
+                    ScoredMemory(
+                        memory=existing,
+                        score=0.90,
+                        semantic_score=0.92,
+                        lexical_score=0.60,
+                        topic_score=0.3,
+                        freshness_score=1.0,
+                    )
+                ]
+            )
+            candidate = MemoryCandidate(
+                memory_type="decision",
+                topic="session-store-b",
+                content="Redis is now the session store for the checkout service.",
+                operation_hint="supersede",
+                supersedes_memory_ids=[existing.id],
+                explicit_correction=False,
+            )
+
+            caplog.set_level(logging.DEBUG, logger="infinitum.learning")
+            await learner._apply(candidate, [], {existing.id})
+            assert "topic mismatch" in caplog.text
         finally:
             await upstream.close()
             await embeddings.close()

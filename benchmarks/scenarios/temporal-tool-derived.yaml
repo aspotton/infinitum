@@ -1,0 +1,36 @@
+name: temporal-tool-derived
+description: >-
+  A tool-result-derived fact (the §1.1 golden-corpus category): the user reports
+  a benchmark tool's output together with the period it was valid for. The
+  derived fact carries that stated validity period, so an as_of probe inside the
+  benchmark window surfaces it while the default-current probe hides it after
+  expiry.
+context:
+  user_id: eval
+  project_id: temporal-tool-derived
+turns:
+  - user: "The load-test tool result came back: our checkout API serves 320 requests per second on eu-central-1, measured during the March 2024 benchmark window from March 1st to March 31st."
+    assistant: "Noted - the load test showed the checkout API serving 320 requests per second on eu-central-1 for that March 2024 window."
+    learn:
+      - operation: new
+        memory_type: fact
+        topic: checkout-throughput
+        content: "Checkout API serves 320 requests per second on eu-central-1"
+        importance: 0.6
+        confidence: 0.75
+        valid_from: "2024-03-01"
+        valid_until: "2024-03-31"
+    expect:
+      created: ["Checkout API serves 320 requests per second on eu-central-1"]
+    probe:
+      query: "checkout API requests per second eu-central-1"
+      temporal_view: as_of
+      as_of: "2024-03-15"
+      must_include: ["Checkout API serves 320 requests per second on eu-central-1"]
+
+  - user: "How do I add per-endpoint rate limiting to a FastAPI service behind a load balancer?"
+    assistant: "Use a token-bucket limiter keyed on client ID in middleware, or offload it to the load balancer's rate-limit module."
+    learn: []
+    probe:
+      query: "checkout API throughput requests per second"
+      must_not_include: ["Checkout API serves 320 requests per second on eu-central-1"]
