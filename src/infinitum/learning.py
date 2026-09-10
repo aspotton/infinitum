@@ -92,6 +92,10 @@ class MemoryLearner:
         if request_context.cwd:
             context_lines.append(f"cwd={request_context.cwd}")
         context_text = "\n".join(context_lines) or "(none)"
+        temporal_hint = (
+            "Add valid_from/valid_until (YYYY-MM-DD) only when the conversation "
+            "states when a fact began or ended; otherwise omit them."
+        )
 
         prompt = f"""Extract durable memories from this interaction. Return JSON only. Do not call tools or functions.
 Do not save transient chit-chat, guesses, assistant inventions, or obvious restatements.
@@ -99,7 +103,7 @@ Prefer concise current-state facts, decisions, preferences, goals, procedures, l
 If the user explicitly corrects or replaces an existing memory, set operation_hint='supersede', explicit_correction=true, and list only relevant existing memory IDs.
 If this merely confirms an existing memory, use operation_hint='reinforce', set reinforces_memory_id to that existing memory ID, and copy that memory's memory_type and topic exactly.
 The request context below is provenance/affinity metadata. Use it only to disambiguate nearby memories; do not save the user ID, project ID, or CWD as a memory unless the interaction explicitly discusses them.
-Add valid_from/valid_until (YYYY-MM-DD) only when the conversation states when a fact began or ended; otherwise omit them.
+{temporal_hint}
 
 Request context:\n{context_text}
 

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -28,7 +28,6 @@ from infinitum.config import AppConfig
 from infinitum.database import Database
 from infinitum.learning import MemoryLearner
 from infinitum.models import Event, Memory, MemoryCandidate
-
 
 TEMPORAL_COLUMNS = {"valid_from", "valid_until", "observed_at"}
 
@@ -238,7 +237,7 @@ async def test_observed_at_is_earliest_source_event_or_null():
         db = Database(f"{tmp}/obs.db")
         await db.connect()
         try:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             older = await db.add_event(
                 Event(
                     session_id="s",
