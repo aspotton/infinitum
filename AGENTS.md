@@ -9,7 +9,7 @@ This file is the working guide for coding agents contributing to Infinitum.
 - Repository slug: `infinitum`
 - Python distribution/package: `infinitum`
 - Primary CLI: `infinitum`
-- Current release line: `0.2.x`
+- Current release line: `0.3.x`
 
 The pre-0.2 project name was **Context Runtime**. All pre-0.2 compatibility shims (the old Python namespace, the old CLI alias, the old config environment variable, and the old header aliases) were removed. Do not use the old name in new public APIs, examples, or prose except in historical notes.
 
