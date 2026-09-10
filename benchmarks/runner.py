@@ -182,10 +182,18 @@ def _drain_jobs(
         time.sleep(_POLL_SECONDS)
 
 
+def _active_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    query = "SELECT id, observation_count FROM memories WHERE status='active'"
+    return {row["id"]: int(row["observation_count"]) for row in conn.execute(query)}
+
+
 def _eval_expectation(
-    conn: sqlite3.Connection, turn_index: int, expect: Expectation
+    conn: sqlite3.Connection,
+    turn_index: int,
+    expect: Expectation,
+    baseline_counts: dict[str, int],
 ) -> list[ExpectationRecord]:
-    rows = conn.execute("SELECT content, status, observation_count FROM memories").fetchall()
+    rows = conn.execute("SELECT id, content, status, observation_count FROM memories").fetchall()
 
     def _hits(sub: str, status: str) -> list[sqlite3.Row]:
         return [r for r in rows if r["status"] == status and sub in r["content"]]
@@ -202,7 +210,9 @@ def _eval_expectation(
         records.append(_rec("superseded", sub, bool(_hits(sub, "superseded"))))
     for sub in expect.reinforced:
         hits = _hits(sub, "active")
-        grew = len(hits) == 1 and int(hits[0]["observation_count"]) >= 1
+        prior = baseline_counts.get(hits[0]["id"]) if len(hits) == 1 else None
+        # Fail (not vacuously pass) unless the target existed at baseline and grew.
+        grew = prior is not None and int(hits[0]["observation_count"]) > prior
         records.append(_rec("reinforced", sub, grew))
     return records
 
@@ -286,10 +296,11 @@ def run_scenario(scenario: Scenario) -> ScenarioResult:
                     response = client.post("/v1/chat/completions", json=body, headers=headers)
                     response.raise_for_status()
                     baseline = _done_count(conn)
+                    counts0 = _active_counts(conn)
                     _drain_jobs(conn, state)
                     if _done_count(conn) <= baseline:
                         raise RunnerError(f"turn {turn_index}: no learning job terminal")
-                    records.extend(_eval_expectation(conn, turn_index, turn.expect))
+                    records.extend(_eval_expectation(conn, turn_index, turn.expect, counts0))
                     if turn.probe is not None:
                         records.extend(_eval_probe(client, headers, turn_index, turn.probe))
                 snapshot = _snapshot(conn)

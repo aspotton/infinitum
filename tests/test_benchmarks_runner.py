@@ -230,3 +230,73 @@ def test_scenario_result_equality_ignores_snapshot_and_tokens() -> None:
 
 def test_scenario_result_inequality_tracks_pass_fail_records() -> None:
     assert _mk_result(True, "mem_1", 10) != _mk_result(False, "mem_1", 10)
+
+
+def _reinforce_scenario(reinforce_on_turn2: bool) -> Scenario:
+    """Turn 1 creates a fact; turn 2 either reinforces it or proposes nothing.
+
+    The `reinforced` expectation is identical either way, so the only thing that
+    can flip its pass/fail is whether observation_count actually grew.
+    """
+
+    content = "The CI runner is ubuntu-2404-large"
+    turn2_learn = (
+        [
+            {
+                "operation": "reinforce",
+                "memory_type": "fact",
+                "topic": "ci-runner",
+                "content": content,
+                "importance": 0.7,
+                "confidence": 0.9,
+            }
+        ]
+        if reinforce_on_turn2
+        else []
+    )
+    return Scenario.model_validate(
+        {
+            "name": "reinforce-check",
+            "description": "observation_count must actually grow for reinforced to pass",
+            "context": {"user_id": "eval", "project_id": "reinforce-check"},
+            "turns": [
+                {
+                    "user": "For the record, our CI runner is ubuntu-2404-large.",
+                    "assistant": "Noted - CI runs on ubuntu-2404-large.",
+                    "learn": [
+                        {
+                            "operation": "new",
+                            "memory_type": "fact",
+                            "topic": "ci-runner",
+                            "content": content,
+                            "importance": 0.7,
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "expect": {"created": ["ubuntu-2404-large"]},
+                },
+                {
+                    "user": "Same CI runner as always for this push.",
+                    "assistant": "Right, still ubuntu-2404-large.",
+                    "learn": turn2_learn,
+                    "expect": {"reinforced": ["ubuntu-2404-large"]},
+                },
+            ],
+        }
+    )
+
+
+def _reinforced_record(result: ScenarioResult) -> bool:
+    records = [r for r in result.records if r.kind == "reinforced"]
+    assert len(records) == 1
+    return records[0].passed
+
+
+def test_reinforced_passes_when_observation_count_grows() -> None:
+    result = run_scenario(_reinforce_scenario(True))
+    assert _reinforced_record(result) is True
+
+
+def test_reinforced_fails_when_nothing_reinforces() -> None:
+    result = run_scenario(_reinforce_scenario(False))
+    assert _reinforced_record(result) is False
