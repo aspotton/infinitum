@@ -355,19 +355,31 @@ Schema:
         if candidate.operation_hint == "supersede":
             for old_id in candidate.supersedes_memory_ids:
                 if old_id not in allowed_ids:
+                    log.debug("supersede skipped: id %s not in shown memory set", old_id)
                     continue
                 old = await self.db.get_memory(old_id)
                 if not old or old.status != "active":
+                    log.debug(
+                        "supersede skipped: id %s not active (%s)",
+                        old_id,
+                        "missing" if not old else old.status,
+                    )
                     continue
                 if old.topic != candidate.topic and not candidate.explicit_correction:
+                    log.debug(
+                        "supersede skipped: id %s topic mismatch (%s != %s)",
+                        old_id,
+                        old.topic,
+                        candidate.topic,
+                    )
                     continue
-                related = (
-                    lexical_similarity(old.content, candidate.content)
-                    >= self.config.memory.supersede_similarity_floor
-                )
+                lexical = lexical_similarity(old.content, candidate.content)
+                related = lexical >= self.config.memory.supersede_similarity_floor
                 if related or candidate.explicit_correction:
                     await self.db.supersede_memory(old.id, new_memory.id)
                     affected.add(old.id)
+                else:
+                    log.debug("supersede skipped: similarity %.3f below floor", lexical)
         return affected
 
     def _reinforcement_reason(self, candidate: MemoryCandidate, best: Any) -> str | None:
