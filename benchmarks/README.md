@@ -45,6 +45,8 @@ and depends on the configured extraction model. Pass `--strict` to make any
 line, is skipped, and does not affect the exit code; the remaining scenarios
 are still attempted.
 
+For semantic grading of a **live** store against this corpus (paraphrase-tolerant), use the `.opencode/skills/infinitum-eval` skill from an agent session in this repo.
+
 ## Scenario corpus format
 
 Scenarios are YAML files in `benchmarks/scenarios/`. The authoritative field
