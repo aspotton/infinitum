@@ -98,9 +98,10 @@ class MemoryLearner:
         )
 
         prompt = f"""Extract durable memories from this interaction. Return JSON only. Do not call tools or functions.
-Do not save transient chit-chat, guesses, assistant inventions, or obvious restatements.
+Do not save transient chit-chat, guesses, assistant inventions, or obvious restatements, \
+or facts the user marks as temporary or today-only.
 Prefer concise current-state facts, decisions, preferences, goals, procedures, lessons, or episodic events.
-If the user explicitly corrects or replaces an existing memory, set operation_hint='supersede', explicit_correction=true, and list only relevant existing memory IDs.
+If the user explicitly corrects or replaces an existing memory, set operation_hint='supersede', explicit_correction=true, list only relevant existing memory IDs, and copy that memory's memory_type and topic exactly.
 If this merely confirms an existing memory, use operation_hint='reinforce', set reinforces_memory_id to that existing memory ID, and copy that memory's memory_type and topic exactly.
 The request context below is provenance/affinity metadata. Use it only to disambiguate nearby memories; do not save the user ID, project ID, or CWD as a memory unless the interaction explicitly discusses them.
 {temporal_hint}
