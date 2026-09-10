@@ -27,6 +27,7 @@ scenario-named pytest failure without anyone remembering to run the CLI.
 ```bash
 .venv/bin/python -m benchmarks.replay --base-url http://127.0.0.1:8788
 .venv/bin/python -m benchmarks.replay --scenario explicit-correction --strict
+.venv/bin/python -m benchmarks.replay --timeout 300  # patient reads for slow upstreams
 ```
 
 Replay posts each scenario turn to `/v1/chat/completions` under

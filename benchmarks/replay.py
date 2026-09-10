@@ -27,8 +27,6 @@ from .corpus import Expectation, Probe, Scenario, load_scenarios
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8788"
 _REPLAY_MODEL = "infinitum-replay"
-# Bounded so a dead host fails fast instead of hanging the replay.
-_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
 _SCENARIOS_DIR = Path(__file__).parent / "scenarios"
 _CONTENT_SNIPPET = 60
 
@@ -211,6 +209,13 @@ def main(argv: list[str] | None = None) -> int:
         help=f"model name for turn requests (default {_REPLAY_MODEL}; "
         "use your upstream's model when it validates names)",
     )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        metavar="SECONDS",
+        default=120.0,
+        help="per-request read timeout (default 120; connect capped at 5)",
+    )
     args = parser.parse_args(argv)
 
     scenarios = load_scenarios(_SCENARIOS_DIR)
@@ -221,7 +226,10 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"unknown scenario(s) {unknown}; available: {sorted(by_name)}")
         scenarios = [by_name[name] for name in args.scenario]
 
-    with httpx.Client(base_url=args.base_url, timeout=_TIMEOUT) as client:
+    # connect stays capped at 5s so a dead host fails fast; read is --timeout.
+    with httpx.Client(
+        base_url=args.base_url, timeout=httpx.Timeout(args.timeout, connect=5.0)
+    ) as client:
         return replay_scenarios(scenarios, client, strict=args.strict, model=args.model)
 
 

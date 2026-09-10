@@ -170,3 +170,33 @@ def test_replay_model_override_and_default() -> None:
     ) as client:
         assert turn_models(client, model="qwen") == ["qwen", "qwen"]
         assert turn_models(client) == ["infinitum-replay", "infinitum-replay"]
+
+
+def test_replay_cli_timeout_flag_builds_patient_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--timeout`` sets the client read timeout; connect stays capped at 5s."""
+
+    captured: list[dict] = []
+
+    class _StubClient:
+        """Records construction kwargs; every request fails like a dead port."""
+
+        def __init__(self, **kwargs: object) -> None:
+            captured.append(kwargs)
+
+        def __enter__(self) -> _StubClient:
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+        def post(self, *args: object, **kwargs: object) -> httpx.Response:
+            raise httpx.ConnectError("stub")
+
+        def get(self, *args: object, **kwargs: object) -> httpx.Response:
+            raise httpx.ConnectError("stub")
+
+    monkeypatch.setattr(httpx, "Client", _StubClient)
+    assert replay_main([]) == 0
+    assert captured[0]["timeout"] == httpx.Timeout(120.0, connect=5.0)
+    assert replay_main(["--timeout", "7"]) == 0
+    assert captured[1]["timeout"] == httpx.Timeout(7.0, connect=5.0)
