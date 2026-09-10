@@ -356,7 +356,9 @@ Schema:
                 if old_id not in allowed_ids:
                     continue
                 old = await self.db.get_memory(old_id)
-                if not old or old.status != "active" or old.topic != candidate.topic:
+                if not old or old.status != "active":
+                    continue
+                if old.topic != candidate.topic and not candidate.explicit_correction:
                     continue
                 related = (
                     lexical_similarity(old.content, candidate.content)
