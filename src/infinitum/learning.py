@@ -316,6 +316,9 @@ Schema:
                 confidence=candidate.confidence,
                 importance=candidate.importance,
                 source_event_ids=source_ids,
+                # The learner's evidence is the user's own statements, even for
+                # explicit_correction candidates.
+                evidence_type="user_assertion",
                 reinforcement_metadata={
                     "method": reinforcement_reason,
                     "operation_hint": candidate.operation_hint,
@@ -342,7 +345,7 @@ Schema:
             valid_from=candidate.valid_from,
             valid_until=candidate.valid_until,
         )
-        await self.db.create_memory(new_memory)
+        await self.db.create_memory(new_memory, evidence_type="user_assertion")
         vector = await self.embeddings.embed(new_memory.content)
         if vector is not None:
             await self.db.set_embedding(new_memory.id, self.config.embeddings.model, vector)

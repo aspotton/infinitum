@@ -21,7 +21,7 @@ async def list_memories(request: Request, limit: int = Query(100, ge=1, le=1000)
 async def create_memory(request: Request, body: MemoryCreateRequest):
     runtime = _runtime(request)
     memory = Memory(**body.model_dump())
-    await runtime.db.create_memory(memory)
+    await runtime.db.create_memory(memory, evidence_type="manual_admin")
     vector = await runtime.embeddings.embed(memory.content)
     if vector is not None:
         await runtime.db.set_embedding(memory.id, runtime.config.embeddings.model, vector)

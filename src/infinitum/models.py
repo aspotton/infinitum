@@ -112,6 +112,27 @@ class Memory(BaseModel):
         return _coerce_iso_or_none(value)
 
 
+class Observation(BaseModel):
+    """One piece of evidence supporting a memory, as a first-class record.
+
+    ``observation_count`` on :class:`Memory` remains a cached counter; these
+    rows are the ground it derives from. The UNIQUE ``fingerprint`` (memory +
+    evidence kind + exact source-event set) makes replayed evidence
+    structurally idempotent.
+    """
+
+    id: str = Field(default_factory=lambda: new_id("obs"))
+    memory_id: str
+    observed_at: datetime = Field(default_factory=utc_now)
+    session_id: str | None = None
+    evidence_type: str
+    evidence_weight: float = 1.0
+    confidence: float | None = None
+    fingerprint: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    source_event_ids: list[str] = Field(default_factory=list)
+
+
 class MemoryCandidate(BaseModel):
     memory_type: MemoryType = "fact"
     topic: str = "general"
