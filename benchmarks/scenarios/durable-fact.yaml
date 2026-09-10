@@ -1,0 +1,34 @@
+name: durable-fact
+description: >-
+  A durable infrastructure fact stated once, then asked about several turns
+  later; the probe must retrieve it from memory, not from the conversation.
+context:
+  user_id: eval
+  project_id: durable-fact
+turns:
+  - user: "Heads up for the pipeline work: our CI jobs run on self-hosted runners labeled ubuntu-2404-large, not the GitHub-hosted ones."
+    assistant: "Got it - I'll target the self-hosted ubuntu-2404-large runner labels for the pipeline changes."
+    learn:
+      - operation: new
+        memory_type: fact
+        topic: ci-infrastructure
+        content: "CI jobs run on self-hosted runners labeled ubuntu-2404-large"
+        importance: 0.7
+        confidence: 0.9
+    expect:
+      created: ["self-hosted runners labeled ubuntu-2404-large"]
+
+  - user: "Quick one while I'm in here - what's the difference between git fetch and git pull?"
+    assistant: "git fetch downloads new commits without touching your working branch; git pull fetches and then merges or rebases them into your current branch."
+    learn: []
+
+  - user: "Back to the workflow file - which runner label should the new integration job use?"
+    assistant: "Use the self-hosted ubuntu-2404-large label, same as the other integration jobs."
+    learn: []
+    probe:
+      query: "which runner label for CI jobs self-hosted"
+      must_include: ["ubuntu-2404-large"]
+
+  - user: "Perfect, thanks."
+    assistant: "Anytime - ping me when the pipeline is green."
+    learn: []

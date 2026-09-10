@@ -1,0 +1,42 @@
+name: long-gap
+description: >-
+  A fact stated in turn one, four turns of unrelated traffic, then a probe -
+  recall must survive the gap without the fact being repeated.
+context:
+  user_id: eval
+  project_id: long-gap
+turns:
+  - user: "Context for later: the payments database runs on Postgres 16 in the eu-central-1 cluster."
+    assistant: "Got it - payments is on Postgres 16 in eu-central-1."
+    learn:
+      - operation: new
+        memory_type: fact
+        topic: payments-database
+        content: "Payments database runs on Postgres 16 in the eu-central-1 cluster"
+        importance: 0.8
+        confidence: 0.9
+    expect:
+      created: ["Postgres 16 in the eu-central-1 cluster"]
+
+  - user: "What's a good VS Code extension for editing TOML configs?"
+    assistant: "TOML by tamasfe gives you syntax highlighting and schema-aware completion."
+    learn: []
+
+  - user: "Why would a cron job silently not run on a Sunday?"
+    assistant: "Check the day-of-week field - Sunday is 0 or 7 depending on the cron implementation, and some schedulers only accept 0."
+    learn: []
+
+  - user: "How do I check which port a process is holding on Linux?"
+    assistant: "ss -ltnp or lsof -i shows the listening sockets and their owning PIDs."
+    learn: []
+
+  - user: "Should shellcheck run in pre-commit or CI?"
+    assistant: "Both are cheap - pre-commit catches it locally, CI keeps merges honest if hooks get skipped."
+    learn: []
+
+  - user: "Which Postgres version is payments on, and in which region?"
+    assistant: "Payments runs on Postgres 16 in the eu-central-1 cluster."
+    learn: []
+    probe:
+      query: "payments database postgres version region"
+      must_include: ["Postgres 16 in the eu-central-1 cluster"]

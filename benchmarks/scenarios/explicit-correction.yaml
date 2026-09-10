@@ -1,0 +1,47 @@
+name: explicit-correction
+description: >-
+  A decision stated, then explicitly reversed a few turns later with an
+  actual "actually"; the old memory must be superseded and the current-view
+  probe must surface only the corrected decision.
+context:
+  user_id: eval
+  project_id: explicit-correction
+turns:
+  - user: "We decided the bulk export endpoint returns CSV format - that's what the data team planned around."
+    assistant: "Noted - the bulk export endpoint returns CSV format per the data team's plan."
+    learn:
+      - operation: new
+        memory_type: decision
+        topic: export-endpoint-format
+        content: "Bulk export endpoint returns CSV format"
+        importance: 0.7
+        confidence: 0.85
+    expect:
+      created: ["Bulk export endpoint returns CSV format"]
+
+  - user: "How do I stream a large CSV response in FastAPI without buffering the whole file?"
+    assistant: "Yield row chunks from an async generator and return a StreamingResponse with media_type text/csv."
+    learn: []
+
+  - user: "Actually, scratch the CSV plan - the product team changed the bulk export endpoint to return JSON format instead."
+    assistant: "Updated - the bulk export endpoint returns JSON format now, dropping the CSV plan."
+    learn:
+      - operation: supersede
+        memory_type: decision
+        topic: export-endpoint-format
+        content: "Bulk export endpoint returns JSON format"
+        importance: 0.7
+        confidence: 0.9
+        explicit_correction: true
+        supersedes_match: "Bulk export endpoint returns CSV format"
+    expect:
+      created: ["Bulk export endpoint returns JSON format"]
+      superseded: ["Bulk export endpoint returns CSV format"]
+
+  - user: "What format should my export client parse?"
+    assistant: "Parse JSON - the bulk export endpoint returns JSON format."
+    learn: []
+    probe:
+      query: "bulk export endpoint format"
+      must_include: ["Bulk export endpoint returns JSON format"]
+      must_not_include: ["Bulk export endpoint returns CSV format"]
