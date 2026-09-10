@@ -32,9 +32,16 @@ async def create_memory(request: Request, body: MemoryCreateRequest):
 async def search_memory(request: Request, body: MemorySearchRequest):
     runtime = _runtime(request)
     request_context = runtime.request_context.resolve(request.headers)
-    results = await runtime.retriever.search(
-        body.query, limit=body.limit, request_context=request_context
-    )
+    try:
+        results = await runtime.retriever.search(
+            body.query,
+            limit=body.limit,
+            request_context=request_context,
+            temporal_view=body.temporal_view,
+            as_of=body.as_of,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return [item.model_dump() for item in results]
 
 

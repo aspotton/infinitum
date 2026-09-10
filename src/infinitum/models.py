@@ -170,3 +170,7 @@ class MemorySearchRequest(BaseModel):
     query: str
     limit: int = Field(default=20, ge=1, le=200)
     include_archived: bool = False
+    # Diagnostic searches default to now-true facts; the retriever's own
+    # default stays "all" so compiler/tool injection behavior is untouched.
+    temporal_view: str = "current"
+    as_of: str | None = None
