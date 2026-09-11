@@ -103,6 +103,7 @@ def test_defaults_when_omitted():
     assert candidate.explicit_correction is False
     assert candidate.supersedes_match is None
     probe = Probe(query="q", must_include=[], must_not_include=[])
+    assert probe.must_demote == []
     assert probe.temporal_view == "current"
     assert probe.as_of is None
     assert ScenarioContext(project_id="p").user_id == "eval"
@@ -242,3 +243,25 @@ def test_unknown_key_is_rejected(tmp_path):
     with pytest.raises(ScenarioError) as excinfo:
         load_scenario(path)
     assert "typo.yaml" in str(excinfo.value)
+
+
+def test_must_demote_parses_and_defaults_empty(tmp_path):
+    """Given probe.must_demote ['x'], When loaded, Then it parses; absent means []."""
+    data = _valid_payload()
+    data["turns"][0]["probe"]["must_demote"] = ["PostgreSQL"]
+    scenario = load_scenario(_mutate(data, "demote.yaml", str(tmp_path)))
+    assert scenario.turns[0].probe.must_demote == ["PostgreSQL"]
+    plain = load_scenario(_write(str(tmp_path), "plain.yaml", VALID_YAML))
+    assert plain.turns[0].probe.must_demote == []
+
+
+def test_unknown_probe_sibling_of_must_demote_still_rejected(tmp_path):
+    """Given probe.must_promote (a fake sibling of must_demote), When loaded, Then rejected."""
+    data = _valid_payload()
+    data["turns"][0]["probe"]["must_demote"] = ["PostgreSQL"]
+    data["turns"][0]["probe"]["must_promote"] = ["MySQL"]
+    path = _mutate(data, "badsibling.yaml", str(tmp_path))
+    with pytest.raises(ScenarioError) as excinfo:
+        load_scenario(path)
+    assert "badsibling.yaml" in str(excinfo.value)
+    assert "must_promote" in str(excinfo.value)

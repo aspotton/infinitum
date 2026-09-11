@@ -300,3 +300,79 @@ def test_reinforced_passes_when_observation_count_grows() -> None:
 def test_reinforced_fails_when_nothing_reinforces() -> None:
     result = run_scenario(_reinforce_scenario(False))
     assert _reinforced_record(result) is False
+
+
+def _demote_scenario(demote_undated_memory: bool) -> Scenario:
+    """Turns 1-2 create one standing and one expired fact; turn 3 probes must_demote.
+
+    Naming "VaultPress" (expired row) must PASS: its current-view score is
+    the all-view score x 0.70, so the all-view follow-up is strictly higher.
+    Naming "KeyGuard" (never expires) must FAIL: the demotion factor is inert
+    there, so the all-view score is never strictly higher and the check fails.
+    """
+    target = "KeyGuard" if demote_undated_memory else "VaultPress"
+    return Scenario.model_validate(
+        {
+            "name": "demote-check",
+            "description": "must_demote compares current-view vs all-view scores",
+            "context": {"user_id": "eval", "project_id": "demote-check"},
+            "turns": [
+                {
+                    "user": "For the record, our encryption key custody runs on KeyGuard.",
+                    "assistant": "Noted - KeyGuard holds the encryption keys.",
+                    "learn": [
+                        {
+                            "operation": "new",
+                            "memory_type": "fact",
+                            "topic": "encryption-vendors",
+                            "content": "Encryption key custody runs on KeyGuard",
+                            "importance": 0.7,
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "expect": {"created": ["KeyGuard"]},
+                },
+                {
+                    "user": "The 2023 encryption audit ran on VaultPress, through June 2024 only.",
+                    "assistant": "Noted - VaultPress covered the 2023 audit until June 2024.",
+                    "learn": [
+                        {
+                            "operation": "new",
+                            "memory_type": "fact",
+                            "topic": "encryption-vendors",
+                            "content": "The 2023 encryption audit ran on VaultPress",
+                            "importance": 0.7,
+                            "confidence": 0.9,
+                            "valid_until": "2024-06-30",
+                        }
+                    ],
+                    "expect": {"created": ["VaultPress"]},
+                },
+                {
+                    "user": "Which encryption vendors show up in our audit history?",
+                    "assistant": "KeyGuard now; VaultPress for the 2023 audit window.",
+                    "learn": [],
+                    "probe": {
+                        "query": "encryption custody audit vendor history",
+                        "must_demote": [target],
+                    },
+                },
+            ],
+        }
+    )
+
+
+def _demote_record(result: ScenarioResult) -> bool:
+    records = [r for r in result.records if r.kind == "probe_must_demote"]
+    assert len(records) == 1
+    return records[0].passed
+
+
+def test_must_demote_passes_when_expired_row_scores_lower_in_current_view() -> None:
+    result = run_scenario(_demote_scenario(False))
+    assert _demote_record(result) is True
+
+
+def test_must_demote_fails_when_factor_is_inert_on_undated_memory() -> None:
+    result = run_scenario(_demote_scenario(True))
+    assert _demote_record(result) is False
