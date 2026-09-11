@@ -23,7 +23,15 @@ from typing import Any
 
 import httpx
 
-from .corpus import Expectation, Probe, Scenario, demotion_violations, load_scenarios
+from .corpus import (
+    Expectation,
+    Probe,
+    Scenario,
+    demotion_violations,
+    load_scenarios,
+    rank_pair_label,
+    ranking_violations,
+)
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8788"
 _REPLAY_MODEL = "infinitum-replay"
@@ -147,14 +155,19 @@ def _eval_probe(
         all_body = {"query": probe.query, "limit": 20, "temporal_view": "all"}
         all_response = client.post("/memory/search", json=all_body, headers=headers)
         all_response.raise_for_status()
-        violations = set(demotion_violations(probe.must_demote, items, all_response.json()))
+        failures = demotion_violations(probe.must_demote, items, all_response.json())
         for substring in probe.must_demote:
-            if substring in violations:
-                warner.warn(
-                    "probe_must_demote",
-                    substring,
-                    "not demoted: current-view score is not below the all-view score",
-                )
+            if substring in failures:
+                warner.warn("probe_must_demote", substring, failures[substring])
+    rank_failures = set(ranking_violations(probe.must_rank_below, items))
+    for pair in probe.must_rank_below:
+        label = rank_pair_label(pair)
+        if label in rank_failures:
+            warner.warn(
+                "probe_must_rank_below",
+                label,
+                "not ordered below its peer in the probed view",
+            )
 
 
 def _run_scenario(

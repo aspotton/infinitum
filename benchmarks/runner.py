@@ -22,7 +22,16 @@ from infinitum.app import create_app
 from infinitum.config import AppConfig
 from infinitum.database import Database
 
-from .corpus import Expectation, Probe, Scenario, ScenarioContext, Turn, demotion_violations
+from .corpus import (
+    Expectation,
+    Probe,
+    Scenario,
+    ScenarioContext,
+    Turn,
+    demotion_violations,
+    rank_pair_label,
+    ranking_violations,
+)
 
 _EXTRACTION_MARKER = "Extract durable memories"
 _POLL_SECONDS = 0.05
@@ -244,9 +253,13 @@ def _eval_probe(
         all_payload = {"query": probe.query, "limit": 20, "temporal_view": "all"}
         all_response = client.post("/memory/search", json=all_payload, headers=headers)
         all_response.raise_for_status()
-        violations = set(demotion_violations(probe.must_demote, items, all_response.json()))
+        failures = demotion_violations(probe.must_demote, items, all_response.json())
         for sub in probe.must_demote:
-            records.append(_rec("probe_must_demote", sub, sub not in violations))
+            records.append(_rec("probe_must_demote", sub, sub not in failures))
+    rank_failures = set(ranking_violations(probe.must_rank_below, items))
+    for pair in probe.must_rank_below:
+        label = rank_pair_label(pair)
+        records.append(_rec("probe_must_rank_below", label, label not in rank_failures))
     return records
 
 

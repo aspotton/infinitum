@@ -81,11 +81,18 @@ class Expectation(StrictModel):
     ignored: list[str] = Field(default_factory=list)
 
 
+class RankPair(StrictModel):
+    # `memory` must rank strictly below `below` by result-list position.
+    memory: str
+    below: str
+
+
 class Probe(StrictModel):
     query: str
     must_include: list[str] = Field(default_factory=list)
     must_not_include: list[str] = Field(default_factory=list)
     must_demote: list[str] = Field(default_factory=list)
+    must_rank_below: list[RankPair] = Field(default_factory=list)
     temporal_view: _TEMPORAL_VIEWS = "current"
     as_of: str | None = None
 
@@ -108,22 +115,59 @@ def demotion_violations(
     entries: list[str],
     probed_items: list[dict[str, Any]],
     all_view_items: list[dict[str, Any]],
-) -> list[str]:
+) -> dict[str, str]:
     """must_demote entries the two search result sets fail to prove demoted.
 
-    An entry passes only when the probed-view results contain a memory whose
-    content includes it AND the temporal_view="all" follow-up search scores
-    that same memory strictly higher. Scores are compared post-clamp
-    (min(1.0,...)), so a row pinned at 1.0 in both views cannot demonstrate
-    demotion - keep scenario fixtures below the clamp ceiling; unreachable
-    under default offline weights.
+    Maps each failing entry to a self-naming reason; an entry passes only when
+    the probed-view results contain a memory whose content includes it AND the
+    temporal_view="all" follow-up search scores that same memory strictly
+    higher. Scores are compared post-clamp (min(1.0,...)): a row pinned at 1.0
+    in both views fails with a ceiling-named reason instead of the misleading
+    strictly-higher failure, because no factor is observable there.
     """
-    violations: list[str] = []
+    violations: dict[str, str] = {}
     for entry in entries:
         probed = _scored_by_content(probed_items, entry)
         every = _scored_by_content(all_view_items, entry)
-        if probed is None or every is None or not every > probed:
-            violations.append(entry)
+        if probed is None or every is None:
+            violations[entry] = "not present in both search result sets"
+        elif not every > probed:
+            if probed >= 1.0 or every >= 1.0:
+                violations[entry] = (
+                    "at score ceiling 1.0 - post-clamp comparison cannot prove "
+                    "the factor; lower fixture scores"
+                )
+            else:
+                violations[entry] = "current-view score is not below the all-view score"
+    return violations
+
+
+def _position_by_content(items: list[dict[str, Any]], entry: str) -> int | None:
+    """Index of the first search result whose content contains ``entry``."""
+    for position, item in enumerate(items):
+        if entry in item["memory"]["content"]:
+            return position
+    return None
+
+
+def rank_pair_label(pair: RankPair) -> str:
+    return f"{pair.memory!r} below {pair.below!r}"
+
+
+def ranking_violations(pairs: list[RankPair], probed_items: list[dict[str, Any]]) -> list[str]:
+    """Labels of must_rank_below pairs the probed view fails to order.
+
+    Checked in the probed view only (no all-view follow-up): a pair passes only
+    when both entries are found and the first memory containing ``memory``
+    sits at a strictly later result-list position than the first containing
+    ``below``.
+    """
+    violations: list[str] = []
+    for pair in pairs:
+        first = _position_by_content(probed_items, pair.memory)
+        second = _position_by_content(probed_items, pair.below)
+        if first is None or second is None or not first > second:
+            violations.append(rank_pair_label(pair))
     return violations
 
 

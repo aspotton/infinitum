@@ -9,12 +9,15 @@ from benchmarks.corpus import (
     CandidateSpec,
     Expectation,
     Probe,
+    RankPair,
     Scenario,
     ScenarioContext,
     ScenarioError,
     Turn,
+    demotion_violations,
     load_scenario,
     load_scenarios,
+    ranking_violations,
 )
 
 VALID_YAML = """\
@@ -104,6 +107,7 @@ def test_defaults_when_omitted():
     assert candidate.supersedes_match is None
     probe = Probe(query="q", must_include=[], must_not_include=[])
     assert probe.must_demote == []
+    assert probe.must_rank_below == []
     assert probe.temporal_view == "current"
     assert probe.as_of is None
     assert ScenarioContext(project_id="p").user_id == "eval"
@@ -265,3 +269,57 @@ def test_unknown_probe_sibling_of_must_demote_still_rejected(tmp_path):
         load_scenario(path)
     assert "badsibling.yaml" in str(excinfo.value)
     assert "must_promote" in str(excinfo.value)
+
+
+def test_must_rank_below_parses_pairs_and_defaults_empty(tmp_path):
+    """Given probe.must_rank_below pairs, When loaded, Then RankPairs parse; absent means []."""
+    data = _valid_payload()
+    data["turns"][0]["probe"]["must_rank_below"] = [{"memory": "Memcached", "below": "Redis"}]
+    scenario = load_scenario(_mutate(data, "rank.yaml", str(tmp_path)))
+    assert scenario.turns[0].probe.must_rank_below == [
+        RankPair(memory="Memcached", below="Redis")
+    ]
+    plain = load_scenario(_write(str(tmp_path), "plain.yaml", VALID_YAML))
+    assert plain.turns[0].probe.must_rank_below == []
+
+
+def test_unknown_rank_pair_field_is_rejected(tmp_path):
+    """Given a RankPair with a typo'd 'higher' key, When loaded, Then ScenarioError names it."""
+    data = _valid_payload()
+    data["turns"][0]["probe"]["must_rank_below"] = [{"memory": "a", "higher": "b"}]
+    path = _mutate(data, "badpair.yaml", str(tmp_path))
+    with pytest.raises(ScenarioError) as excinfo:
+        load_scenario(path)
+    assert "badpair.yaml" in str(excinfo.value)
+    assert "higher" in str(excinfo.value)
+
+
+def test_must_rank_below_violations_are_position_based():
+    """Given probed results ordered Redis-then-Memcached, When checked, Then the
+    memory-below-below pair passes and the inverted/missing cases fail."""
+    items = [
+        {"memory": {"content": "Session storage runs on the Redis cluster"}, "score": 0.5},
+        {"memory": {"content": "Session storage ran on Memcached"}, "score": 0.3},
+    ]
+    assert ranking_violations([RankPair(memory="Memcached", below="Redis")], items) == []
+    inverted = [RankPair(memory="Redis", below="Memcached")]
+    violations = ranking_violations(inverted, items)
+    assert violations == ["'Redis' below 'Memcached'"]
+    missing = [RankPair(memory="Memcached", below="DynamoDB")]
+    assert ranking_violations(missing, items) == ["'Memcached' below 'DynamoDB'"]
+
+
+def test_demotion_ceiling_guard_names_the_clamp_condition():
+    """Given both views pinned at score 1.0, When checked, Then the violation
+    names the ceiling instead of the misleading strictly-higher failure."""
+    row = {"memory": {"content": "VaultPress held the encryption keys"}}
+    ceiling = demotion_violations(
+        ["VaultPress"], [{**row, "score": 1.0}], [{**row, "score": 1.0}]
+    )
+    assert "score ceiling 1.0" in ceiling["VaultPress"]
+    inert = demotion_violations(["VaultPress"], [{**row, "score": 0.3}], [{**row, "score": 0.3}])
+    assert "ceiling" not in inert["VaultPress"]
+    passed = demotion_violations(
+        ["VaultPress"], [{**row, "score": 0.21}], [{**row, "score": 0.3}]
+    )
+    assert passed == {}

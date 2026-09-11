@@ -376,3 +376,84 @@ def test_must_demote_passes_when_expired_row_scores_lower_in_current_view() -> N
 def test_must_demote_fails_when_factor_is_inert_on_undated_memory() -> None:
     result = run_scenario(_demote_scenario(True))
     assert _demote_record(result) is False
+
+
+def _rank_scenario(inverted: bool) -> Scenario:
+    """Turns 1-2 create one expired and one active session-store fact; turn 3
+    probes must_rank_below.
+
+    Asserting Memcached ranks below Redis must PASS: the expired row is
+    demoted into the active successor's shadow. Asserting the inverted order
+    (Redis below Memcached) must FAIL on the same data: position is checked
+    in the probed view, and the active row ranks first there.
+    """
+    pair = (
+        {"memory": "Redis", "below": "Memcached"}
+        if inverted
+        else {"memory": "Memcached", "below": "Redis"}
+    )
+    return Scenario.model_validate(
+        {
+            "name": "rank-check",
+            "description": "must_rank_below compares result-list positions",
+            "context": {"user_id": "eval", "project_id": "rank-check"},
+            "turns": [
+                {
+                    "user": "For the record, the legacy session store ran on Memcached.",
+                    "assistant": "Noted - the legacy session store ran on Memcached.",
+                    "learn": [
+                        {
+                            "operation": "new",
+                            "memory_type": "fact",
+                            "topic": "session store",
+                            "content": "The legacy session store ran on Memcached",
+                            "importance": 0.7,
+                            "confidence": 0.9,
+                            "valid_until": "2024-06-30",
+                        }
+                    ],
+                    "expect": {"created": ["Memcached"]},
+                },
+                {
+                    "user": "The session store runs on the Redis cluster now.",
+                    "assistant": "Noted - the session store runs on the Redis cluster.",
+                    "learn": [
+                        {
+                            "operation": "new",
+                            "memory_type": "fact",
+                            "topic": "session store",
+                            "content": "The session store runs on the Redis cluster",
+                            "importance": 0.7,
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "expect": {"created": ["Redis"]},
+                },
+                {
+                    "user": "What runs the session store today?",
+                    "assistant": "The Redis cluster does.",
+                    "learn": [],
+                    "probe": {
+                        "query": "session store",
+                        "must_rank_below": [pair],
+                    },
+                },
+            ],
+        }
+    )
+
+
+def _rank_record(result: ScenarioResult) -> bool:
+    records = [r for r in result.records if r.kind == "probe_must_rank_below"]
+    assert len(records) == 1
+    return records[0].passed
+
+
+def test_must_rank_below_passes_when_expired_sits_below_active_successor() -> None:
+    result = run_scenario(_rank_scenario(False))
+    assert _rank_record(result) is True
+
+
+def test_must_rank_below_fails_when_expectation_inverts_the_real_order() -> None:
+    result = run_scenario(_rank_scenario(True))
+    assert _rank_record(result) is False
