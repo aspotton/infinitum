@@ -402,6 +402,8 @@ AGENT_TASK(current)
 
 Never perform an unrestricted semantic search and filter unauthorized records afterward. Scope should be part of the physical/index query boundary where possible.
 
+Supersession eligibility follows the same boundary: an explicit correction may supersede only memories inside the request's eligible write scope. Retrieval from other scopes may inform ranking and context, but it must never silently rewrite another scope's derived state. The `subtle-supersession` corpus canary noted in the V0.2.0 provenance section is the standing test expectation this rule retires.
+
 ### 3.4 Automatic scope classification
 
 Extend extraction candidates with `scope`. The deterministic layer validates the choice using evidence:

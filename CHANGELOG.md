@@ -6,6 +6,7 @@ Changed:
 
 - The `"current"` temporal search view now demotes naturally-expired facts rather than hiding them: each expired row's score is multiplied by `EXPIRED_FACTOR = 0.70`, applied after the relevance gates, so a mis-dated static fact can still surface when nothing fresher matches while staying ranked below its active successor.
 - The injected-context retrieval path now compiles with the `"current"` view, so naturally-expired facts are de-prioritized in context blocks while remaining fully visible to drill-down memory tools and the learner, which still search with `"all"`.
+- Dev-only golden corpus: the temporal successor-ordering scenario's second turn is reworded into deliberately additive phrasing, because explicit-correction cues ("Update", "now") make live learning supersede the scenario's expired-but-active survivor and void its demotion probes; deterministic offline results are unchanged.
 
 ## 0.3.0
 
