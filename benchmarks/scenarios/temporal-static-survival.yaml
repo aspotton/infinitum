@@ -1,0 +1,28 @@
+name: temporal-static-survival
+description: >-
+  A durable preference the pipeline mis-dates (wrong valid_until in the past)
+  must still surface in the current view - demoted, not buried.
+context:
+  user_id: eval
+  project_id: temporal-static-survival
+turns:
+  - user: "Let's lock this in permanently: Python is the primary programming language for this project - we always write new services in Python."
+    assistant: "Understood - Python is and stays the project's primary programming language."
+    learn:
+      - operation: new
+        memory_type: preference
+        topic: language-choice
+        content: "The project's primary programming language is Python"
+        importance: 0.8
+        confidence: 0.9
+        valid_from: "2024-01-01"
+        valid_until: "2024-06-30"
+    expect:
+      created: ["The project's primary programming language is Python"]
+
+  - user: "What's a good way to organize unit tests for a FastAPI service?"
+    assistant: "Mirror the app structure under tests/, use httpx.ASGITransport with TestClient, and keep fixtures in local conftest files."
+    learn: []
+    probe:
+      query: "project primary programming language Python"
+      must_include: ["The project's primary programming language is Python"]
