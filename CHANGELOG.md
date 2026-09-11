@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+Changed:
+
+- The `"current"` temporal search view now demotes naturally-expired facts rather than hiding them: each expired row's score is multiplied by `EXPIRED_FACTOR = 0.70`, applied after the relevance gates, so a mis-dated static fact can still surface when nothing fresher matches while staying ranked below its active successor.
+- The injected-context retrieval path now compiles with the `"current"` view, so naturally-expired facts are de-prioritized in context blocks while remaining fully visible to drill-down memory tools and the learner, which still search with `"all"`.
+
 ## 0.3.0
 
 Added:

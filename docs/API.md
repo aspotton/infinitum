@@ -55,7 +55,7 @@ Optional temporal parameters:
 }
 ```
 
-`temporal_view` selects the validity window applied before scoring: `"current"` (default; rows whose `valid_until` is already past are dropped), `"all"` (no temporal filtering), or `"as_of"` (rows whose validity window covers `as_of`, an ISO date or datetime; a date-only value counts as 00:00:00 UTC that day). An `"as_of"` view without an `as_of` value, an unparseable `as_of`, or an unknown view string returns HTTP 400.
+`temporal_view` selects how temporal information is applied: `"current"` (default; rows whose `valid_until` is already past are kept and their scores demoted to 0.70×, applied after the relevance gates rather than excluding them, so mis-dated static facts stay recoverable via shadowing), `"all"` (no temporal weighting), or `"as_of"` (a hard pre-scoring window filter: rows whose validity window covers `as_of`, an ISO date or datetime; a date-only value counts as 00:00:00 UTC that day). An `"as_of"` view without an `as_of` value, an unparseable `as_of`, or an unknown view string returns HTTP 400.
 
 ### `GET /memory/{id}`
 

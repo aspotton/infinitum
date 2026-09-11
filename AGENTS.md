@@ -47,7 +47,7 @@ Primary code lives in `src/infinitum/`.
 - `config.py` — configuration models and loading
 - `database.py` — SQLite schema, persistence, durable jobs, provenance, `memory_observations`/`memory_observation_sources` evidence ledger, and additive temporal columns on `memories` (largest module)
 - `request_context.py` — user/project/CWD header resolution
-- `retrieval.py` — hybrid scoring and context affinity
+- `retrieval.py` — hybrid scoring, temporal demotion, context affinity
 - `compiler.py` — token-aware memory selection/rendering/injection
 - `learning.py` — extraction, reinforcement, supersession, incremental topic summaries, worker
 - `text.py` — shared scoring primitives: normalization, lexical/topic similarity, bounded phrase comparison (length-bound skip + 8192-char backstop), freshness decay (used by retrieval and reinforcement guards)
@@ -133,6 +133,8 @@ learning.py:LearningWorker._run → db.claim_job (jobs table, SQLite)
 Interrupted jobs self-heal two ways: `claim_job` adopts a stale `running` lock past a lease of `learning.timeout_seconds + 60s` (derived from config, no new config key), and `recover_interrupted_jobs` in `build_runtime` requeues interrupted jobs at startup. The startup call sits above the dirty-topic recovery, though the order is functionally neutral. Both paths assume a single process: the startup requeue presumes no other live instance is using the DB.
 
 Key symbols: `build_runtime` (runtime.py), `create_app` (app.py), `chat_completions` (routes/openai.py), `ContextCompiler.compile/inject` (compiler.py), `MemoryRetriever.search` (retrieval.py), `MemoryLearner.learn/_apply` (learning.py), `LearningWorker` (learning.py), durable job queue `enqueue_job/claim_job/finish_job/fail_job` (database.py).
+
+Temporal view wiring: the `current` view (used by `compiler.py` for injected context and by `POST /memory/search` via the `MemorySearchRequest` default) demotes naturally-expired active rows by `EXPIRED_FACTOR = 0.70` applied after the relevance gates rather than excluding them, while the learner (`learning.py`) and drill-down memory tools (`memory_tools.py`) keep the retriever's `"all"` default; the retriever's `superseded_by` score-factor tier is documented-unreachable because supersede always flips status off active, keeping the candidate set active-only.
 
 ## Release notes
 
