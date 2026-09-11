@@ -279,6 +279,82 @@ async def test_current_view_orders_active_before_equal_expired():
             await db.close()
 
 
+SUCCESSOR = (
+    "Our PostgreSQL backups run through a nightly pg_dump job writing compressed "
+    "archives to object storage."
+)
+EXPIRED_ORIGINAL = "The PostgreSQL database uses a nightly backup strategy."
+BACKUP_QUERY = "PostgreSQL backup strategy"
+
+
+@pytest.mark.asyncio
+async def test_current_view_ranks_reworded_successor_above_expired_original():
+    """Realistic successor-ordering pin (external review follow-up): the expired
+    row carries the query's exact vocabulary (the lexical ceiling of a mis-dated
+    supersession-survivor) while the active successor is reworded and more
+    specific, at identical importance/confidence. The raw all-view gap measures
+    ~1.14x, below the     ~1.43x inversion threshold, so the demotion factor must decide
+    the head-to-head. Seeded active-first: the expired row cannot win any
+    freshness tie-break. Non-vacuity: the expired row must be PRESENT in the
+    current view at exactly all-view x EXPIRED_FACTOR - retrieved and demoted,
+    not absent; the ORDER (not the ratio literal) is the pin, so a deeper
+    factor like 0.15 still passes here while a factor of 1.0 (no demotion)
+    flips it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db, embeddings, retriever = await _open(tmp)
+        try:
+            successor_id = await _seed(db, SUCCESSOR)
+            expired_id = await _seed(db, EXPIRED_ORIGINAL, valid_until="2020-01-01")
+            current = await retriever.search(BACKUP_QUERY, temporal_view="current")
+            current_ids = [item.memory.id for item in current]
+            current_scores = {item.memory.id: item.score for item in current}
+            all_scores = {
+                item.memory.id: item.score
+                for item in await retriever.search(BACKUP_QUERY)
+            }
+            assert expired_id in current_ids
+            assert current_ids.index(successor_id) < current_ids.index(expired_id)
+            assert current_scores[expired_id] == pytest.approx(
+                all_scores[expired_id] * retrieval_mod.EXPIRED_FACTOR
+            )
+        finally:
+            await embeddings.close()
+            await db.close()
+
+
+@pytest.mark.asyncio
+async def test_current_view_expired_outranks_low_stakes_reworded_successor():
+    """Trade-off pin: the same pair, but the successor is materially lower-stakes
+    (importance 0.4, confidence 0.5 vs 0.8/0.9). The raw gap widens past the
+    inversion threshold - raw_expired > raw_successor / EXPIRED_FACTOR ~= 1.43x -
+    so the demoted expired row outranks the successor in the current view. That
+    inversion IS the accepted current behavior; if a future factor, shadowing,
+    or rendering change flips this pin, update it deliberately. Spot-checked
+    against EXPIRED_FACTOR=0.15, where this pin flips (expired demoted too hard
+    for the low-stakes gap), proving the factor is load-bearing here."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db, embeddings, retriever = await _open(tmp)
+        try:
+            successor = await db.create_memory(
+                Memory(
+                    memory_type="fact",
+                    topic="database",
+                    content=SUCCESSOR,
+                    importance=0.4,
+                    confidence=0.5,
+                )
+            )
+            successor_id = successor.id
+            expired_id = await _seed(db, EXPIRED_ORIGINAL, valid_until="2020-01-01")
+            current = await retriever.search(BACKUP_QUERY, temporal_view="current")
+            current_ids = [item.memory.id for item in current]
+            assert expired_id in current_ids
+            assert current_ids.index(expired_id) < current_ids.index(successor_id)
+        finally:
+            await embeddings.close()
+            await db.close()
+
+
 @pytest.mark.asyncio
 async def test_as_of_view_before_inside_after_window():
     """as_of keeps rows where valid_from <= as_of and valid_until > as_of, with

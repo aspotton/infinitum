@@ -1,0 +1,90 @@
+Task 8 — successor-ordering follow-up (external review of soft-current temporal demotion)
+Branch: feat/temporal-demotion-soft-current (PR #33) | Date: 2026-09-11
+
+## Deliverable A — must_rank_below corpus probe
+- benchmarks/corpus.py: RankPair(StrictModel){memory, below}; Probe.must_rank_below:
+  list[RankPair] = Field(default_factory=list); rank_pair_label() + ranking_violations()
+  shared check (probed view ONLY, no all-view follow-up; position-based: first row
+  containing `memory` must sit at a strictly later result-list position than the first
+  containing `below`; missing either entry = violation).
+- benchmarks/runner.py: FAIL records kind="probe_must_rank_below" (mirrors must_demote).
+- benchmarks/replay.py: WARN lines, --strict exits non-zero.
+- Tests: tests/test_benchmarks_corpus.py (parse + default + nested strict rejection of
+  typo'd RankPair key + position-based pass/fail/missing-unit checks),
+  tests/test_benchmarks_runner.py (_rank_scenario False/True twin: PASS on real order;
+  FAIL via INVERTED expectation on identical data — provably-failing case, like the
+  existing inert-factor test), tests/test_replay.py (WARN + strict exit 1 + exactly ONE
+  POST with no temporal_view for a rank-only probe — machine contract for "probed view
+  only"; and pass-when-ordered).
+
+## Deliverable B — clamp-ceiling guard in demotion_violations
+- demotion_violations now returns dict[entry, self-naming reason]. Ceiling case:
+  "at score ceiling 1.0 - post-clamp comparison cannot prove the factor; lower fixture
+  scores" when a would-be violation has probed or all-view score >= 1.0, replacing the
+  misleading strictly-higher failure. Inert case keeps "current-view score is not below
+  the all-view score" (same string the replay WARN printed before, so existing replay
+  WARN assertions are untouched).
+- Test: test_demotion_ceiling_guard_names_the_clamp_condition (direct pure-function
+  seam — no monkeypatch needed; asserts ceiling wording fires at 1.0/1.0, generic
+  wording at 0.3/0.3, and 0.21<0.3 passes clean).
+
+## Deliverable C — ordering pins (tests/test_temporal_retrieval.py, zero src/ changes)
+Fixtures (shared strings with scenario D):
+  EXPIRED_ORIGINAL = "The PostgreSQL database uses a nightly backup strategy."
+  SUCCESSOR = "Our PostgreSQL backups run through a nightly pg_dump job writing compressed archives to object storage."
+  BACKUP_QUERY = "PostgreSQL backup strategy"
+MEASURED FIXTURE DIRECTION (scratch script, retriever directly, successor seeded
+ACTIVE-FIRST then expired; offline weights, embeddings off):
+  realistic (both 0.8/0.9):  all: succ=0.32231 exp=0.36682  raw ratio 1.1381
+                             current: succ=0.32231 > exp=0.25677 -> SUCCESSOR WINS (+0.0655)
+  trade-off (succ 0.4/0.5):  current: succ=0.22631 < exp=0.25677 -> EXPIRED WINS (+0.0305)
+                             all-view ratio 1.6209 (flip needs > 1/0.70 = 1.4286)
+  exp current == all * 0.70 exactly (0.25677 == 0.36682*0.70) — non-vacuity proven.
+- test_current_view_ranks_reworded_successor_above_expired_original: successor above
+  expired; asserts expired PRESENT and current == all * retrieval_mod.EXPIRED_FACTOR
+  (ORDER is the pin, not the ratio literal, so factor 0.15 keeps it green by design —
+  factor 1.0/no-demotion flips it).
+- test_current_view_expired_outranks_low_stakes_reworded_successor: low-stakes (0.4/0.5)
+  successor widens the raw gap past the ~1.43x inversion threshold; asserts the
+  inversion IS current behavior; docstring carries the threshold arithmetic +
+  "update this pin deliberately" guidance.
+NON-VACUITY SPOT-CHECK (sed EXPIRED_FACTOR 0.70 -> 0.15, then restored):
+  realistic pin: PASSED (deeper demotion only widens successor's lead)
+  trade-off pin: FAILED (expired demoted below the low-stakes successor) — factor is
+  load-bearing in both pins. `git diff src/` empty after restore.
+  Note: the first run right after editing the pin files showed one unexplained failure
+  that did not reproduce in 5x reruns + full-file runs (stale-bytecode race suspected);
+  final state deterministic green.
+
+## Deliverable D — adversarial scenario
+benchmarks/scenarios/temporal-successor-ordering.yaml: same strings/weights as the pins;
+turn 1 plants the exact-vocabulary fact with quoted mis-dates ("2024-01-01" /
+"2025-06-30", style copied from temporal-static-survival.yaml), turn 2 the reworded
+more-specific successor, turn 3 probes the OLD vocabulary:
+  must_demote: ["nightly backup strategy"]
+  must_rank_below: [{memory: "nightly backup strategy", below: "pg_dump"}]
+Direction was MEASURED before wiring (scratch measurement above; successor wins, raw
+gap 1.14x < 1.43x) — no inversion, so the assertions were wired, not inverted.
+First live run: PASS 6/6, exit 0. Description records the live-store probe fact:
+1587 active memories, 0 with valid_until (expired-ACTIVE rows exist only via
+mis-dating/manual edits).
+
+## Verification
+- .venv/bin/python -m pytest -q           -> 341 passed (330 baseline + 11 new)
+- .venv/bin/python -m benchmarks.run      -> 12/12 PASS, exit 0
+  (temporal-successor-ordering also parametrized into tests/test_eval_corpus.py gate:
+  new pytest id "temporal-successor-ordering")
+- git diff --name-only: exactly benchmarks/{corpus,runner,replay}.py,
+  benchmarks/scenarios/temporal-successor-ordering.yaml,
+  tests/{test_benchmarks_corpus,test_benchmarks_runner,test_replay,test_temporal_retrieval}.py
+- src/infinitum/ diff: EMPTY (both sed mutation probes restored).
+
+## Known limitations / recommendations
+- benchmarks/runner.py is now 271 pure LOC (was 270 pre-task, >250 since earlier todos);
+  the notepad-recommended split into benchmarks/probe_eval.py is out of this task's
+  file allowlist — recommend it as a follow-up.
+- tests/test_benchmarks_runner.py (384) and test_temporal_retrieval.py (388) are
+  large, consistent with existing test-file practice.
+- benchmarks/README.md probe-field prose not updated (outside task diff allowlist);
+  corpus.py remains the authoritative field list per the README's own pointer.
+- ruff not installed in .venv (unchanged baseline); pytest is the effective static gate.
