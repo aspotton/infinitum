@@ -2,8 +2,9 @@ name: temporal-validity
 description: >-
   A durable anchor fact plus a fact with an explicitly stated, clearly-past
   validity window. The memory row stays ACTIVE forever - expiry is purely
-  temporal - so an as_of probe inside the window must surface it while the
-  default-current probe must not, and the anchor keeps both probes honest.
+  temporal - so an as_of probe inside the window must surface it at full
+  strength, while the default-current probe must surface the expired fact
+  DEMOTED into the anchor's shadow, not hide it.
 context:
   user_id: eval
   project_id: temporal-validity
@@ -43,6 +44,6 @@ turns:
     assistant: "Use a dual-user switchover: add the new credential to the pool config, reload, then drop the old user."
     learn: []
     probe:
-      query: "analytics service database choice"
+      query: "analytics service database choice team offsite venue"
       must_include: ["Analytics service runs on PostgreSQL 16"]
-      must_not_include: ["Team offsite is held at the Lisbon office"]
+      must_demote: ["Team offsite is held at the Lisbon office"]

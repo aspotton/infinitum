@@ -44,6 +44,27 @@ def _temporal_bound(value: str | None, *, end_of_day: bool = False) -> datetime 
     return parsed
 
 
+# Demotion factor for naturally-expired rows under the "current" temporal view.
+# Decision record: 0.70 is the highest factor that reliably loses a
+# head-to-head against an equal-base active row while keeping a strong
+# mis-dated static fact visible; a deeper supersession-tier factor was
+# dropped as unreachable (supersede_memory sets status='superseded' and the
+# candidate set is active-only).
+EXPIRED_FACTOR = 0.70
+
+
+def validity_factor(valid_until: str | None, now: datetime) -> float:
+    """Multiplicative current-view demotion for naturally-expired rows.
+
+    Returns EXPIRED_FACTOR iff ``valid_until`` is a strictly-past bound under
+    the same end-of-day normalization the as_of filter uses, else 1.0 — a
+    bound exactly equal to ``now`` is not yet expired. Parsing is delegated
+    wholesale to ``_temporal_bound``, so odd ISO forms behave identically.
+    """
+    until = _temporal_bound(valid_until, end_of_day=True)
+    return EXPIRED_FACTOR if until is not None and until < now else 1.0
+
+
 def _is_high_authority(memory: Memory) -> bool:
     """High-authority persistent goals/decisions that survive wording mismatch."""
     return memory.memory_type in {"goal", "decision"} and memory.importance >= 0.85
@@ -65,23 +86,27 @@ class MemoryRetriever:
     ) -> list[ScoredMemory]:
         """Hybrid-scored search over active memories.
 
-        ``temporal_view`` filters ACTIVE candidate rows by their validity
-        bounds before scoring (eligibility before ranking, AGENTS.md
-        invariant 10); it never enters base_score or the relevance gate.
-        The default ``"all"`` skips the filter and is byte-identical to
-        pre-temporal behavior for every existing caller. ``"current"`` drops
-        rows whose ``valid_until`` is in the past; ``"as_of"`` keeps rows
-        covering the given ISO date/datetime (a date-only ``as_of`` counts as
-        00:00:00 UTC that day, so "as of today" agrees with the current view).
-        Rows with any non-active status (superseded, archived, contested) are
-        retrievable under NO view: the candidate set stays
-        ``list_active_memories``; supersession history is inspected via memory
-        detail, never retrieval.
+        ``temporal_view`` never enters base_score or the relevance gates. The
+        default ``"all"`` applies no temporal handling and is byte-identical
+        to pre-temporal behavior for every existing caller; the compiler will
+        compile with ``"current"``. ``"current"`` scores rows normally and,
+        AFTER the gates pass, multiplies naturally-expired ACTIVE rows
+        (``valid_until`` strictly in the past) by ``EXPIRED_FACTOR``: expired
+        rows are demoted into shadow of live ones, never hidden, so a strong
+        mis-dated fact can still surface while an equal active peer wins
+        head-to-head. ``"as_of"`` stays a hard eligibility filter applied
+        before scoring (eligibility before ranking, AGENTS.md invariant 10):
+        it keeps only rows whose validity window covers the given ISO
+        date/datetime (a date-only ``as_of`` counts as 00:00:00 UTC that day,
+        so "as of today" agrees with the current view). Rows with any
+        non-active status (superseded, archived, contested) are retrievable
+        under NO view: the candidate set stays ``list_active_memories``;
+        supersession history is inspected via memory detail, never retrieval.
 
         Limitation: a naturally expiring memory (``valid_until`` passing with
         no row write) does not move the session-block invalidation watermark,
         which is MAX(updated_at)-based (``Database.memory_state_watermark``,
-        database.py:577-592). A session-pinned compiled block can therefore
+        database.py:780). A session-pinned compiled block can therefore
         keep showing a naturally-expired fact until the next memory write
         bumps the watermark.
         """
@@ -125,19 +150,23 @@ class MemoryRetriever:
         )
         scored: list[ScoredMemory] = []
         for memory in active:
-            # Temporal eligibility filter, before scoring (pre-ranking
-            # eligibility, AGENTS.md invariant 10). Default "all" skips it.
-            if temporal_view == "current":
-                until = _temporal_bound(memory.valid_until, end_of_day=True)
-                if until is not None and until < now:
-                    continue
-            elif temporal_view == "as_of":
+            # Hard temporal eligibility filter, before scoring (pre-ranking
+            # eligibility, AGENTS.md invariant 10). Only "as_of" filters here;
+            # "current" demotes expired rows after the gates instead, and
+            # "all" skips temporal handling entirely. Default "all" is
+            # byte-identical to pre-temporal behavior.
+            if temporal_view == "as_of":
                 start = _temporal_bound(memory.valid_from)
                 until = _temporal_bound(memory.valid_until, end_of_day=True)
                 if (start is not None and start > as_of_dt) or (
                     until is not None and until <= as_of_dt
                 ):
                     continue
+            factor = (
+                validity_factor(memory.valid_until, now)
+                if temporal_view == "current"
+                else 1.0
+            )
             lexical = lexical_similarity(query, memory.content)
             if memory.id in fts_ids:
                 lexical = min(1.0, lexical + 0.15)
@@ -204,7 +233,7 @@ class MemoryRetriever:
                 + project_affinity * rcfg.project_affinity_bonus
                 + cwd_affinity * rcfg.cwd_affinity_bonus
             )
-            score = base_score + affinity_bonus
+            score = (base_score + affinity_bonus) * factor
 
             scored.append(
                 ScoredMemory(

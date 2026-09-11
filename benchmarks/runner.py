@@ -22,7 +22,16 @@ from infinitum.app import create_app
 from infinitum.config import AppConfig
 from infinitum.database import Database
 
-from .corpus import Expectation, Probe, Scenario, ScenarioContext, Turn
+from .corpus import (
+    Expectation,
+    Probe,
+    Scenario,
+    ScenarioContext,
+    Turn,
+    demotion_violations,
+    rank_pair_label,
+    ranking_violations,
+)
 
 _EXTRACTION_MARKER = "Extract durable memories"
 _POLL_SECONDS = 0.05
@@ -227,7 +236,8 @@ def _eval_probe(
             payload["as_of"] = probe.as_of
     response = client.post("/memory/search", json=payload, headers=headers)
     response.raise_for_status()
-    contents = [item["memory"]["content"] for item in response.json()]
+    items = response.json()
+    contents = [item["memory"]["content"] for item in items]
 
     def _rec(kind: str, sub: str, passed: bool) -> ExpectationRecord:
         return ExpectationRecord(turn_index, kind, sub, passed)
@@ -237,6 +247,19 @@ def _eval_probe(
         records.append(_rec("probe_must_include", sub, any(sub in c for c in contents)))
     for sub in probe.must_not_include:
         records.append(_rec("probe_must_not_include", sub, not any(sub in c for c in contents)))
+    if probe.must_demote:
+        # Same query through the same search path, all-view this time: only
+        # the follow-up score being strictly higher proves the demotion.
+        all_payload = {"query": probe.query, "limit": 20, "temporal_view": "all"}
+        all_response = client.post("/memory/search", json=all_payload, headers=headers)
+        all_response.raise_for_status()
+        failures = demotion_violations(probe.must_demote, items, all_response.json())
+        for sub in probe.must_demote:
+            records.append(_rec("probe_must_demote", sub, sub not in failures))
+    rank_failures = set(ranking_violations(probe.must_rank_below, items))
+    for pair in probe.must_rank_below:
+        label = rank_pair_label(pair)
+        records.append(_rec("probe_must_rank_below", label, label not in rank_failures))
     return records
 
 

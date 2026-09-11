@@ -3,8 +3,8 @@ description: >-
   A tool-result-derived fact (the §1.1 golden-corpus category): the user reports
   a benchmark tool's output together with the period it was valid for. The
   derived fact carries that stated validity period, so an as_of probe inside the
-  benchmark window surfaces it while the default-current probe hides it after
-  expiry.
+  benchmark window surfaces it at full strength, while the default-current probe
+  surfaces the expired fact DEMOTED rather than hiding it after expiry.
 context:
   user_id: eval
   project_id: temporal-tool-derived
@@ -33,4 +33,4 @@ turns:
     learn: []
     probe:
       query: "checkout API throughput requests per second"
-      must_not_include: ["Checkout API serves 320 requests per second on eu-central-1"]
+      must_demote: ["Checkout API serves 320 requests per second on eu-central-1"]

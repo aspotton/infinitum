@@ -23,7 +23,15 @@ from typing import Any
 
 import httpx
 
-from .corpus import Expectation, Probe, Scenario, load_scenarios
+from .corpus import (
+    Expectation,
+    Probe,
+    Scenario,
+    demotion_violations,
+    load_scenarios,
+    rank_pair_label,
+    ranking_violations,
+)
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8788"
 _REPLAY_MODEL = "infinitum-replay"
@@ -133,13 +141,33 @@ def _eval_probe(
             body["as_of"] = probe.as_of
     response = client.post("/memory/search", json=body, headers=headers)
     response.raise_for_status()
-    contents = [item["memory"]["content"] for item in response.json()]
+    items = response.json()
+    contents = [item["memory"]["content"] for item in items]
     for substring in probe.must_include:
         if not any(substring in content for content in contents):
             warner.warn("probe_must_include", substring, "not in search results")
     for substring in probe.must_not_include:
         if any(substring in content for content in contents):
             warner.warn("probe_must_not_include", substring, "found in search results")
+    if probe.must_demote:
+        # Control search: only the all-view score being strictly higher than
+        # the probed (current-view) score proves the temporal demotion.
+        all_body = {"query": probe.query, "limit": 20, "temporal_view": "all"}
+        all_response = client.post("/memory/search", json=all_body, headers=headers)
+        all_response.raise_for_status()
+        failures = demotion_violations(probe.must_demote, items, all_response.json())
+        for substring in probe.must_demote:
+            if substring in failures:
+                warner.warn("probe_must_demote", substring, failures[substring])
+    rank_failures = set(ranking_violations(probe.must_rank_below, items))
+    for pair in probe.must_rank_below:
+        label = rank_pair_label(pair)
+        if label in rank_failures:
+            warner.warn(
+                "probe_must_rank_below",
+                label,
+                "not ordered below its peer in the probed view",
+            )
 
 
 def _run_scenario(

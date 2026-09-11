@@ -194,7 +194,7 @@ Use these signals first for offline evaluation. Do not immediately create a self
 
 ### 1.3 Better temporal truth
 
-**Status: implemented at minimum depth.** Memories gained nullable `valid_from`/`valid_until`/`observed_at` columns; supersession now closes the superseded memory's `valid_until` at the moment of supersession (history closes without being rewritten); and retrieval plus `POST /memory/search` expose temporal views (`current`, `all`, `as_of`). No typed `supersedes`/`contradicts` edges were added; supersession chains are traversed via the existing `superseded_by` link. Known limitation: natural expiry (a `valid_until` date passing with no row write) never bumps `updated_at`, so session-pinned context blocks stay cached until the next memory write.
+**Status: implemented at minimum depth.** Memories gained nullable `valid_from`/`valid_until`/`observed_at` columns; supersession now closes the superseded memory's `valid_until` at the moment of supersession (history closes without being rewritten); and retrieval plus `POST /memory/search` expose temporal views (`current`, `all`, `as_of`). No typed `supersedes`/`contradicts` edges were added; supersession chains are traversed via the existing `superseded_by` link. Known limitation: natural expiry (a `valid_until` date passing with no row write) never bumps `updated_at`, so session-pinned context blocks stay cached until the next memory write. Update: the `current` view now demotes naturally-expired facts (score × `EXPIRED_FACTOR = 0.70`, applied after the relevance gates) rather than hiding them, and the context compiler compiles its injected block with the `current` view while the learner and drill-down tools keep using `all`.
 
 Add structured temporal metadata:
 
@@ -401,6 +401,8 @@ AGENT_TASK(current)
 ```
 
 Never perform an unrestricted semantic search and filter unauthorized records afterward. Scope should be part of the physical/index query boundary where possible.
+
+Supersession eligibility follows the same boundary: an explicit correction may supersede only memories inside the request's eligible write scope. Retrieval from other scopes may inform ranking and context, but it must never silently rewrite another scope's derived state. The `subtle-supersession` corpus canary noted in the V0.2.0 provenance section is the standing test expectation this rule retires.
 
 ### 3.4 Automatic scope classification
 

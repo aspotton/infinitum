@@ -18,7 +18,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from benchmarks.corpus import Expectation, Probe, Scenario, ScenarioContext, Turn
+from benchmarks.corpus import Expectation, Probe, RankPair, Scenario, ScenarioContext, Turn
 from benchmarks.replay import main as replay_main
 from benchmarks.replay import replay_scenarios
 from infinitum.app import create_app
@@ -200,3 +200,128 @@ def test_replay_cli_timeout_flag_builds_patient_client(monkeypatch: pytest.Monke
     assert captured[0]["timeout"] == httpx.Timeout(120.0, connect=5.0)
     assert replay_main(["--timeout", "7"]) == 0
     assert captured[1]["timeout"] == httpx.Timeout(7.0, connect=5.0)
+
+
+def _demote_scenario() -> Scenario:
+    """One-turn scenario whose probe asserts must_demote on an expired row."""
+
+    return Scenario(
+        name="replay-demote",
+        description="Probe asserts the current view demotes the expired audit row.",
+        context=ScenarioContext(user_id="eval", project_id="replay-demote"),
+        turns=[
+            Turn(
+                user="What ran the 2023 encryption audit?",
+                assistant="VaultPress ran it, valid through 2024-06-30.",
+                probe=Probe(query="2023 encryption audit", must_demote=["VaultPress"]),
+            )
+        ],
+    )
+
+
+def _demote_client(current: float, every: float, bodies: list[dict]) -> httpx.Client:
+    """Client whose /memory/search returns one row at a view-dependent score."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/memory/search":
+            return httpx.Response(200, json=[])
+        body = json.loads(request.content)
+        bodies.append(body)
+        score = every if body.get("temporal_view") == "all" else current
+        row = {"memory": {"content": "The 2023 encryption audit ran on VaultPress"}, "score": score}
+        return httpx.Response(200, json=[row])
+
+    return httpx.Client(base_url="http://instance", transport=httpx.MockTransport(handler))
+
+
+def test_replay_must_demote_posts_all_view_followup_and_warns_when_scores_equal() -> None:
+    """Inert factor (equal scores) => one WARN line and --strict exits 1."""
+    bodies: list[dict] = []
+    lines: list[str] = []
+    with _demote_client(0.3, 0.3, bodies) as client:
+        code = replay_scenarios(
+            [_demote_scenario()], client, strict=True, emit=lines.append
+        )
+    # First POST omits temporal_view (implicit current), second is the "all" follow-up.
+    assert [body.get("temporal_view") for body in bodies] == [None, "all"]
+    warns = [line for line in lines if line.startswith("WARN")]
+    assert len(warns) == 1, warns
+    assert "probe_must_demote" in warns[0] and "VaultPress" in warns[0]
+    assert code == 1
+
+
+def test_replay_must_demote_passes_when_all_view_scores_higher() -> None:
+    """X 0.70 demotion visible (all > current) => no WARN, exits 0 even strict."""
+    bodies: list[dict] = []
+    lines: list[str] = []
+    with _demote_client(0.21, 0.3, bodies) as client:
+        code = replay_scenarios(
+            [_demote_scenario()], client, strict=True, emit=lines.append
+        )
+    assert len(bodies) == 2
+    assert not [line for line in lines if line.startswith("WARN")]
+    assert code == 0
+
+
+def _rank_scenario() -> Scenario:
+    """One-turn scenario whose probe asserts Memcached ranks below Redis."""
+    return Scenario(
+        name="replay-rank",
+        description="Probe asserts result-list ordering in the probed view.",
+        context=ScenarioContext(user_id="eval", project_id="replay-rank"),
+        turns=[
+            Turn(
+                user="What runs the session store?",
+                assistant="Redis now; Memcached before that.",
+                probe=Probe(
+                    query="session store",
+                    must_rank_below=[RankPair(memory="Memcached", below="Redis")],
+                ),
+            )
+        ],
+    )
+
+
+def _rank_client(order: list[str], bodies: list[dict]) -> httpx.Client:
+    """Client whose /memory/search returns the given content order."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/memory/search":
+            return httpx.Response(200, json=[])
+        bodies.append(json.loads(request.content))
+        rows = [
+            {"memory": {"content": f"The session store ran on {name}"}, "score": 0.5 - i * 0.1}
+            for i, name in enumerate(order)
+        ]
+        return httpx.Response(200, json=rows)
+
+    return httpx.Client(base_url="http://instance", transport=httpx.MockTransport(handler))
+
+
+def test_replay_must_rank_below_warns_when_order_is_wrong_and_skips_followup() -> None:
+    """Memcached printed first => one WARN, strict exits 1, and NO all-view
+    follow-up: ordering is proven by the probed view alone."""
+    bodies: list[dict] = []
+    lines: list[str] = []
+    with _rank_client(["Memcached", "Redis"], bodies) as client:
+        code = replay_scenarios(
+            [_rank_scenario()], client, strict=True, emit=lines.append
+        )
+    assert len(bodies) == 1 and "temporal_view" not in bodies[0]
+    warns = [line for line in lines if line.startswith("WARN")]
+    assert len(warns) == 1, warns
+    assert "probe_must_rank_below" in warns[0]
+    assert code == 1
+
+
+def test_replay_must_rank_below_passes_when_ordered() -> None:
+    """Redis first, Memcached second => pair satisfied, no WARN, strict exits 0."""
+    bodies: list[dict] = []
+    lines: list[str] = []
+    with _rank_client(["Redis", "Memcached"], bodies) as client:
+        code = replay_scenarios(
+            [_rank_scenario()], client, strict=True, emit=lines.append
+        )
+    assert len(bodies) == 1
+    assert not [line for line in lines if line.startswith("WARN")]
+    assert code == 0

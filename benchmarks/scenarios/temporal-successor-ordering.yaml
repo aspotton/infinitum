@@ -1,0 +1,59 @@
+name: temporal-successor-ordering
+description: >-
+  Adversarial supersession-style pair built for realism, not convenience: turn 1
+  plants the old fact in the query's exact vocabulary with a mis-dated past
+  valid_until (a supersession-survivor - the only way expired-ACTIVE rows exist
+  today, since supersession itself flips status off active; the live-store probe
+  on the running instance found 1587 active memories and 0 carrying valid_until),
+  turn 2 states a reworded, more-specific companion fact in explicitly
+  continuity-preserving phrasing (cues are avoided for offline semantics; NOTE:
+  live learning still supersedes elaboration because the real model's verbose
+  assistant echo reads as a replacement, so the expired-but-ACTIVE premise is
+  graded by the offline runner only). The current-view
+  probe must show the successor ranked above the demoted survivor (must_demote
+  proves the survivor is retrieved-and-demoted, not absent; must_rank_below
+  proves the position). Raw all-view gap measures ~1.14x, under the ~1.43x
+  inversion threshold, so the 0.70 factor decides the head-to-head.
+context:
+  user_id: eval
+  project_id: temporal-successor-ordering
+turns:
+  - user: "For the record, the PostgreSQL database uses a nightly backup strategy - that's been the setup for a while."
+    assistant: "Noted - the PostgreSQL database uses a nightly backup strategy."
+    learn:
+      - operation: new
+        memory_type: fact
+        topic: database
+        content: "The PostgreSQL database uses a nightly backup strategy"
+        importance: 0.8
+        confidence: 0.9
+        valid_from: "2024-01-01"
+        valid_until: "2025-06-30"
+    expect:
+      created: ["nightly backup strategy"]
+
+  - user: "The nightly backup strategy is still the same, but with more specifics: the backup job is a nightly pg_dump run that writes compressed archives to object storage."
+    assistant: "Noted - the backup job is a nightly pg_dump run writing compressed archives to object storage."
+    learn:
+      - operation: new
+        memory_type: fact
+        topic: database
+        content: "Our PostgreSQL backups run through a nightly pg_dump job writing compressed archives to object storage"
+        importance: 0.8
+        confidence: 0.9
+    expect:
+      created: ["pg_dump"]
+
+  - user: "How do we back up PostgreSQL these days?"
+    assistant: "Through the nightly pg_dump job writing compressed archives to object storage."
+    learn: []
+    probe:
+      query: "PostgreSQL backup strategy"
+      must_include:
+        - "pg_dump"
+        - "nightly backup strategy"
+      # Measured direction (successor wins, ~1.14x raw gap): wire assertions.
+      must_demote: ["nightly backup strategy"]
+      must_rank_below:
+        - memory: "nightly backup strategy"
+          below: "pg_dump"
