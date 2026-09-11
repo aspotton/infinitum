@@ -44,7 +44,7 @@ def _temporal_bound(value: str | None, *, end_of_day: bool = False) -> datetime 
     return parsed
 
 
-# Demotion factor for naturally-expired rows under temporal_view="current".
+# Demotion factor for naturally-expired rows under the "current" temporal view.
 # Decision record: 0.70 is the highest factor that reliably loses a
 # head-to-head against an equal-base active row while keeping a strong
 # mis-dated static fact visible; a deeper supersession-tier factor was
