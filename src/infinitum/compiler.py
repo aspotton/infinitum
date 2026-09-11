@@ -135,6 +135,9 @@ class ContextCompiler:
         # writes only last_accessed_at while freshness scoring reads updated_at.
         # Embedding backfill mutates memory_embeddings only and does NOT move the
         # watermark; cached blocks refresh at the next memory/topic mutation.
+        # Natural expiry likewise moves no watermark (it is a valid_until pass,
+        # not a row write), so a cached block refreshes its current-view demotion
+        # only at the next memory write or cache miss.
         cache_key: tuple[str, str, str] | None = None
         watermark = ""
         if session_id is not None:
@@ -153,7 +156,9 @@ class ContextCompiler:
                 self._session_cache.move_to_end(cache_key)
                 return replace(cached_entry[1])
 
-        candidates = await self.retriever.search(query, request_context=request_context)
+        # Injected blocks are soft-current: naturally-expired facts enter the
+        # block demoted by the retriever's current-view factor, never hidden.
+        candidates = await self.retriever.search(query, request_context=request_context, temporal_view="current")
         selected: list[ScoredMemory] = []
         used_tokens = 0
 

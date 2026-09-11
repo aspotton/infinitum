@@ -1,4 +1,5 @@
 import tempfile
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -317,6 +318,83 @@ async def test_session_cache_evicts_oldest_beyond_capacity():
         assert len(compiler._session_cache) == 64
         assert ("s0", "", "") not in compiler._session_cache
         assert ("s64", "", "") in compiler._session_cache
+
+        await embeddings.close()
+        await db.close()
+
+
+def _yesterday() -> str:
+    return (datetime.now(UTC).date() - timedelta(days=1)).isoformat()
+
+
+@pytest.mark.asyncio
+async def test_current_view_orders_active_before_expired_in_compiled_block():
+    # Given: equal-weight memories in one topic with identical query relevance
+    # (mirror sentences differing only in one non-query token, so the
+    # compiler's near-duplicate dedup cannot fire) and identical
+    # type/importance/confidence. The ACTIVE row is seeded FIRST and the
+    # EXPIRED row (valid_until=yesterday) SECOND, so without the soft-current
+    # demotion the freshness drift ranks the expired row first deterministically.
+    with tempfile.TemporaryDirectory() as tmp:
+        db, embeddings, compiler = await _session_compiler(tmp)
+        active = await db.create_memory(
+            Memory(
+                memory_type="fact",
+                topic="database",
+                content="The PostgreSQL database runs on the primary host.",
+                importance=0.8,
+                confidence=0.9,
+            )
+        )
+        expired = await db.create_memory(
+            Memory(
+                memory_type="fact",
+                topic="database",
+                content="The PostgreSQL database runs on the replica host.",
+                importance=0.8,
+                confidence=0.9,
+                valid_until=_yesterday(),
+            )
+        )
+
+        # When: compiling the injected block for the probe query
+        compiled = await compiler.compile(_user("PostgreSQL database"))
+
+        # Then: both rows survive in the block — natural expiry demotes, never
+        # filters (the expired row could only drop on token budget, and here
+        # the budget is ample) — and the active row is ranked first.
+        ids = [item.memory.id for item in compiled.memories]
+        assert active.id in ids
+        assert expired.id in ids
+        assert ids.index(active.id) < ids.index(expired.id)
+        assert "replica host" in compiled.text
+
+        await embeddings.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_mis_dated_expired_memory_survives_in_compiled_block():
+    # Given: a lone strong static memory whose valid_until is far in the past
+    # (a mis-dated fact, not a superseded one)
+    with tempfile.TemporaryDirectory() as tmp:
+        db, embeddings, compiler = await _session_compiler(tmp)
+        await db.create_memory(
+            Memory(
+                memory_type="fact",
+                topic="database",
+                content="The PostgreSQL database used PgBouncer pooling.",
+                importance=0.8,
+                confidence=0.9,
+                valid_until="2020-01-01",
+            )
+        )
+
+        # When: compiling with nothing else in scope
+        compiled = await compiler.compile(_user("PostgreSQL database"))
+
+        # Then: the demoted row is still present — soft-current never hides.
+        assert "PgBouncer" in compiled.text
 
         await embeddings.close()
         await db.close()
