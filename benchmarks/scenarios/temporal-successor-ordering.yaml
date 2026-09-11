@@ -5,7 +5,9 @@ description: >-
   valid_until (a supersession-survivor - the only way expired-ACTIVE rows exist
   today, since supersession itself flips status off active; the live-store probe
   on the running instance found 1587 active memories and 0 carrying valid_until),
-  turn 2 states the reworded, more-specific active successor. The current-view
+  turn 2 states a reworded, more-specific companion fact in deliberately additive
+  phrasing (no supersession cues, or the live learner would supersede the survivor
+  instead of leaving it expired-but-active). The current-view
   probe must show the successor ranked above the demoted survivor (must_demote
   proves the survivor is retrieved-and-demoted, not absent; must_rank_below
   proves the position). Raw all-view gap measures ~1.14x, under the ~1.43x
@@ -28,8 +30,8 @@ turns:
     expect:
       created: ["nightly backup strategy"]
 
-  - user: "Update: our PostgreSQL backups now run through a nightly pg_dump job writing compressed archives to object storage."
-    assistant: "Noted - PostgreSQL backups go through the nightly pg_dump job to object storage now."
+  - user: "A bit more detail on our PostgreSQL setup: the backup job is a nightly pg_dump run that writes compressed archives to object storage."
+    assistant: "Noted - the backup job is a nightly pg_dump run writing compressed archives to object storage."
     learn:
       - operation: new
         memory_type: fact
