@@ -12,7 +12,8 @@ upstream:
 
 memory:
   enabled: true
-  database_path: ./infinitum.db
+  # Docker users pin this to /db/infinitum.db via INFINITUM_DATABASE_PATH.
+  database_path: ${INFINITUM_DATABASE_PATH:-./infinitum.db}
   retrieve_candidates: 50
   minimum_retrieval_score: 0.18
   # Eligibility gate: one semantic/lexical/topic signal must clear this before other terms qualify a memory.

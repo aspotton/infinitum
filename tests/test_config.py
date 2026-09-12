@@ -49,3 +49,26 @@ def test_stream_reasoning_defaults():
 def test_stream_reasoning_rejects_unknown_mode():
     with pytest.raises(ValidationError):
         AppConfig(memory={"stream_reasoning": "bogus"})
+
+
+def test_database_path_expands_from_env(monkeypatch):
+    # monkeypatch here is intentional; the direct os.environ mutation above is older style.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.yaml"
+        path.write_text(
+            "memory:\n  database_path: ${INFINITUM_DATABASE_PATH:-./infinitum.db}\n"
+        )
+        monkeypatch.setenv("INFINITUM_DATABASE_PATH", "/db/infinitum.db")
+        cfg = load_config(path)
+        assert cfg.memory.database_path == "/db/infinitum.db"
+
+
+def test_database_path_falls_back_when_env_unset(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.yaml"
+        path.write_text(
+            "memory:\n  database_path: ${INFINITUM_DATABASE_PATH:-./infinitum.db}\n"
+        )
+        monkeypatch.delenv("INFINITUM_DATABASE_PATH", raising=False)
+        cfg = load_config(path)
+        assert cfg.memory.database_path == "./infinitum.db"
