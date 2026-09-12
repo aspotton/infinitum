@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -33,6 +34,12 @@ _JSON_RE = re.compile(r"\{.*\}", re.S)
 # a job that hard-crashes the process would loop crash-requeue-crash every
 # lease. Upgrade path: one-line attempts check on the adoption path.
 STALE_LOCK_GRACE_SECONDS = 60.0
+
+STOP_GRACE_SECONDS = 5.0
+# Grace for worker shutdown before the worker task is cancelled. Deliberately
+# fixed (not derived from learning.timeout_seconds=600s default, which is the
+# latency we are bounding): a cancelled mid-job task self-heals via
+# recover_interrupted_jobs at startup and stale-lock adoption in claim_job.
 
 
 class MemoryLearner:
@@ -633,7 +640,12 @@ class LearningWorker:
     async def stop(self) -> None:
         self._stop.set()
         if self._task:
-            await self._task
+            try:
+                await asyncio.wait_for(self._task, timeout=STOP_GRACE_SECONDS)
+            except TimeoutError:
+                self._task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._task
             self._task = None
 
     async def _run(self) -> None:
