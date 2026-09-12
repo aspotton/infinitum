@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/infinitum_logo.png" width="200" alt="Infinitum logo">
+
 # Infinitum
 
 **Persistent memory and context for AI.**
