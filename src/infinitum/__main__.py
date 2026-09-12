@@ -25,12 +25,17 @@ def main() -> None:
     try:
         cfg = load_config(cfg_path)
     except FileNotFoundError:
-        raise SystemExit(f"infinitum: config file not found: {cfg_path} (see docs/CONFIGURATION.md)")
+        raise SystemExit(
+            f"infinitum: config file not found: {cfg_path} (see docs/CONFIGURATION.md)"
+        ) from None
     if cfg_path:
         os.environ["INFINITUM_CONFIG"] = cfg_path
     db_dir = Path(cfg.memory.database_path).parent
     if not os.access(db_dir, os.W_OK):
-        raise SystemExit(f"infinitum: database directory missing or not writable: {db_dir} (see docs/CONFIGURATION.md)")
+        raise SystemExit(
+            f"infinitum: database directory missing or not writable: {db_dir} "
+            "(see docs/CONFIGURATION.md)"
+        ) from None
     uvicorn.run("infinitum.app:create_app", factory=True, host=cfg.server.host, port=cfg.server.port, log_level=cfg.server.log_level)
 
 

@@ -25,7 +25,7 @@ jobs:
           if infinitum.__version__ != tag:
               sys.exit(f"version mismatch: package {infinitum.__version__} != tag {tag}")
           PY
-      - run: pytest -q
+      - run: python -m pytest -q
   images:
     needs: test
     runs-on: ubuntu-latest
