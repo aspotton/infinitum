@@ -438,7 +438,9 @@ class Database:
         session_id: str | None = None,
         user_id: str | None = None,
         project_id: str | None = None,
+        before: tuple[str, str] | None = None,
     ) -> list[Event]:
+        """List events newest-first; before=(created_at, id) keyset, ISO strings compared."""
         clauses: list[str] = []
         params: list[Any] = []
         if session_id:
@@ -450,10 +452,14 @@ class Database:
         if project_id:
             clauses.append("project_id=?")
             params.append(project_id)
+        if before is not None:
+            clauses.append("(created_at, id) < (?, ?)")
+            params.extend(before)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         rows = await self.fetchall(
-            f"SELECT * FROM events {where} ORDER BY created_at DESC LIMIT ?", tuple(params)
+            f"SELECT * FROM events {where} ORDER BY created_at DESC, id DESC LIMIT ?",
+            tuple(params),
         )
         return [self._row_to_event(r) for r in rows]
 
@@ -583,8 +589,13 @@ class Database:
         return await self._row_to_memory(row) if row else None
 
     async def list_memories(
-        self, limit: int = 100, status: str | None = None, topic: str | None = None
+        self,
+        limit: int = 100,
+        status: str | None = None,
+        topic: str | None = None,
+        before: tuple[str, str] | None = None,
     ) -> list[Memory]:
+        """Keyset page from a prior page's last row (updated_at, id); ISO row-value compare."""
         clauses: list[str] = []
         params: list[Any] = []
         if status:
@@ -593,10 +604,14 @@ class Database:
         if topic:
             clauses.append("topic=?")
             params.append(topic)
+        if before is not None:
+            clauses.append("(updated_at, id) < (?, ?)")
+            params.extend(before)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         rows = await self.fetchall(
-            f"SELECT * FROM memories {where} ORDER BY updated_at DESC LIMIT ?", tuple(params)
+            f"SELECT * FROM memories {where} ORDER BY updated_at DESC, id DESC LIMIT ?",
+            tuple(params),
         )
         return [await self._row_to_memory(r) for r in rows]
 
@@ -877,8 +892,21 @@ class Database:
             (summary.topic, summary.summary, summary.memory_count, _iso(summary.updated_at)),
         )
 
-    async def list_topics(self, limit: int = 100) -> list[TopicSummary]:
-        rows = await self.fetchall("SELECT * FROM topics ORDER BY updated_at DESC LIMIT ?", (limit,))
+    async def list_topics(
+        self, limit: int = 100, before: tuple[str, str] | None = None
+    ) -> list[TopicSummary]:
+        """Keyset page from a prior last row (updated_at, topic); topic is the tiebreaker."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if before is not None:
+            clauses.append("(updated_at, topic) < (?, ?)")
+            params.extend(before)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = await self.fetchall(
+            f"SELECT * FROM topics {where} ORDER BY updated_at DESC, topic DESC LIMIT ?",
+            tuple(params),
+        )
         return [
             TopicSummary(
                 topic=r["topic"],
