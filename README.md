@@ -24,7 +24,7 @@ Local AI doesn't have that. Worse, the moment you want to try a new tool or swit
 
 Infinitum moves the memory out of the service and into a runtime that sits in front of whatever you point it at. It learns from your interactions and improves the general intelligence of whatever tool or service you happen to want to use today. Bring your own model, bring your own agent framework, switch whenever you like — the memory keeps compounding. No memory exports, no tricks, no workarounds.
 
-Current release: **v0.3.0**.
+Current release: **v0.4.0**.
 
 Full release history lives in [CHANGELOG.md](CHANGELOG.md).
 
@@ -267,7 +267,7 @@ docker run -d --name infinitum --restart unless-stopped \
   -v ~/infinitum/config.yaml:/config/config.yaml:ro \
   -v ~/infinitum/db:/db \
   -e UPSTREAM_API_KEY=replace-me \
-  ghcr.io/aspotton/infinitum:vX.Y.Z
+  ghcr.io/aspotton/infinitum:v0.4.0
 ```
 
 Setup, verification, and upgrade/backup details: [docs/DOCKER.md](docs/DOCKER.md).
