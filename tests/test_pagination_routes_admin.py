@@ -8,7 +8,7 @@ model path is exercised. Seed BEFORE app construction; run requests inside
 import base64
 import sqlite3
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
@@ -22,7 +22,7 @@ _INSERT = "INSERT INTO events(id, session_id, event_type, created_at) VALUES (?,
 
 def _ts(i: int) -> str:
     """Unique minute-spaced ISO timestamp for seed row i."""
-    return (datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=i)).isoformat()
+    return (datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=i)).isoformat()
 
 
 async def _seed_events(path: str, count: int) -> set[str]:
@@ -60,7 +60,9 @@ def _cfg(path: str) -> AppConfig:
     return cfg
 
 
-def _walk(client, route: str, limit: int, extra: dict | None = None) -> tuple[list[int], list[dict]]:
+def _walk(
+    client, route: str, limit: int, extra: dict | None = None
+) -> tuple[list[int], list[dict]]:
     """Follow X-Next-Cursor until absent; return (page sizes, collected rows)."""
     sizes: list[int] = []
     rows_out: list[dict] = []
@@ -112,7 +114,7 @@ async def test_topics_walk():
     """250 identical-timestamp topics walk stably; tie order is topic DESC."""
     with tempfile.TemporaryDirectory() as tmp:
         path = f"{tmp}/topics_walk.db"
-        shared = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        shared = datetime(2026, 1, 1, tzinfo=UTC)
         seeded = await _seed_topics(path, 250, shared)
         with TestClient(create_app(_cfg(path))) as client:
             sizes, rows = _walk(client, "/topics", 100)

@@ -8,7 +8,7 @@ timestamps.
 from __future__ import annotations
 
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -17,7 +17,7 @@ from infinitum.models import Event, Memory, TopicSummary
 
 # Shared fixed instant for the identical-timestamp tests: all rows carry the
 # exact same stored string so only the id/topic tiebreaker can order them.
-_SAME = datetime(2026, 1, 1, tzinfo=timezone.utc)
+_SAME = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 def _stamp(i: int) -> str:
@@ -167,7 +167,7 @@ async def test_events_and_topics_keyset():
         await db.connect()
 
         evt_ids = set()
-        for i in range(3):
+        for _i in range(3):
             evt = await db.add_event(
                 Event(
                     session_id="s",

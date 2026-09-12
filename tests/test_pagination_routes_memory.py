@@ -8,7 +8,7 @@ lifespan sets app.state.runtime.
 import base64
 import sqlite3
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
@@ -25,7 +25,7 @@ _INSERT = (
 
 def _ts(i: int) -> str:
     """Unique minute-spaced ISO timestamp for seed row i."""
-    return (datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=i)).isoformat()
+    return (datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=i)).isoformat()
 
 
 async def _seed(path: str, count: int, status_at=lambda i: "active") -> set[str]:

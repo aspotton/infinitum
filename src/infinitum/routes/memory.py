@@ -24,7 +24,9 @@ async def list_memories(
 ):
     if offset is not None:
         raise HTTPException(
-            400, "offset pagination is not supported; use the cursor from the X-Next-Cursor response header"
+            400,
+            "offset pagination is not supported; use the cursor from the "
+            "X-Next-Cursor response header",
         )
     before = None
     if cursor is not None:
@@ -35,7 +37,9 @@ async def list_memories(
     items = await _runtime(request).db.list_memories(limit=limit + 1, status=status, before=before)
     if len(items) > limit:
         items = items[:limit]
-        response.headers["X-Next-Cursor"] = encode_cursor(items[-1].updated_at.isoformat(), items[-1].id)
+        response.headers["X-Next-Cursor"] = encode_cursor(
+            items[-1].updated_at.isoformat(), items[-1].id
+        )
     return items
 
 

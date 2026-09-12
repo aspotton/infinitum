@@ -8,10 +8,13 @@ from ..runtime import Runtime
 
 
 def _keyset(offset: int | None, cursor: str | None) -> tuple[str, str] | None:
-    """Resolve offset/cursor params to a keyset (sort_value, tiebreak) pair; 400 on offset or garbage."""
+    """Resolve offset/cursor params to a keyset (sort_value, tiebreak) pair;
+    400 on offset or garbage."""
     if offset is not None:
         raise HTTPException(
-            400, "offset pagination is not supported; use the cursor from the X-Next-Cursor response header"
+            400,
+            "offset pagination is not supported; use the cursor from the "
+            "X-Next-Cursor response header",
         )
     if cursor is None:
         return None
@@ -62,7 +65,9 @@ async def events(
     )
     if len(items) > limit:
         items = items[:limit]
-        response.headers["X-Next-Cursor"] = encode_cursor(items[-1].created_at.isoformat(), items[-1].id)
+        response.headers["X-Next-Cursor"] = encode_cursor(
+            items[-1].created_at.isoformat(), items[-1].id
+        )
     return items
 
 
@@ -85,5 +90,7 @@ async def topics(
     items = await _runtime(request).db.list_topics(limit=limit + 1, before=before)
     if len(items) > limit:
         items = items[:limit]
-        response.headers["X-Next-Cursor"] = encode_cursor(items[-1].updated_at.isoformat(), items[-1].topic)
+        response.headers["X-Next-Cursor"] = encode_cursor(
+            items[-1].updated_at.isoformat(), items[-1].topic
+        )
     return items
