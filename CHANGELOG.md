@@ -9,6 +9,10 @@ Changed:
 - Dev-only golden corpus: the temporal successor-ordering scenario's second turn is reworded into deliberately additive phrasing, because explicit-correction cues ("Update", "now") make live learning supersede the scenario's expired-but-active survivor and void its demotion probes; deterministic offline results are unchanged.
 - The temporal successor-ordering scenario's expired-but-active premise is graded by the offline runner only: live learning still supersedes an elaboration when the follow-up adds specificity, because the recorded reply's restatement reads as a replacement even with cue-free user wording, so live replay shows a superseded survivor by design.
 
+Fixed:
+
+- Graceful shutdown now cancels a wedged background learning job after a 5-second grace (`STOP_GRACE_SECONDS`), bounding Ctrl-C latency independently of learning.timeout_seconds (#24).
+
 ## 0.3.0
 
 Added:
