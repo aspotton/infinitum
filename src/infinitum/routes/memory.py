@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from ..models import Memory, MemoryCreateRequest, MemorySearchRequest
+from ..pagination import decode_cursor, encode_cursor
 from ..runtime import Runtime
 
 router = APIRouter(prefix="/memory", tags=["memory"])
@@ -13,8 +14,29 @@ def _runtime(request: Request) -> Runtime:
 
 
 @router.get("")
-async def list_memories(request: Request, limit: int = Query(100, ge=1, le=1000), status: str | None = None):
-    return await _runtime(request).db.list_memories(limit=limit, status=status)
+async def list_memories(
+    request: Request,
+    response: Response,
+    limit: int = Query(100, ge=1, le=1000),
+    status: str | None = None,
+    cursor: str | None = None,
+    offset: int | None = None,
+):
+    if offset is not None:
+        raise HTTPException(
+            400, "offset pagination is not supported; use the cursor from the X-Next-Cursor response header"
+        )
+    before = None
+    if cursor is not None:
+        try:
+            before = decode_cursor(cursor)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    items = await _runtime(request).db.list_memories(limit=limit + 1, status=status, before=before)
+    if len(items) > limit:
+        items = items[:limit]
+        response.headers["X-Next-Cursor"] = encode_cursor(items[-1].updated_at.isoformat(), items[-1].id)
+    return items
 
 
 @router.post("")
