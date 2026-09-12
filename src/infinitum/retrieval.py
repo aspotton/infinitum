@@ -125,6 +125,8 @@ class MemoryRetriever:
 
         result_limit = limit if limit is not None else self.config.memory.retrieve_candidates
         candidate_limit = max(result_limit, self.config.memory.retrieve_candidates)
+        # ponytail: hard 5000-memory scan cap per retrieval pass, silent above it;
+        # upgrade path: progressive/paginated retrieval (docs/ROADMAP.md). See docs/ARCHITECTURE.md.
         active = await self.db.list_active_memories(limit=5000)
         if not active:
             return []

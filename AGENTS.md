@@ -73,6 +73,7 @@ Use these canonical names in new code/docs:
 - `<infinitum_memory>...</infinitum_memory>`
 - `infinitum_memory_search` / `infinitum_memory_get` (read-only drill-down tool names, not headers; gated by `memory.tools_enabled`)
 - `x-infinitum-memory-tool-rejects` (debug-only response header; count of rejected or forward-stripped memory-tool calls)
+- `x-next-cursor` (response header on `GET /memory`, `GET /events`, `GET /topics`; opaque keyset pagination position, not a security token)
 
 A tool call whose name starts with `infinitum_` but was not exposed this request and is not client-defined is a hallucination: reject it server-side with an instructive tool result, never forward it to the client, and let the loop continue. On a mixed terminal round, where memory-namespace calls sit alongside client tool calls, non-client `infinitum_` calls are stripped from the forwarded response on both the stream and non-stream paths rather than forwarded, and are recorded as `memory.tool_call` events with `stripped: true` and never answered.
 

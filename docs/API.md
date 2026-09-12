@@ -77,6 +77,10 @@ Returns the user/project/CWD context resolved from the current request headers. 
 
 Lists generated multi-memory topic summaries.
 
+### Listing and pagination
+
+`GET /memory`, `GET /events`, and `GET /topics` paginate by cursor. Pass the `X-Next-Cursor` response-header value back as the `cursor` query parameter to fetch the next page; the cursor is an opaque, server-stateless position hint, not a security token. A present `X-Next-Cursor` header means more rows exist; its absence means the walk is done. Passing `offset` (any value, including `0`) returns HTTP 400 by design — the parameter used to be silently ignored, which re-served page 1 forever, and that was the old trap. Rows are ordered by `updated_at DESC` (events: `created_at DESC`) with an `id` tiebreaker (`topic` for topics), so page boundaries are stable across requests. Caveat: the walk is not a snapshot — if a row's sort timestamp changes mid-walk, that row can appear again in a later page or shift position; the walk is duplicate-stable for stable populations only.
+
 ## Per-request control headers
 
 Internal headers are stripped before forwarding upstream.
