@@ -257,6 +257,21 @@ or:
 INFINITUM_CONFIG=config.yaml uvicorn infinitum.app:app --host 0.0.0.0 --port 8788
 ```
 
+### Run with Docker
+
+```bash
+docker run -d --name infinitum --restart unless-stopped \
+  --user $(id -u):$(id -g) \
+  -p 8788:8788 \
+  --add-host=host.docker.internal:host-gateway \
+  -v ~/infinitum/config.yaml:/config/config.yaml:ro \
+  -v ~/infinitum/db:/db \
+  -e UPSTREAM_API_KEY=replace-me \
+  ghcr.io/aspotton/infinitum:vX.Y.Z
+```
+
+Setup, verification, and upgrade/backup details: [docs/DOCKER.md](docs/DOCKER.md).
+
 ## Configuration
 
 A minimal setup:

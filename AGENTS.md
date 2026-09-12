@@ -56,6 +56,8 @@ Primary code lives in `src/infinitum/`.
 - `upstream.py` — transparent OpenAI-compatible upstream transport
 - `models.py` — event/memory/request-context models
 
+Container packaging lives at the repo root: `Dockerfile` (multi-stage build, non-root, bind-mount state contract — nothing persisted in the image) and the operator setup guide in `docs/DOCKER.md`. Publishing a GitHub release triggers `.github/workflows/release.yml`, which runs the test suite then builds and pushes multi-arch images to GHCR.
+
 Dev-only evaluation code lives in `benchmarks/` (not an installed package; run everything from the repo root via `python -m benchmarks.run` / `python -m benchmarks.replay`; see `benchmarks/README.md`): a golden-scenario YAML corpus, a deterministic offline runner with a scripted extractor, extraction/retrieval precision-recall + token metrics, and live-replay against a running instance. For paraphrase-tolerant semantic grading of a **live** store against this corpus, use the `.opencode/skills/infinitum-eval` skill from an agent session in this repo.
 
 ## Public naming and compatibility

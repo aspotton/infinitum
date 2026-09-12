@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+Added:
+
+- Docker image for bind-mounted operation: all state (config file, database directory) lives as operator-owned files on the host, nothing in the image; setup guide in `docs/DOCKER.md`.
+- Multi-arch release images (linux/amd64 and linux/arm64) published to GHCR automatically when a GitHub release is published.
+- The CLI now exits with a single clear line instead of a traceback when the config file is missing or the database directory is missing or not writable.
+
 Changed:
 
 - `GET /memory`, `GET /events`, and `GET /topics` now paginate by cursor: pass the opaque `X-Next-Cursor` response-header value back as `?cursor` and the walk reaches every row exactly once, with the header's absence marking end-of-population. Response bodies are unchanged. (#11)
