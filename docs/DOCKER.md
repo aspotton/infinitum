@@ -8,7 +8,8 @@ re-run it, and the memory store is exactly where you left it.
 
 Release images are published automatically when a GitHub release is published:
 
-- `ghcr.io/aspotton/infinitum:vX.Y.Z` (the release tag), plus `latest` and `sha-<commit>`
+- `ghcr.io/aspotton/infinitum:latest` — the default tag, always the newest release
+- Pin a version: the only other published formats are a full release tag `v<MAJOR>.<MINOR>.<PATCH>` (e.g. `v1.2.3`) and a build tag `sha-<commit>`
 - Architectures: `linux/amd64` and `linux/arm64`
 
 ## 2. Host layout
@@ -66,7 +67,7 @@ docker run -d --name infinitum --restart unless-stopped \
   -v ~/infinitum/config.yaml:/config/config.yaml:ro \
   -v ~/infinitum/db:/db \
   -e UPSTREAM_API_KEY=replace-me \
-  ghcr.io/aspotton/infinitum:vX.Y.Z
+  ghcr.io/aspotton/infinitum:latest
 ```
 
 Why `--user $(id -u):$(id -g)`: the image's built-in uid (10001) would not be
@@ -118,9 +119,9 @@ errors) — fix it per the message; the runtime does not paraphrase those.
 
 ## 7. Upgrade / backup / rollback
 
-- **Upgrade**: `docker rm -f infinitum`, then re-run the canonical command with the new tag (same mounts). `--restart unless-stopped` also brings the container back after host reboots; the `docker rm -f` before an upgrade supersedes that.
+- **Upgrade**: `docker pull ghcr.io/aspotton/infinitum:latest` first — a plain `docker run` will not re-pull a cached `latest` — then `docker rm -f infinitum` and re-run the canonical command (same mounts). `--restart unless-stopped` also brings the container back after host reboots; the `docker rm -f` before an upgrade supersedes that.
 - **Backup**: stop the container, then cold-copy the database files: `cp ~/infinitum/db/infinitum.db* /backup/` (the glob includes the WAL files).
-- **Rollback**: re-run the previous tag. Database migrations are additive-only, so an older image reads a newer database unchanged.
+- **Rollback**: `latest` has no previous tag, so re-run with a previously published full release tag `v<MAJOR>.<MINOR>.<PATCH>` (e.g. `v1.2.3`). Database migrations are additive-only, so an older image reads a newer database unchanged.
 
 ## 8. Platform caveat
 
