@@ -29,6 +29,8 @@ Eligibility requires at least one genuine relevance signal (semantic, lexical, o
 
 Temporal handling is view-scoped on the same path. `as_of` stays a pre-scoring eligibility filter (a hard window evaluated against an explicit date). `current` is now a post-scoring demotion rather than an eligibility gate: rows whose `valid_until` is already past remain in the candidate set and their final score is multiplied by `EXPIRED_FACTOR = 0.70` after the relevance gates, so naturally-expired facts are shadowed rather than lost and mis-dated static facts stay recoverable. `all` applies no temporal weighting and remains the retrieval-side default for the learner and the drill-down memory tools. A memory with no temporal columns set is unbounded and always eligible; supersession closes the superseded memory's `valid_until` at the moment of supersession. Known limitation: natural expiry (a `valid_until` date passing with no row write) moves no `updated_at` watermark, so a session-pinned context block reflects the demotion only at the next memory write or cache miss.
 
+The retrieval scan itself is bounded: each retrieval pass reads at most 5000 active memories (`limit=5000`), a hard internal constant and not a configuration key. Corpora beyond that ceiling degrade silently today — memories past the scanned window are simply never scored. Progressive/paginated retrieval is roadmap work ([ROADMAP](./ROADMAP.md)).
+
 ## Server-side memory tool loop
 
 With `memory.tools_enabled` and an injected memory block, the request path may run a transparent tool loop before responding:

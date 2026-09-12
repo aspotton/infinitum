@@ -4,6 +4,9 @@
 
 Changed:
 
+- `GET /memory`, `GET /events`, and `GET /topics` now paginate by cursor: pass the opaque `X-Next-Cursor` response-header value back as `?cursor` and the walk reaches every row exactly once, with the header's absence marking end-of-population. Response bodies are unchanged. (#11)
+- The `offset` query parameter on those three listing endpoints now returns HTTP 400 instead of being silently ignored; ignored, it re-served page 1 forever, the duplication trap this replaces. (#11)
+- Listing order is now total: `updated_at DESC` (events: `created_at DESC`) plus an id/topic tiebreaker, so pages stay stable and disjoint across requests even when rows share a timestamp. (#11)
 - The `"current"` temporal search view now demotes naturally-expired facts rather than hiding them: each expired row's score is multiplied by `EXPIRED_FACTOR = 0.70`, applied after the relevance gates, so a mis-dated static fact can still surface when nothing fresher matches while staying ranked below its active successor.
 - The injected-context retrieval path now compiles with the `"current"` view, so naturally-expired facts are de-prioritized in context blocks while remaining fully visible to drill-down memory tools and the learner, which still search with `"all"`.
 - Dev-only golden corpus: the temporal successor-ordering scenario's second turn is reworded into deliberately additive phrasing, because explicit-correction cues ("Update", "now") make live learning supersede the scenario's expired-but-active survivor and void its demotion probes; deterministic offline results are unchanged.
