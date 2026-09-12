@@ -52,15 +52,16 @@ Edit **exactly** these four files — nothing else:
 2. `CHANGELOG.md` — rename the `## Unreleased` heading to `## X.Y.Z`. Bodies
    stay verbatim. Do **not** add a new empty Unreleased section; do not touch
    older sections.
-3. `README.md` — two lines: the `Current release: **vX.Y.Z**.` line, and the
-   image tag in the `Run with Docker` block → `ghcr.io/aspotton/infinitum:vX.Y.Z`.
+3. `README.md` — the `Current release: **vX.Y.Z**.` line.
 4. `docs/ARCHITECTURE.md` — the line-1 heading `# Infinitum vX.Y.Z Architecture`.
 
 **Note:** `.github/workflows/release.yml` is **not** an edit target — its
 `v{{version}}` pattern already publishes `vX.Y.Z` tags matching the docs, and
 the Constraints section forbids editing `.github/workflows/` during a release.
 
-Do **not** edit `docs/DOCKER.md` — it keeps the generic `vX.Y.Z` placeholder.
+Do **not** edit `docs/DOCKER.md` — it documents `latest` as the default tag
+plus the full-semver and `sha-<commit>` pin formats, so it needs no per-release
+change.
 
 Re-freeze the installed dist-info (the branding metadata test reads it and
 fails against a stale version otherwise), then verify and open the PR:

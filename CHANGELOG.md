@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+Changed:
+
+- Docker documentation now defaults to the `latest` image tag and documents how to pin a specific release tag.
+
 ## 0.4.0
 
 Added:

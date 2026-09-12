@@ -267,10 +267,10 @@ docker run -d --name infinitum --restart unless-stopped \
   -v ~/infinitum/config.yaml:/config/config.yaml:ro \
   -v ~/infinitum/db:/db \
   -e UPSTREAM_API_KEY=replace-me \
-  ghcr.io/aspotton/infinitum:v0.4.0
+  ghcr.io/aspotton/infinitum:latest
 ```
 
-Setup, verification, and upgrade/backup details: [docs/DOCKER.md](docs/DOCKER.md).
+Setup, verification, and upgrade/backup details: [docs/DOCKER.md](docs/DOCKER.md). To pin a specific version, replace `latest` with a full release tag (`v<MAJOR>.<MINOR>.<PATCH>`, e.g. `v1.2.3`).
 
 ## Configuration
 
