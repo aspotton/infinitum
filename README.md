@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/infinitum_logo.png" width="240" alt="Infinitum">
+<img src="assets/infinitum_logo.png" width="200" alt="Infinitum logo">
 
 # Infinitum
 
