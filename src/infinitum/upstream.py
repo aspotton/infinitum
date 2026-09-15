@@ -49,9 +49,12 @@ class UpstreamClient:
         }
         for key, value in incoming.items():
             lower = key.lower()
+            # Bare sub-session marker is identity-like; stripped like internal headers.
+            # The canonical x-infinitum-parent-session-id is caught by the prefix rule.
             if (
                 lower in _HOP_BY_HOP
                 or lower.startswith("x-infinitum-")
+                or lower == "x-parent-session-id"
                 or lower in consumed
             ):
                 continue
