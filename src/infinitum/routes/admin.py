@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from .. import __version__
 from ..pagination import decode_cursor, encode_cursor
 from ..runtime import Runtime
+from .openai import _parent_session_id
 
 
 def _keyset(offset: int | None, cursor: str | None) -> tuple[str, str] | None:
@@ -75,7 +76,11 @@ async def events(
 async def request_context(request: Request):
     """Inspect how the current request headers resolve without invoking a model."""
 
-    return _runtime(request).request_context.resolve(request.headers)
+    parent = _parent_session_id(request)
+    return _runtime(request).request_context.resolve(request.headers).model_dump() | {
+        "subsession": parent is not None,
+        "parent_session_id": parent,
+    }
 
 
 @router.get("/topics")
