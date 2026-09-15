@@ -79,9 +79,9 @@ V0.2.0 intentionally implements the **provenance and ranking half** of future sc
 
 ```python
 RequestContext(
-    user_id="adam",
+    user_id="example-user",
     project_id="infinitum",
-    cwd="/home/adam/infinitum",
+    cwd="/home/example/infinitum",
 )
 ```
 

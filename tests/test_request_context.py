@@ -21,24 +21,24 @@ def test_request_context_resolves_opencode_and_headroom_aliases():
 
     explicit = resolver.resolve(
         {
-            "X-OpenCode-User": "adam",
+            "X-OpenCode-User": "example-user",
             "X-OpenCode-Project": "memory-runtime",
-            "X-OpenCode-Directory": "/home/adam/src/memory-runtime/../memory-runtime",
+            "X-OpenCode-Directory": "/home/example/src/memory-runtime/../memory-runtime",
         }
     )
-    assert explicit.user_id == "adam"
+    assert explicit.user_id == "example-user"
     assert explicit.project_id == "memory-runtime"
-    assert explicit.cwd == "/home/adam/src/memory-runtime"
+    assert explicit.cwd == "/home/example/src/memory-runtime"
     assert explicit.project_derived_from_cwd is False
 
     derived = resolver.resolve(
         {
-            "x-headroom-user-id": "adam",
-            "x-headroom-cwd": "/home/adam/src/infinitum",
+            "x-headroom-user-id": "example-user",
+            "x-headroom-cwd": "/home/example/src/infinitum",
         }
     )
-    assert derived.user_id == "adam"
-    assert derived.project_id == project_id_from_cwd("/home/adam/src/infinitum")
+    assert derived.user_id == "example-user"
+    assert derived.project_id == project_id_from_cwd("/home/example/src/infinitum")
     assert derived.project_derived_from_cwd is True
 
 
@@ -70,7 +70,7 @@ async def test_retrieval_softly_boosts_same_project_without_filtering_global_mem
             event_a = await db.add_event(
                 Event(
                     session_id="s1",
-                    user_id="adam",
+                    user_id="example-user",
                     project_id="project-a",
                     cwd="/src/a",
                     event_type="message.user",
@@ -81,7 +81,7 @@ async def test_retrieval_softly_boosts_same_project_without_filtering_global_mem
             event_b = await db.add_event(
                 Event(
                     session_id="s2",
-                    user_id="adam",
+                    user_id="example-user",
                     project_id="project-b",
                     cwd="/src/b",
                     event_type="message.user",
@@ -114,7 +114,7 @@ async def test_retrieval_softly_boosts_same_project_without_filtering_global_mem
                 "Which database does the API use?",
                 limit=10,
                 request_context=RequestContext(
-                    user_id="adam", project_id="project-b", cwd="/src/b"
+                    user_id="example-user", project_id="project-b", cwd="/src/b"
                 ),
             )
             ids = [item.memory.id for item in results]
@@ -211,10 +211,12 @@ def test_api_persists_context_and_strips_consumed_headers_upstream(debug_header)
             response = client.post(
                 "/v1/chat/completions",
                 headers={
-                    "x-opencode-user": "adam",
+                    "x-opencode-user": "example-user",
                     "x-opencode-project": "infinitum",
-                    "x-opencode-directory": "/home/adam/infinitum",
+                    "x-opencode-directory": "/home/example/infinitum",
                     "x-session-id": "ses_from_opencode",
+                    "x-parent-session-id": "ses_parent_leak",
+                    "x-infinitum-parent-session-id": "ses_canonical_parent_leak",
                     debug_header: "true",
                 },
                 json={
@@ -223,21 +225,26 @@ def test_api_persists_context_and_strips_consumed_headers_upstream(debug_header)
                 },
             )
             assert response.status_code == 200
-            assert response.headers["x-infinitum-resolved-user-id"] == "adam"
+            assert response.headers["x-infinitum-resolved-user-id"] == "example-user"
             assert response.headers["x-infinitum-resolved-project-id"] == "infinitum"
             assert "x-opencode-user" not in captured_headers
             assert "x-opencode-project" not in captured_headers
             assert "x-opencode-directory" not in captured_headers
             assert debug_header not in captured_headers
+            # Sub-session markers are identity-like and never reach upstream: the
+            # bare alias via build_headers' equality rule, the canonical header
+            # via the x-infinitum- prefix rule (regardless of proxy consumption).
+            assert "x-parent-session-id" not in captured_headers
+            assert "x-infinitum-parent-session-id" not in captured_headers
 
             events = client.get(
-                "/events", params={"user_id": "adam", "project_id": "infinitum"}
+                "/events", params={"user_id": "example-user", "project_id": "infinitum"}
             ).json()
             assert len(events) >= 3
             assert all(event["session_id"] == "ses_from_opencode" for event in events)
-            assert all(event["user_id"] == "adam" for event in events)
+            assert all(event["user_id"] == "example-user" for event in events)
             assert all(event["project_id"] == "infinitum" for event in events)
-            assert all(event["cwd"] == "/home/adam/infinitum" for event in events)
+            assert all(event["cwd"] == "/home/example/infinitum" for event in events)
 
 
 def test_upstream_can_emit_canonical_headroom_headers():
@@ -246,9 +253,9 @@ def test_upstream_can_emit_canonical_headroom_headers():
     upstream = UpstreamClient(cfg)
     try:
         resolved = RequestContext(
-            user_id="adam",
+            user_id="example-user",
             project_id="project-a",
-            cwd="/home/adam/project-a",
+            cwd="/home/example/project-a",
         )
         headers = upstream.build_headers(
             {
@@ -257,9 +264,42 @@ def test_upstream_can_emit_canonical_headroom_headers():
             },
             resolved,
         )
-        assert headers["x-headroom-user-id"] == "adam"
+        assert headers["x-headroom-user-id"] == "example-user"
         assert headers["x-headroom-project-id"] == "project-a"
-        assert headers["x-headroom-cwd"] == "/home/adam/project-a"
+        assert headers["x-headroom-cwd"] == "/home/example/project-a"
     finally:
         # AsyncClient close is exercised in runtime tests; no event loop here.
         pass
+
+
+def test_request_context_diagnostic_reports_subsession_true():
+    """GET /request-context surfaces subsession=True when a parent marker is present."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = AppConfig()
+        cfg.memory.database_path = f"{tmp}/runtime.db"
+        cfg.learning.enabled = False
+        app = create_app(cfg)
+        with TestClient(app) as client:
+            response = client.get(
+                "/request-context",
+                headers={"x-parent-session-id": "ses_parent1"},
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["subsession"] is True
+            assert body["parent_session_id"] == "ses_parent1"
+
+
+def test_request_context_diagnostic_reports_subsession_false():
+    """GET /request-context surfaces subsession=False when no parent marker is present."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = AppConfig()
+        cfg.memory.database_path = f"{tmp}/runtime.db"
+        cfg.learning.enabled = False
+        app = create_app(cfg)
+        with TestClient(app) as client:
+            response = client.get("/request-context")
+            assert response.status_code == 200
+            body = response.json()
+            assert body["subsession"] is False
+            assert body["parent_session_id"] is None

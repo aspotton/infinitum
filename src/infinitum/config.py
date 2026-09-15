@@ -95,6 +95,10 @@ class EmbeddingConfig(BaseModel):
 
 class LearningConfig(BaseModel):
     enabled: bool = True
+    # When true, requests carrying a parent-session marker (sub-sessions like
+    # OpenCode task-tool children) do not enqueue learn_interaction; events and
+    # retrieval are unaffected. The X-Infinitum-Learning header outranks this.
+    skip_subsessions: bool = True
     model: str = ""
     base_url: str = ""
     api_key: str = ""

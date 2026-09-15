@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+Added:
+
+- Sub-session learning gate: requests carrying a parent-session marker (`X-Infinitum-Parent-Session-ID` or its bare `x-parent-session-id` alias) no longer enqueue `learn_interaction` jobs by default, so delegated sub-agent scaffolding stops diluting the memory store. Controlled by `learning.skip_subsessions` (default `true`); events and retrieval for those requests are unaffected.
+- Header precedence for that gate: explicit `X-Infinitum-Learning: off` beats explicit `on`, which beats the sub-session skip, which beats default learning; an unparseable header value counts as absent. The marker headers are stripped before upstream forwarding like the other runtime control headers.
+
 Changed:
 
 - Docker documentation now defaults to the `latest` image tag and documents how to pin a specific release tag.

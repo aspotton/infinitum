@@ -90,11 +90,23 @@ X-Infinitum-Memory: off
 X-Infinitum-Learning: off
 X-Infinitum-Session-ID: my-session-id
 # Also accepted: X-OpenCode-Session / X-Session-Id / X-Session-Affinity
-X-Infinitum-User-ID: adam
+X-Infinitum-User-ID: example-user
 X-Infinitum-Project-ID: infinitum
-X-Infinitum-CWD: /home/adam/infinitum
+X-Infinitum-CWD: /home/example/project
+X-Infinitum-Parent-Session-ID: parent-session-id
+# Also accepted: x-parent-session-id
 X-Infinitum-Debug: true
 ```
+
+`X-Infinitum-Learning` has three states:
+
+- `off` / `false` / `0`: never learn from this request, whatever the config says;
+- an explicit `on` / `true` / `1`: always learn from this request, outranking the sub-session skip below;
+- absent or an unparseable value: the config decides, via `learning.skip_subsessions` (see [CONFIGURATION](./CONFIGURATION.md)).
+
+A global `learning.enabled: false` outranks all of it. In every state the request is still recorded as events; the header governs only whether background learning runs afterward.
+
+`X-Infinitum-Parent-Session-ID` (bare alias: `x-parent-session-id`) marks the request as a sub-session of a parent session. When `learning.skip_subsessions` is on (the default), sub-session requests are recorded and receive memory retrieval and injection exactly like any other request, but they never trigger learning; an explicit `X-Infinitum-Learning: on` overrides this. Both header forms are stripped before upstream forwarding, like all internal headers. OpenCode sends the alias automatically for task-tool subagents in releases after 2026-08.
 
 `X-Infinitum-Debug: true` adds response metadata such as the number of detailed memories injected, token budget used, resolved user/project IDs, and whether project identity was derived from CWD. It intentionally does not return the full CWD in response headers.
 
