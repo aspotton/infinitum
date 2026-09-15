@@ -28,9 +28,9 @@ The annotated example in [`../config.example.yaml`](../config.example.yaml) writ
 V0.2.0 can associate an OpenAI request with a user/project/CWD while keeping the memory store globally visible. Prefer the canonical headers:
 
 ```text
-X-Infinitum-User-ID: adam
+X-Infinitum-User-ID: example-user
 X-Infinitum-Project-ID: infinitum
-X-Infinitum-CWD: /home/adam/infinitum
+X-Infinitum-CWD: /home/example/infinitum
 ```
 
 An explicit project ID is preferred. If it is omitted but CWD is supplied, the runtime normalizes the path and derives a stable local key such as `cwd:infinitum:<hash>`. The full CWD is stored separately for provenance.
@@ -206,6 +206,93 @@ drains; any new foreground request restarts the window.
 
 The mechanism internals are covered in [ARCHITECTURE.md](./ARCHITECTURE.md#deferring-learning-under-upstream-contention).
 
+## Skipping learning for sub-sessions
+
+Some clients spawn child agent sessions (e.g. OpenCode's task tool) that send a
+parent-session marker — `X-Infinitum-Parent-Session-ID`, or the bare
+`x-parent-session-id` alias — alongside the request. By default these
+sub-sessions do not enqueue `learn_interaction` jobs, so delegated work does not
+dilute learning with second-hand context:
+
+```yaml
+learning:
+  skip_subsessions: true  # default
+```
+
+Events and retrieval are unaffected: sub-session requests are still recorded in
+full and still receive injected memory. An explicit `X-Infinitum-Learning: on`
+header outranks the skip; `off` outranks everything. Set
+`skip_subsessions: false` to learn from sub-sessions like any other request.
+
+### Sub-agent and harness integration
+
+The general contract is harness-side and works with any client that supports
+per-model or per-route provider options: point synthetic and sub-worker
+traffic at a provider entry that sends `X-Infinitum-Learning: off`. Infinitum
+additionally auto-skips requests that carry the parent-session marker when
+`skip_subsessions` is true, so a harness whose sub-sessions self-report a
+parent session needs no extra configuration at all. The full precedence is:
+explicit `off` beats explicit `on`, which beats the sub-session skip, which
+beats default learning. Unparseable header values count as absent.
+
+OpenCode is one worked example of that contract; the same shape applies to any
+client with per-model provider options:
+
+```jsonc
+{
+  "provider": {
+    // Learning-enabled entry for interactive sessions.
+    "infinitum": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://localhost:8788/v1" },
+      "models": { "your-model": {} }
+    },
+    // Same baseURL, learning pinned off, for synthetic traffic.
+    "infinitum-no-learn": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://localhost:8788/v1",
+        "headers": { "x-infinitum-learning": "off" }
+      },
+      "models": { "your-model": {} }
+    }
+  },
+  // Route internal (title, summary, compaction) calls at the no-learn entry.
+  "small_model": "infinitum-no-learn/your-model",
+  "agent": {
+    // An agent's own model wins over small_model, so a stale pin here
+    // keeps that internal call on the learning entry. Override them all.
+    "title": { "model": "infinitum-no-learn/your-model" },
+    "summary": { "model": "infinitum-no-learn/your-model" },
+    "compaction": { "model": "infinitum-no-learn/your-model" },
+    // Delegate subagents the same way; .md agent files use the same
+    // model: frontmatter key.
+    "your-subagent": { "model": "infinitum-no-learn/your-model" }
+  }
+}
+```
+
+Note the version caveat: OpenCode's automatic parent-session marker ships in
+releases after 2026-08. Older builds send sub-sessions without the marker, so
+the no-learn provider entries above are what keep those harnesses quiet.
+
+Verify this on your build rather than trusting the config alone: trigger a
+compaction, then confirm the synthetic summary prompt shows up in
+`GET /events` as a `message.user` event with **no** matching
+`learn_interaction` job. Whether a given build's compaction call sites honor
+the model pins is build-dependent, so check the events, not the config. As a
+generic fallback, a harness can simply send the `X-Infinitum-Learning: off`
+header itself on synthetic calls; some OpenCode builds also expose an
+undocumented plugin hook keyed on agent name that can attach headers, if your
+version has it.
+
+Any OpenAI SDK client can do the same in two lines:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8788/v1", default_headers={"X-Infinitum-Learning": "off"})
+```
+
 ## Incremental topic-summary controls
 
 V0.1.2+ no longer regenerates a topic summary from up to 100 topic memories after every learned interaction. Changed memory IDs are persisted as dirty topic state, and one debounced background job updates the existing summary.
@@ -255,7 +342,7 @@ upstream:
   passthrough_authorization: true
 
 memory:
-  database_path: /home/adam/infinitum.db
+  database_path: /home/example/infinitum.db
   minimum_retrieval_score: 0.30
   minimum_relevance_score: 0.08
   inject_max_memories: 6

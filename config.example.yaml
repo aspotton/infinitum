@@ -86,6 +86,10 @@ learning:
   # idle this long; any new foreground request restarts the window. 0 disables
   # the grace period. Requires skip_when_upstream_busy: true.
   upstream_idle_grace_seconds: 0.0
+  # When true (default), requests carrying a sub-session marker
+  # (X-Infinitum-Parent-Session-ID or x-parent-session-id) skip learning;
+  # events/retrieval are unaffected and X-Infinitum-Learning outranks this.
+  skip_subsessions: true
 
   # Topic summaries are incremental in v0.2.x (introduced in v0.1.2). Memory changes are accumulated
   # and summarized once after a quiet period, or sooner after enough changes.
