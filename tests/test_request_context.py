@@ -215,6 +215,8 @@ def test_api_persists_context_and_strips_consumed_headers_upstream(debug_header)
                     "x-opencode-project": "infinitum",
                     "x-opencode-directory": "/home/example/infinitum",
                     "x-session-id": "ses_from_opencode",
+                    "x-parent-session-id": "ses_parent_leak",
+                    "x-infinitum-parent-session-id": "ses_canonical_parent_leak",
                     debug_header: "true",
                 },
                 json={
@@ -229,6 +231,11 @@ def test_api_persists_context_and_strips_consumed_headers_upstream(debug_header)
             assert "x-opencode-project" not in captured_headers
             assert "x-opencode-directory" not in captured_headers
             assert debug_header not in captured_headers
+            # Sub-session markers are identity-like and never reach upstream: the
+            # bare alias via build_headers' equality rule, the canonical header
+            # via the x-infinitum- prefix rule (regardless of proxy consumption).
+            assert "x-parent-session-id" not in captured_headers
+            assert "x-infinitum-parent-session-id" not in captured_headers
 
             events = client.get(
                 "/events", params={"user_id": "example-user", "project_id": "infinitum"}
