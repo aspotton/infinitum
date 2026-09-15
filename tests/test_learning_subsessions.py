@@ -170,3 +170,41 @@ async def test_unparseable_learning_header_treated_as_absent():
         finally:
             await rt.upstream.client.aclose()
             await rt.db.close()
+
+
+async def test_streaming_subsession_skips_learning():
+    # (g) streaming + parent marker + default config: no learn job. Drain to
+    # [DONE] first; completed() (the enqueue site) runs after the last byte.
+    def sse_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                b'data: {"choices":[{"delta":{"content":"hi"},"index":0}]}\n\n'
+                b"data: [DONE]\n\n"
+            ),
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        app, rt = await _proxy_app(tmp)
+        rt.upstream.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(sse_handler)
+        )
+        try:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://infinitum.test"
+            ) as client:
+                async with client.stream(
+                    "POST",
+                    "/v1/chat/completions",
+                    json={**CHAT_BODY, "stream": True},
+                    headers={"x-parent-session-id": "ses-parent-1"},
+                ) as resp:
+                    assert resp.status_code == 200
+                    body = b"".join([chunk async for chunk in resp.aiter_bytes()])
+                    assert b"[DONE]" in body
+            assert _job_count(rt.config.memory.database_path) == 0
+        finally:
+            await rt.upstream.client.aclose()
+            await rt.db.close()
