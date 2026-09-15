@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
@@ -18,6 +19,8 @@ from ..text import first_text_content
 from ..upstream import extract_nonstream_assistant, extract_stream_assistant
 
 router = APIRouter()
+
+log = logging.getLogger(__name__)
 
 
 def _runtime(request: Request) -> Runtime:
@@ -47,6 +50,27 @@ def _session_id(request: Request, body: dict[str, Any]) -> str | None:
     if isinstance(metadata, dict):
         if metadata.get("infinitum_session_id"):
             return str(metadata["infinitum_session_id"])
+    return None
+
+
+def _parent_session_id(request: Request) -> str | None:
+    """Return the parent-session marker, or None when this is not a sub-session.
+
+    OpenCode's task-tool child sessions send the bare ``x-parent-session-id``
+    alias; the canonical ``x-infinitum-parent-session-id`` takes precedence.
+    Values are stripped before the truthy check (same handling as
+    request_context._first_header) so a whitespace-only marker is not a
+    sub-session marker.
+    """
+    for name in (
+        "x-infinitum-parent-session-id",
+        "x-parent-session-id",
+    ):
+        header = request.headers.get(name)
+        if header:
+            value = header.strip()
+            if value:
+                return value
     return None
 
 
@@ -467,6 +491,8 @@ async def chat_completions(request: Request) -> Response:
     request_context = runtime.request_context.resolve(request.headers)
     request_id = new_id("req")
     user_text = strip_memory_block(_latest_user(original_messages))
+    parent_session_id = _parent_session_id(request)
+    subsession = parent_session_id is not None
 
     await runtime.db.add_request(
         request_id, session_id, user_text, model, context=request_context
@@ -484,6 +510,8 @@ async def chat_completions(request: Request) -> Response:
                 "model": model,
                 "stream": bool(body.get("stream")),
                 "request_context": request_context.compact(),
+                "subsession": subsession,
+                **({"parent_session_id": parent_session_id} if parent_session_id else {}),
             },
         )
     )
@@ -506,9 +534,27 @@ async def chat_completions(request: Request) -> Response:
     memory_enabled = control_header("x-infinitum-memory", "on").lower() not in {
         "off", "false", "0"
     }
-    learning_enabled = control_header("x-infinitum-learning", "on").lower() not in {
-        "off", "false", "0"
-    }
+    # Learning precedence: explicit off > explicit on > config-conditioned
+    # sub-session skip > default-learn. An unparseable header value is absent.
+    raw_learning = request.headers.get("x-infinitum-learning")
+    lowered_learning = raw_learning.strip().lower() if raw_learning else ""
+    learning_off = lowered_learning in {"off", "false", "0"}
+    learning_on = lowered_learning in {"on", "true", "1"}
+    learning_enabled = (not learning_off) and (
+        learning_on or not (runtime.config.learning.skip_subsessions and subsession)
+    )
+    if (
+        not learning_off
+        and not learning_on
+        and subsession
+        and runtime.config.learning.skip_subsessions
+        and runtime.config.learning.enabled
+    ):
+        log.info(
+            "skipping learning request_id=%s (subsession parent=%s)",
+            request_id,
+            parent_session_id,
+        )
     debug = control_header("x-infinitum-debug", "false").lower() in {"on", "true", "1"}
 
     # Hallucination-guard state, computed once per request BEFORE any def
