@@ -727,7 +727,21 @@ class Database:
         reinforcement_metadata: dict[str, Any] | None = None,
         evidence_type: str = "user_assertion",
         session_id: str | None = None,
+        content: str | None = None,
     ) -> Memory | None:
+        """Reinforce an existing memory, optionally refining its wording.
+
+        Refine semantics (issue #34): passing ``content`` replaces the stored
+        wording in place; the memory id, observation chain, and validity window
+        are preserved. A replayed refine (all source events already attached)
+        converges content ONLY — no confidence/importance merge, no observation
+        row, no ``last_reinforcement`` metadata write: crash-replay convergence,
+        not double-counting. The content-only path still bumps ``updated_at``
+        and thus advances the memory-state watermark — the normal "a memory was
+        written" semantic the session-pin cache already relies on, not a new
+        mechanism. Leaving ``content`` None keeps this byte-identical to a plain
+        reinforcement.
+        """
         memory = await self.get_memory(memory_id)
         if not memory:
             return None
@@ -749,6 +763,16 @@ class Database:
             session_id=session_id,
         )
         if source_event_ids and not new_source_ids:
+            if content is not None and content != memory.content:
+                # Replayed refine: converge the wording ONLY. No count bump, no
+                # confidence/importance merge, no observation row (the
+                # fingerprint call above inserted zero).
+                await self.execute(
+                    "UPDATE memories SET content=?, updated_at=? WHERE id=?",
+                    (content, _iso(utc_now()), memory_id),
+                )
+                await self._refresh_fts_memory(memory_id)
+                return await self.get_memory(memory_id)
             return memory
 
         # Increment gate: observation_count == 1 (creation) + the number of
@@ -765,10 +789,17 @@ class Database:
                 **reinforcement_metadata,
                 "at": _iso(utc_now()),
             }
+        # Refine in place on the same row: id, observation chain, and validity
+        # window untouched. Without a genuine wording change this is exactly the
+        # prior reinforcement UPDATE.
+        refine = content is not None and content != memory.content
         await self.execute(
-            "UPDATE memories SET observation_count=?, confidence=?, importance=?, "
+            "UPDATE memories SET "
+            + ("content=?, " if refine else "")
+            + "observation_count=?, confidence=?, importance=?, "
             "metadata_json=?, updated_at=? WHERE id=?",
             (
+                *([content] if refine else []),
                 count,
                 new_conf,
                 new_importance,
