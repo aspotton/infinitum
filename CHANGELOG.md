@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1
+
+Changed:
+
+- The learn payload may include a capped rendering of the current turn's `role: "tool"` results (1200 characters per message, 4000 characters total, whole entries only), and the extraction prompt gains a matching `TOOL RESULTS` section when present, so delegated sub-agent outcomes are learned once from the parent session instead of being lost to the sub-session gate. Tool-less requests keep byte-identical payloads and extraction prompts; sub-agent session traffic itself remains gated off by `learning.skip_subsessions`.
+
 ## 0.5.0
 
 Added:
