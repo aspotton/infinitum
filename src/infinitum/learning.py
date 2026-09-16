@@ -120,6 +120,7 @@ or facts the user marks as temporary or today-only.
 Prefer concise current-state facts, decisions, preferences, goals, procedures, lessons, or episodic events.
 If the user explicitly corrects or replaces an existing memory, set operation_hint='supersede', explicit_correction=true, list only relevant existing memory IDs, and copy that memory's memory_type and topic exactly.
 If this merely confirms an existing memory, use operation_hint='reinforce', set reinforces_memory_id to that existing memory ID, and copy that memory's memory_type and topic exactly.
+If the user merely adds detail to an existing memory without contradicting or changing it, keep operation_hint='reinforce' (never 'supersede') with the more specific content and set reinforces_memory_id; reserve 'supersede' for explicit contradictions or replacements.
 The request context below is provenance/affinity metadata. Use it only to disambiguate nearby memories; do not save the user ID, project ID, or CWD as a memory unless the interaction explicitly discusses them.
 {temporal_hint}
 
@@ -349,6 +350,22 @@ Schema:
             if reinforced is not None:
                 return {best.memory.id}
 
+        # Refine pre-check (issue #34): an unmarked supersede proposal naming one
+        # compatible, lexically-related target refines that memory in place
+        # instead of superseding it. This is NOT the reinforcement gate — the
+        # _reinforcement_reason exclusion below is untouched and invariant 4
+        # holds for it; this route is gated by the extractor's named target +
+        # explicit_correction=False + deterministic type/topic/similarity
+        # checks. Candidate valid_from/valid_until are intentionally ignored:
+        # the target keeps its own validity window. Any decline falls through
+        # to the create + supersede path unchanged.
+        if candidate.operation_hint == "supersede":
+            refined_ids = await self._refine_supersede(
+                candidate, source_ids, allowed_ids, request_context
+            )
+            if refined_ids is not None:
+                return refined_ids
+
         new_memory = Memory(
             memory_type=candidate.memory_type,
             topic=candidate.topic,
@@ -398,6 +415,79 @@ Schema:
                 else:
                     log.debug("supersede skipped: similarity %.3f below floor", lexical)
         return affected
+
+    async def _refine_supersede(
+        self,
+        candidate: MemoryCandidate,
+        source_ids: list[str],
+        allowed_ids: set[str],
+        request_context: RequestContext | None = None,
+    ) -> set[str] | None:
+        """Refine an unmarked single-target supersede proposal in place (issue #34).
+
+        An elaboration that names exactly one shown, active, same type/topic
+        target and stays above the supersede similarity floor is applied as a
+        refine: the target keeps its id, observation chain, and validity window
+        while its content converges to the newer wording. Every gate here is
+        deterministic; the LLM only names the target. Returns the refined id
+        set, or None to decline so the caller falls through to the create +
+        supersede path unchanged.
+        """
+
+        if candidate.explicit_correction or len(candidate.supersedes_memory_ids) != 1:
+            return None
+        old_id = candidate.supersedes_memory_ids[0]
+        if old_id not in allowed_ids:
+            log.debug("refine declined: id %s not in shown memory set", old_id)
+            return None
+        old = await self.db.get_memory(old_id)
+        if not old or old.status != "active":
+            log.debug(
+                "refine declined: id %s not active (%s)",
+                old_id,
+                "missing" if not old else old.status,
+            )
+            return None
+        if old.topic != candidate.topic or old.memory_type != candidate.memory_type:
+            log.debug(
+                "refine declined: id %s type/topic mismatch (%s/%s)",
+                old_id,
+                old.memory_type,
+                old.topic,
+            )
+            return None
+        sim = lexical_similarity(old.content, candidate.content)
+        if sim < self.config.memory.supersede_similarity_floor:
+            log.debug("refine declined: similarity %.3f below floor", sim)
+            return None
+
+        refined = await self.db.reinforce_memory(
+            old.id,
+            confidence=candidate.confidence,
+            importance=candidate.importance,
+            source_event_ids=source_ids,
+            # The learner's evidence is the user's own statements.
+            evidence_type="user_assertion",
+            content=candidate.content,
+            reinforcement_metadata={
+                "method": "refine",
+                "operation_hint": candidate.operation_hint,
+                "lexical_similarity": round(sim, 4),
+                "request_context": request_context.compact() if request_context else {},
+            },
+        )
+        if refined is None:
+            return None
+        vector = await self.embeddings.embed(refined.content)
+        if vector is not None:
+            await self.db.set_embedding(refined.id, self.config.embeddings.model, vector)
+        log.info(
+            "refined memory %s from unmarked supersede proposal (lexical=%.3f, sources=%d)",
+            refined.id,
+            sim,
+            len(source_ids),
+        )
+        return {refined.id}
 
     def _reinforcement_reason(self, candidate: MemoryCandidate, best: Any) -> str | None:
         """Return the deterministic reason a candidate may reinforce a memory.
