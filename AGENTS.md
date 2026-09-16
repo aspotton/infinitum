@@ -93,6 +93,7 @@ Schema changes must be additive/migratable and must preserve immutable events an
 Per interaction, the learner should see the current interaction plus a bounded nearby-memory set, not the entire corpus.
 
 - Echoed `<infinitum_memory>` regions must be stripped from recorded user/assistant text, learn-job payloads, and `memory.tool_call` metadata; `request.received` stays byte-exact as received, by design (events are truth; message text is derived).
+- Learn payloads may include a capped rendering of the current turn's `role: "tool"` results (1200 characters per message, 4000 total) so delegated outcomes are learned once in the parent session; sub-agent session traffic remains gated off by `learning.skip_subsessions`.
 
 For candidate mutation:
 

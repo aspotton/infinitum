@@ -15,7 +15,7 @@ from .. import memory_tools
 from ..compiler import strip_memory_block
 from ..models import Event, RequestContext, new_id
 from ..runtime import Runtime
-from ..text import first_text_content
+from ..text import compact_whitespace, first_text_content
 from ..upstream import extract_nonstream_assistant, extract_stream_assistant
 
 router = APIRouter()
@@ -79,6 +79,60 @@ def _latest_user(messages: list[dict[str, Any]]) -> str:
         if msg.get("role") == "user":
             return first_text_content(msg.get("content"))
     return ""
+
+
+TOOL_RESULT_PER_MESSAGE_MAX_CHARS = 1200
+TOOL_RESULTS_TOTAL_MAX_CHARS = 4000
+
+
+def _tool_results(messages: list[dict[str, Any]]) -> str:
+    """Return a capped rendering of current-turn tool results for the learn payload.
+
+    The window is the ``role:"tool"`` messages after the last ``role:"user"``
+    message (current turn only); when the request carries no user message the
+    window is the whole list. Each entry renders as ``[name] content`` where
+    the name is resolved from the entry's ``tool_call_id`` against all
+    assistant ``tool_calls`` in the window (fallback literal ``tool``), and the
+    content passes through first_text_content, strip_memory_block and
+    compact_whitespace. Each whole entry (prefix plus `` [truncated]`` marker
+    included) stays under TOOL_RESULT_PER_MESSAGE_MAX_CHARS; entries are joined
+    with newlines in message order and kept whole while the running total
+    stays under TOOL_RESULTS_TOTAL_MAX_CHARS - the first entry that would not
+    fit ends the harvest. Returns "" when the window holds no tool messages.
+    """
+    start = 0
+    for index, msg in enumerate(messages):
+        if msg.get("role") == "user":
+            start = index + 1
+    window = messages[start:]
+    names: dict[str, str] = {}
+    for msg in window:
+        if msg.get("role") == "assistant":
+            for call in msg.get("tool_calls") or []:
+                call_id = call.get("id")
+                name = (call.get("function") or {}).get("name")
+                if call_id and name:
+                    names[str(call_id)] = str(name)
+    entries: list[str] = []
+    total = 0
+    for msg in window:
+        if msg.get("role") != "tool":
+            continue
+        name = names.get(str(msg.get("tool_call_id")), "tool")
+        content = compact_whitespace(
+            strip_memory_block(first_text_content(msg.get("content")))
+        )
+        prefix = f"[{name}] "
+        entry = prefix + content
+        if len(entry) > TOOL_RESULT_PER_MESSAGE_MAX_CHARS:
+            keep = TOOL_RESULT_PER_MESSAGE_MAX_CHARS - len(prefix) - len(" [truncated]")
+            entry = prefix + content[: max(keep, 0)] + " [truncated]"
+        joined_len = total + (1 if entries else 0) + len(entry)
+        if entries and joined_len > TOOL_RESULTS_TOTAL_MAX_CHARS:
+            break
+        entries.append(entry)
+        total = joined_len
+    return "\n".join(entries)
 
 
 def _response_headers(upstream: httpx.Response, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -444,6 +498,7 @@ async def _record_completion(
     model: str,
     learning_enabled: bool,
     request_context: RequestContext,
+    tool_results: str = "",
 ) -> None:
     assistant_text = strip_memory_block(assistant_text)
     assistant_event = Event(
@@ -459,18 +514,18 @@ async def _record_completion(
     )
     await runtime.db.add_event(assistant_event)
     if learning_enabled and runtime.config.learning.enabled:
-        await runtime.db.enqueue_job(
-            "learn_interaction",
-            {
-                "request_id": request_id,
-                "session_id": session_id,
-                "model": model,
-                "user_text": user_text,
-                "assistant_text": assistant_text,
-                "source_event_ids": [user_event_id, assistant_event.id],
-                "request_context": request_context.model_dump(),
-            },
-        )
+        payload: dict[str, Any] = {
+            "request_id": request_id,
+            "session_id": session_id,
+            "model": model,
+            "user_text": user_text,
+            "assistant_text": assistant_text,
+            "source_event_ids": [user_event_id, assistant_event.id],
+            "request_context": request_context.model_dump(),
+        }
+        if tool_results:
+            payload["tool_results"] = tool_results
+        await runtime.db.enqueue_job("learn_interaction", payload)
 
 
 @router.post("/v1/chat/completions")
@@ -491,6 +546,7 @@ async def chat_completions(request: Request) -> Response:
     request_context = runtime.request_context.resolve(request.headers)
     request_id = new_id("req")
     user_text = strip_memory_block(_latest_user(original_messages))
+    tool_text = _tool_results(original_messages)
     parent_session_id = _parent_session_id(request)
     subsession = parent_session_id is not None
 
@@ -646,6 +702,7 @@ async def chat_completions(request: Request) -> Response:
                 model=model,
                 learning_enabled=learning_enabled and stream_complete,
                 request_context=request_context,
+                tool_results=tool_text,
             )
 
         async def _record_forward_stripped(stripped: list[dict[str, Any]]) -> None:
@@ -1175,6 +1232,7 @@ async def chat_completions(request: Request) -> Response:
                     model=model,
                     learning_enabled=learning_enabled,
                     request_context=request_context,
+                    tool_results=tool_text,
                 )
                 break
 
