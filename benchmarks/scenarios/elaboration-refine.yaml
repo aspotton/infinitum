@@ -1,0 +1,43 @@
+name: elaboration-refine
+description: >-
+  Elaboration must refine the existing memory, never supersede it (issue #34):
+  turn 2 proposes a supersede with explicit_correction=false against the shown
+  turn-1 memory; the deterministic learner converts it to a content-preserving
+  reinforcement of the SAME row (observation chain grows, status stays active).
+context:
+  user_id: eval
+  project_id: elaboration-refine
+turns:
+  - user: "For the record, the PostgreSQL database uses a nightly backup strategy."
+    assistant: "Noted - the PostgreSQL database uses a nightly backup strategy."
+    learn:
+      - operation: new
+        memory_type: fact
+        topic: database
+        content: "The PostgreSQL database uses a nightly backup strategy"
+        importance: 0.8
+        confidence: 0.9
+    expect:
+      created: ["nightly backup strategy"]
+  - user: "The nightly backup strategy is still the same, just with more specifics: it runs pg_dump nightly and writes compressed archives to object storage."
+    assistant: "Noted - the strategy is unchanged, with the specifics recorded."
+    learn:
+      - operation: supersede
+        memory_type: fact
+        topic: database
+        content: "The PostgreSQL database uses a nightly backup strategy: a nightly pg_dump job writing compressed archives to object storage"
+        importance: 0.8
+        confidence: 0.9
+        explicit_correction: false
+        supersedes_match: "nightly backup strategy"
+    expect:
+      reinforced: ["pg_dump"]
+      superseded: []
+  - user: "How do we back up PostgreSQL these days?"
+    assistant: "Through the nightly pg_dump job writing compressed archives to object storage."
+    learn: []
+    probe:
+      query: "PostgreSQL backup strategy"
+      must_include:
+        - "pg_dump"
+        - "nightly backup strategy"

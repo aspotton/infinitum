@@ -33,6 +33,7 @@ turns:
         importance: 0.7
         confidence: 0.85
         supersedes_match: "Session store uses Redis"
+        explicit_correction: true
     expect:
       created: ["DynamoDB tables after the capacity review"]
       superseded: ["Session store uses Redis"]

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+Changed:
+
+- Background learning now refines instead of replaces when an elaboration is misread as a replacement (issue #34). An unmarked supersede proposal (`explicit_correction: false`) that names exactly one shown, active, same type/topic target with lexical similarity at or above `memory.supersede_similarity_floor` is applied as a content-preserving reinforcement of that target: same memory id, growing observation chain, untouched validity window, zero rows superseded. Every declined case falls through to the prior create-plus-supersede path unchanged, and explicit corrections keep their existing supersede behavior. The extraction prompt gains a matching rule: adding detail without contradicting an existing memory proposes an unmarked supersede naming that memory, so the deterministic refine route fires and the detail is applied in place. A new dev-only golden corpus scenario locks the route in, and the refinement primitive is idempotent under replay: a reprocessed job converges the memory's content without inflating `observation_count` or writing extra observation rows.
+- Offline corpus contract note: the `subtle-supersession` scenario's scripted replacement turn now marks itself an explicit correction, because under the issue #34 routing an unmarked supersede proposal against a related, compatible memory would refine it in place instead of superseding it, which the scenario's supersession probes would then fail.
+
 ## 0.5.1
 
 Changed:

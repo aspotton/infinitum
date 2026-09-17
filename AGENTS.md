@@ -103,7 +103,8 @@ For candidate mutation:
 - near-identical lexical matches may reinforce deterministically;
 - high semantic similarity may reinforce when embeddings are available;
 - learner-proposed `reinforces_memory_id` is advisory and must pass deterministic guards;
-- retries/replays of the same source events must not inflate `observation_count`.
+- retries/replays of the same source events must not inflate `observation_count`;
+- an unmarked supersede proposal (explicit_correction=false) naming a single shown, active, same-type/topic target at or above `memory.supersede_similarity_floor` resolves to a refine: the target is reinforced with the candidate's content (same id, observation chain, and validity window), not superseded; explicit corrections keep the correction/supersede behavior above unchanged (issue #34).
 
 Topic summaries are incremental: dirty topic deltas are coalesced, then an existing summary is updated from a bounded set of changed memories plus a small context sample. Do not regress to resending an entire large topic after every interaction.
 

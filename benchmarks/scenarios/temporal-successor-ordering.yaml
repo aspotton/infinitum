@@ -7,9 +7,9 @@ description: >-
   on the running instance found 1587 active memories and 0 carrying valid_until),
   turn 2 states a reworded, more-specific companion fact in explicitly
   continuity-preserving phrasing (cues are avoided for offline semantics; NOTE:
-  live learning still supersedes elaboration because the real model's verbose
-  assistant echo reads as a replacement, so the expired-but-ACTIVE premise is
-  graded by the offline runner only). The current-view
+  live learning refines elaborations (issue #34 fix), which rewrites the
+  survivor's content and can move its probe substrings, so the demotion probes
+  stay graded by the offline runner only). The current-view
   probe must show the successor ranked above the demoted survivor (must_demote
   proves the survivor is retrieved-and-demoted, not absent; must_rank_below
   proves the position). Raw all-view gap measures ~1.14x, under the ~1.43x

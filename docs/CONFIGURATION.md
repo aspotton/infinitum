@@ -332,6 +332,8 @@ memory:
   reinforce_hint_min_semantic: 0.72
 ```
 
+The `memory.supersede_similarity_floor` knob (default `0.30`), which already gates implicit supersede similarity, also gates refine routing: an unmarked supersede proposal naming a single shown, active, same type/topic target refines that memory in place only when lexical similarity sits at or above this floor (issue #34).
+
 ## Sample setup that works for me
 
 The primary maintainer runs a local Qwen model on an NVIDIA DGX Spark, with Infinitum pointing directly at it. This is the working configuration for that single-machine setup:
