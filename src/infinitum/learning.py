@@ -120,7 +120,7 @@ or facts the user marks as temporary or today-only.
 Prefer concise current-state facts, decisions, preferences, goals, procedures, lessons, or episodic events.
 If the user explicitly corrects or replaces an existing memory, set operation_hint='supersede', explicit_correction=true, list only relevant existing memory IDs, and copy that memory's memory_type and topic exactly.
 If this merely confirms an existing memory, use operation_hint='reinforce', set reinforces_memory_id to that existing memory ID, and copy that memory's memory_type and topic exactly.
-If the user merely adds detail to an existing memory without contradicting or changing it, keep operation_hint='reinforce' (never 'supersede') with the more specific content and set reinforces_memory_id; reserve 'supersede' for explicit contradictions or replacements.
+If the user merely adds detail to an existing memory without contradicting or changing it, set operation_hint='supersede' with explicit_correction=false, copy that memory's memory_type and topic exactly, and list only that memory's ID (the runtime refines it in place); reserve explicit_correction=true for actual corrections or replacements.
 The request context below is provenance/affinity metadata. Use it only to disambiguate nearby memories; do not save the user ID, project ID, or CWD as a memory unless the interaction explicitly discusses them.
 {temporal_hint}
 
