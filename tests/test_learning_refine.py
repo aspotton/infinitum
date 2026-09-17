@@ -8,7 +8,7 @@ attached) converges content ONLY — no count bump, no observation row.
 
 import json
 import tempfile
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 from infinitum.config import AppConfig
 from infinitum.database import Database
@@ -16,6 +16,7 @@ from infinitum.embeddings import EmbeddingClient
 from infinitum.learning import MemoryLearner
 from infinitum.models import Event, Memory
 from infinitum.retrieval import MemoryRetriever
+from infinitum.text import lexical_similarity
 from infinitum.upstream import UpstreamClient
 
 
@@ -300,6 +301,92 @@ async def test_refined_memory_marks_its_topic_dirty_for_summary_refresh():
             updates = await db.get_topic_updates("database")
             assert updates
             assert any(memory_id == seed.id for memory_id, _ in updates)
+        finally:
+            await upstream.close()
+            await embeddings.close()
+            await db.close()
+
+
+_FIXED_VECTOR = [0.1, 0.2, 0.3, 0.4]
+
+
+async def test_refine_refreshes_embedding():
+    """The refine route re-embeds the refined wording exactly like the create
+    path does: one embed() of the new content persisted via set_embedding on
+    the SAME target id. Embeddings are enabled with a mocked client, so the
+    assertion is deterministic and makes no network call."""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, db, embeddings, upstream, learner = await _learner(tmp)
+        try:
+            cfg.embeddings.enabled = True
+            cfg.embeddings.model = "mock-embed"
+            embeddings.embed = AsyncMock(return_value=_FIXED_VECTOR)
+            db.set_embedding = AsyncMock()
+            seed = await _seed_fact(db)
+            await _learn_reply(db, learner, _extraction_envelope([_supersede_candidate(seed.id)]))
+
+            # embed() also runs for retriever query vectors once embeddings are
+            # on, so membership (not count) is the honest assertion here.
+            assert call(_REFINED_SCENARIO) in embeddings.embed.await_args_list
+            db.set_embedding.assert_awaited_once_with(seed.id, "mock-embed", _FIXED_VECTOR)
+        finally:
+            await upstream.close()
+            await embeddings.close()
+            await db.close()
+
+
+async def test_refine_declined_below_floor():
+    """Lexically unrelated wording sits below memory.supersede_similarity_floor
+    (checked on the exact strings below), so the refine pre-check declines and
+    the unchanged create path runs side by side with no supersede."""
+
+    unrelated = "The team reviews every pull request on Fridays"
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, db, embeddings, upstream, learner = await _learner(tmp)
+        try:
+            seed = await _seed_fact(db)
+            sim = lexical_similarity(seed.content, unrelated)
+            assert sim < cfg.memory.supersede_similarity_floor
+
+            candidate = _supersede_candidate(seed.id, content=unrelated)
+            await _learn_reply(db, learner, _extraction_envelope([candidate]))
+
+            active = await db.fetchall("SELECT id FROM memories WHERE status='active'")
+            assert len(active) == 2
+            superseded = await db.fetchall("SELECT id FROM memories WHERE status='superseded'")
+            assert superseded == []
+        finally:
+            await upstream.close()
+            await embeddings.close()
+            await db.close()
+
+
+async def test_refine_declined_multi_target():
+    """Two named targets fail the single-target gate, so the pre-check
+    declines and today's create + supersede loop is honored exactly as in the
+    multi-id learner test above."""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _cfg, db, embeddings, upstream, learner = await _learner(tmp)
+        try:
+            first = await _seed_fact(db)
+            second = await _seed_fact(db, content="The PostgreSQL database runs on Amazon RDS")
+            candidate = _supersede_candidate(
+                first.id,
+                content="The PostgreSQL database uses a nightly backup strategy on Amazon RDS",
+                supersedes_memory_ids=[first.id, second.id],
+            )
+            assert len(candidate["supersedes_memory_ids"]) == 2
+
+            await _learn_reply(db, learner, _extraction_envelope([candidate]))
+
+            active = await db.fetchall("SELECT id FROM memories WHERE status='active'")
+            assert len(active) == 1
+            assert active[0]["id"] not in (first.id, second.id)
+            for old_id in (first.id, second.id):
+                old = await db.get_memory(old_id)
+                assert old is not None and old.status == "superseded"
         finally:
             await upstream.close()
             await embeddings.close()
