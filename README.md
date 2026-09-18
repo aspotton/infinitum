@@ -6,11 +6,10 @@
 
 **Persistent memory and context for AI.**
 
-[![status](https://img.shields.io/badge/status-work--in--progress-orange)](#)-[![works for me](https://img.shields.io/badge/%20works%20for%20me-brightgreen)](#)-[![RFC](https://img.shields.io/badge/RFCs-welcome-blue)](https://github.com/aspotton/infinitum/issues)
+[![status](https://img.shields.io/badge/status-work--in--progress-orange)](#)-[![tests](https://github.com/aspotton/infinitum/actions/workflows/ci.yml/badge.svg)](https://github.com/aspotton/infinitum/actions/workflows/ci.yml)-[![release](https://img.shields.io/github/v/release/aspotton/infinitum)](https://github.com/aspotton/infinitum/releases)-[![RFC](https://img.shields.io/badge/RFCs-welcome-blue)](https://github.com/aspotton/infinitum/issues)
 
-> 🚧 **Work in progress.** Infinitum is built and works for me, but it is not a
-> polished production product yet. Design critiques, use cases, and pull
-> requests are welcome — open an issue and tell me what this should become.
+> 🚧 **Work in progress.** Infinitum is not a polished production product yet. Design critiques,
+> use cases, and pull requests are welcome — open an issue and tell me what this should become.
 
 </div>
 
@@ -20,7 +19,7 @@ Infinitum is a standalone Python 3 memory and context runtime for AI agents and 
 
 The newer AI services — OpenAI, Claude, and the rest — now ship their own memory. Their agents remember your decisions, your preferences, the things you already explained once, and that continuity makes them noticeably better at reasoning and recall and simply more useful to have around.
 
-Local AI doesn't have that. Worse, the moment you want to try a new tool or switch between providers, frameworks, and models, you leave that "magic" memory behind — it's locked inside whichever service learned it.
+Local AI doesn't have that. Worse, the moment you want to try a new tool or switch between providers, frameworks, and models, you leave that "magic" memory behind — it's locked inside whichever service learned it. If you find yourself using and switching between multiple AI applications — OpenCode, Open WebUI, and others — Infinitum is the glue.
 
 Infinitum moves the memory out of the service and into a runtime that sits in front of whatever you point it at. It learns from your interactions and improves the general intelligence of whatever tool or service you happen to want to use today. Bring your own model, bring your own agent framework, switch whenever you like — the memory keeps compounding. No memory exports, no tricks, no workarounds.
 

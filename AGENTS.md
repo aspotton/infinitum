@@ -162,6 +162,8 @@ Run from the repository root:
 pytest -q
 ```
 
+CI runs `python -m pytest -q` on pushes to `main` and pull requests via `.github/workflows/ci.yml`; release gating remains in `.github/workflows/release.yml`.
+
 For style/static checks when Ruff is installed:
 
 ```bash
