@@ -26,6 +26,18 @@ _FULL_WEIGHT_EVIDENCE = frozenset({"user_assertion", "tool_verified", "manual_ad
 _EVENT_CONTENT_COMPRESS_THRESHOLD = 2048
 _LZMA_HEADER = b"\x01"
 
+# One migration batch covers at most this many rows and this many raw content
+# bytes. ponytail: fixed row/byte budget keeps a batch's self._lock hold
+# sub-second — lzma CPU time is spent holding the lock and every foreground DB
+# op queues behind it (the timing test, not the byte budget, is the authority);
+# re-measure before raising either cap. ponytail: tail-scan ceiling — near the
+# end of a multi-GB store the selector scans sparse ids inside one bounded
+# transaction (total cost one extra table pass); upgrade path = scan-window
+# cursor (unfiltered `WHERE id > ? ORDER BY id LIMIT N`) if stores ever reach
+# millions of rows.
+_EVENT_COMPRESSION_BATCH_ROWS = 200
+_EVENT_COMPRESSION_BATCH_BYTES = 8 * 1024 * 1024
+
 
 def _encode_event_content(text: str) -> bytes:
     """Codec convention shared by add_event and the batch migrator (no drift)."""
@@ -540,6 +552,64 @@ class Database:
             metadata=json.loads(row["metadata_json"] or "{}"),
             created_at=_dt(row["created_at"]),
         )
+
+    async def compress_events_batch(self) -> int:
+        """Compress one bounded batch of pre-compression event rows; return count."""
+        async with self._lock:
+            return await asyncio.to_thread(self._compress_events_batch_sync)
+
+    def _compress_events_batch_sync(self) -> int:
+        assert self._conn is not None
+        # Done-flag and cursor reads sit ABOVE BEGIN IMMEDIATE: self._lock already
+        # serializes every writer in the process, so they need no read transaction.
+        if self._conn.execute(
+            "SELECT 1 FROM meta WHERE key='event_compression_done'"
+        ).fetchone():
+            return 0
+        cursor_row = self._conn.execute(
+            "SELECT value FROM meta WHERE key='event_compression_cursor'"
+        ).fetchone()
+        cursor = cursor_row["value"] if cursor_row else ""
+        self._conn.execute("BEGIN IMMEDIATE")
+        # ponytail: the LIMIT-bounded fetch materializes rows before the byte
+        # check, so a pathological store of many >8 MB rows refetches heavily per
+        # 8 MB processed; upgrade path = two-query id-then-content fetch.
+        rows = self._conn.execute(
+            "SELECT id, content FROM events WHERE content_blob IS NULL"
+            " AND length(content) > ? AND id > ? ORDER BY id LIMIT ?",
+            (_EVENT_CONTENT_COMPRESS_THRESHOLD, cursor, _EVENT_COMPRESSION_BATCH_ROWS),
+        ).fetchall()
+        if not rows:
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES('event_compression_done', '1')"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
+            self._conn.commit()
+            return 0
+        processed = 0
+        raw_bytes = 0
+        last_id = ""
+        for row in rows:
+            self._conn.execute(
+                "UPDATE events SET content='', content_blob=? WHERE id=?",
+                (_encode_event_content(row["content"]), row["id"]),
+            )
+            processed += 1
+            last_id = row["id"]
+            raw_bytes += len(row["content"])
+            # The byte budget is checked AFTER processing a row: the first fetched
+            # row is always done, so even a single >8 MB row makes progress and a
+            # caller's while-loop can never stall. Rows fetched but not processed
+            # still match the selector and are redone next batch.
+            if raw_bytes >= _EVENT_COMPRESSION_BATCH_BYTES:
+                break
+        self._conn.execute(
+            "INSERT INTO meta(key, value) VALUES('event_compression_cursor', ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (last_id,),
+        )
+        self._conn.commit()
+        return processed
 
     # Memories ---------------------------------------------------------------
     async def _record_observation(
