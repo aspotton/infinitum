@@ -13,12 +13,13 @@ import json
 import sqlite3
 import tempfile
 import time
+from datetime import timedelta
 
 import pytest
 
 from infinitum import database as database_mod
 from infinitum.database import Database
-from infinitum.models import Event
+from infinitum.models import Event, utc_now
 
 # The pre-change events table: the exact 11-column shape initialize() used to
 # create before content_blob existed.
@@ -483,4 +484,67 @@ async def test_concurrent_writes_when_migration_loops_reconstructs_every_row():
         got = {e.id: e.content for e in await db.list_events(limit=1000)}
         assert {k: got[k] for k in old} == old
         assert {k: got[k] for k in new_contents} == new_contents
+        await db.close()
+
+
+def _seed_job(path: str, job_id: str, status: str, age: timedelta) -> None:
+    """Direct-SQL job insert; created_at uses the tz-aware _iso(utc_now()) shape."""
+    conn = sqlite3.connect(path)
+    try:
+        stamp = (utc_now() - age).isoformat()
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS jobs ("
+            " id TEXT PRIMARY KEY, job_type TEXT NOT NULL,"
+            " status TEXT NOT NULL DEFAULT 'pending', payload_json TEXT NOT NULL,"
+            " created_at TEXT NOT NULL, run_after TEXT NOT NULL,"
+            " attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, locked_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO jobs(id, job_type, status, payload_json, created_at, run_after)"
+            " VALUES (?, 'learn_interaction', ?, '{}', ?, ?)",
+            (job_id, status, stamp, stamp),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def test_jobs_purge_when_mixed_status_ages_removes_only_old_done():
+    """Given done+29d, done+1d, pending+29d, running+29d When purge Then only done+29d gone."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/runtime.db"
+        db = Database(path)
+        await db.connect()
+        _seed_job(path, "job_old_done", "done", timedelta(days=29))
+        _seed_job(path, "job_new_done", "done", timedelta(days=1))
+        _seed_job(path, "job_old_pending", "pending", timedelta(days=29))
+        _seed_job(path, "job_old_running", "running", timedelta(days=29))
+
+        assert await db.purge_done_jobs() == 1
+
+        probe = sqlite3.connect(path)
+        remaining = {
+            row[0] for row in probe.execute("SELECT id FROM jobs")
+        }
+        probe.close()
+        assert remaining == {"job_new_done", "job_old_pending", "job_old_running"}
+
+        assert await db.purge_done_jobs() == 0
+        await db.close()
+
+
+async def test_jobs_purge_when_done_row_is_just_inside_retention_survives():
+    """Given a done row at 6d23h old When purge (7-day default) Then rowcount 0, row intact."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/runtime.db"
+        db = Database(path)
+        await db.connect()
+        _seed_job(path, "job_edge_done", "done", timedelta(days=6, hours=23))
+
+        assert await db.purge_done_jobs() == 0
+
+        probe = sqlite3.connect(path)
+        count = probe.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        probe.close()
+        assert count == 1
         await db.close()

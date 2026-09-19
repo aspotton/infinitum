@@ -5,7 +5,7 @@ import hashlib
 import json
 import lzma
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,9 @@ _LZMA_HEADER = b"\x01"
 # millions of rows.
 _EVENT_COMPRESSION_BATCH_ROWS = 200
 _EVENT_COMPRESSION_BATCH_BYTES = 8 * 1024 * 1024
+
+# ponytail: no config key; add one only when someone needs shorter retention.
+_DONE_JOB_RETENTION_DAYS = 7
 
 
 def _encode_event_content(text: str) -> bytes:
@@ -1410,6 +1413,25 @@ class Database:
                 "UPDATE jobs SET status='failed', last_error=?, locked_at=NULL WHERE id=?",
                 (error[:4000], job_id),
             )
+
+    async def purge_done_jobs(self, retention_days: int = _DONE_JOB_RETENTION_DAYS) -> int:
+        """Delete ``done`` job rows older than the retention window; return rowcount.
+
+        The cutoff reuses ``_iso`` so the bound has the identical tz-aware
+        shape jobs.created_at is written with, keeping the TEXT ``<``
+        chronological. Purging a done ``refresh_topic_summary`` row can drop
+        the model-hint row that ``_recover_dirty_topic_summary_jobs_sync``
+        reads as a fallback (its done-row scan), so with ``learning.model``
+        unset a dirty topic degrades to requeueing only on a later
+        interaction — accepted. Startup ordering is safe by construction:
+        that recovery runs inside ``build_runtime``, before any lifespan
+        maintenance task can purge.
+        """
+
+        cutoff = _iso(utc_now() - timedelta(days=retention_days))
+        return await self.execute(
+            "DELETE FROM jobs WHERE status='done' AND created_at < ?", (cutoff,)
+        )
 
     async def recover_interrupted_jobs(self) -> int:
         """Requeue every ``running`` job row.
