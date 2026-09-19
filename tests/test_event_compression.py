@@ -6,6 +6,8 @@ in ``add_event`` / ``_row_to_event`` — rows above the 2048-character threshold
 are stored as ``content=''`` plus a header-tagged blob and must reconstruct
 byte-identically; a foreign codec header must fail loud. Todo 3: the batched
 idempotent migration ``compress_events_batch`` of pre-existing raw rows.
+Todo 5: the ``create_app`` lifespan task that runs the purge + compress
+maintenance in the background while serving (E2E through ``TestClient``).
 """
 
 import asyncio
@@ -16,8 +18,11 @@ import time
 from datetime import timedelta
 
 import pytest
+from fastapi.testclient import TestClient
 
 from infinitum import database as database_mod
+from infinitum.app import create_app
+from infinitum.config import AppConfig
 from infinitum.database import Database
 from infinitum.models import Event, utc_now
 
@@ -548,3 +553,167 @@ async def test_jobs_purge_when_done_row_is_just_inside_retention_survives():
         probe.close()
         assert count == 1
         await db.close()
+
+
+# --- Todo 5: create_app lifespan wiring (background maintenance task) --------
+
+# Rows the migrator has NOT touched yet: still plain text above the threshold.
+# Raw rows satisfy any content-equality check vacuously at t=0, so this count —
+# not the equality — is the proof that the lifespan task actually did the work.
+_STILL_RAW_SQL = (
+    "SELECT COUNT(*) FROM events WHERE content_blob IS NULL"
+    " AND length(content) > 2048"
+)
+
+
+def _seed_app_db(path: str, rows: int, size: int) -> dict[str, str]:
+    """Seed `rows` raw >threshold rows directly (pre-compression write path)."""
+    contents = {f"evt_seed_{i:04d}": _big_content(size) + f"z{i}" for i in range(rows)}
+    _seed_raw_rows(path, list(contents.items()))
+    return contents
+
+
+def _app_config(path: str) -> AppConfig:
+    cfg = AppConfig()
+    cfg.memory.database_path = path
+    cfg.learning.enabled = False
+    return cfg
+
+
+async def _wait_until_migrated(path: str, client: TestClient) -> None:
+    """Poll `/events` + storage until the lifespan task sets the done flag.
+
+    The HTTP poll gives the app's event loop turns to run the maintenance task;
+    the meta probe is the stop condition. Hard 10 s cap so a stalled task fails
+    loudly instead of hanging the suite.
+    """
+    deadline = time.monotonic() + 10.0
+    while True:
+        assert client.get("/events?limit=1000").status_code == 200
+        probe = _events_probe(path)
+        finished = probe.execute(
+            "SELECT 1 FROM meta WHERE key='event_compression_done'"
+        ).fetchone()
+        still_raw = probe.execute(_STILL_RAW_SQL).fetchone()[0]
+        probe.close()
+        if finished and still_raw == 0:
+            return
+        if time.monotonic() > deadline:
+            pytest.fail(f"lifespan maintenance stalled: {still_raw} raw rows after 10s")
+        await asyncio.sleep(0.1)
+
+
+async def test_lifespan_when_seeded_raw_rows_migrate_then_reconstruct_byte_identically():
+    """E2E happy: booting the app compresses the store and purges the old done job."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/runtime.db"
+        contents = _seed_app_db(path, 600, 2100)
+        _seed_job(path, "job_old_done", "done", timedelta(days=30))
+
+        cfg = _app_config(path)
+        with TestClient(create_app(cfg)) as client:
+            await _wait_until_migrated(path, client)
+
+            # Storage-level proof the lifespan task ran, asserted BEFORE the
+            # content equality below (which raw rows would also satisfy).
+            probe = _events_probe(path)
+            assert probe.execute(_STILL_RAW_SQL).fetchone()[0] == 0
+            assert (
+                probe.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE id='job_old_done'"
+                ).fetchone()[0]
+                == 0
+            )
+            probe.close()
+
+            fetched = {
+                event["id"]: event["content"]
+                for event in client.get("/events?limit=1000").json()
+            }
+            assert fetched == contents
+
+
+async def test_lifespan_second_boot_when_store_already_migrated_does_zero_work():
+    """E2E stale-state: a second boot finds the done flag and rewrites nothing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/runtime.db"
+        contents = _seed_app_db(path, 600, 2100)
+        with TestClient(create_app(_app_config(path))) as client:
+            await _wait_until_migrated(path, client)
+
+        probe = _events_probe(path)
+        blobbed_first = probe.execute(
+            "SELECT COUNT(*) FROM events WHERE content_blob IS NOT NULL"
+        ).fetchone()[0]
+        probe.close()
+        assert blobbed_first == 600
+
+        with TestClient(create_app(_app_config(path))):
+            await asyncio.sleep(0.2)  # let the second pass make its one meta probe
+
+        probe = _events_probe(path)
+        blobbed_second = probe.execute(
+            "SELECT COUNT(*) FROM events WHERE content_blob IS NOT NULL"
+        ).fetchone()[0]
+        probe.close()
+        assert blobbed_second == blobbed_first
+
+        db = Database(path)
+        await db.connect()
+        assert await db.compress_events_batch() == 0
+        assert {e.id: e.content for e in await db.list_events(limit=1000)} == contents
+        await db.close()
+
+
+async def test_lifespan_teardown_when_first_batch_is_in_flight_keeps_the_store_lossless():
+    """E2E cancel/resume: 200 x ~250 KB rows keep the first batch in flight at exit.
+
+    One `/events` call before leaving is what makes the race real: it gives the
+    maintenance task a turn to start its batch, which an immediate enter/exit
+    would cancel before its first turn (verified: zero rows touched). Leaving the
+    context must then raise nothing — no CancelledError, no crash from closing the
+    connection under the batch thread — and every row must reconstruct
+    byte-identically afterwards: committed blob or still raw, both are legal states
+    of the idempotent selector.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/runtime.db"
+        filler = "the quick brown fox jumps over the lazy dog " * 1100  # ~53 KB
+        row = json.dumps(
+            {"messages": [{"role": "user", "content": filler}]},
+            ensure_ascii=False,
+        )
+        row = row[: len(row) - 1] + "," + '"pad":"' + "abcdefgh" * (
+            (250_000 - len(row)) // 8
+        ) + '"}'
+        _seed_raw_rows(path, [(f"evt_seed_{i:04d}", row) for i in range(200)])
+
+        # Context exit here IS the assertion: any escaping error fails the test.
+        with TestClient(create_app(_app_config(path))) as client:
+            client.get("/events?limit=1")
+
+        db = Database(path)
+        await db.connect()
+        assert [e.content for e in await db.list_events(limit=200)] == [row] * 200
+        await db.close()
+
+
+async def test_plain_database_when_connected_leaves_seeded_raw_rows_untouched():
+    """Failure control: `initialize()` alone never migrates — only the lifespan does."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/runtime.db"
+        _seed_app_db(path, 600, 2100)
+
+        db = Database(path)
+        await db.connect()
+        await db.close()
+
+        probe = _events_probe(path)
+        assert probe.execute(_STILL_RAW_SQL).fetchone()[0] == 600
+        assert (
+            probe.execute(
+                "SELECT COUNT(*) FROM events WHERE content_blob IS NOT NULL"
+            ).fetchone()[0]
+            == 0
+        )
+        probe.close()
