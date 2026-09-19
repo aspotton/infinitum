@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import lzma
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,42 @@ from .models import Event, Memory, Observation, RequestContext, TopicSummary, ne
 # Evidence kinds that carry full authority; paraphrases and derived
 # observations count half as much as direct evidence.
 _FULL_WEIGHT_EVIDENCE = frozenset({"user_assertion", "tool_verified", "manual_admin"})
+
+# Event content longer than this many characters is stored lzma-compressed
+# (preset 1) in events.content_blob behind a one-byte codec header. SQL
+# length() counts UTF-16 code units, so it is always >= Python str len — the
+# migration selector is therefore a SAFE SUPERSET of the write path: extra
+# lossless compression is harmless, and nothing above the write threshold is
+# ever missed.
+_EVENT_CONTENT_COMPRESS_THRESHOLD = 2048
+_LZMA_HEADER = b"\x01"
+
+# One migration batch covers at most this many rows and this many raw content
+# bytes. ponytail: fixed row/byte budget keeps a batch's self._lock hold
+# sub-second — lzma CPU time is spent holding the lock and every foreground DB
+# op queues behind it (the timing test, not the byte budget, is the authority);
+# re-measure before raising either cap. ponytail: tail-scan ceiling — near the
+# end of a multi-GB store the selector scans sparse ids inside one bounded
+# transaction (total cost one extra table pass); upgrade path = scan-window
+# cursor (unfiltered `WHERE id > ? ORDER BY id LIMIT N`) if stores ever reach
+# millions of rows.
+_EVENT_COMPRESSION_BATCH_ROWS = 200
+_EVENT_COMPRESSION_BATCH_BYTES = 8 * 1024 * 1024
+
+# ponytail: no config key; add one only when someone needs shorter retention.
+_DONE_JOB_RETENTION_DAYS = 7
+
+
+def _encode_event_content(text: str) -> bytes:
+    """Codec convention shared by add_event and the batch migrator (no drift)."""
+    return _LZMA_HEADER + lzma.compress(text.encode("utf-8"), preset=1)
+
+
+def _decode_event_content(payload: bytes) -> str:
+    """Reconstruct event content; a foreign/corrupt blob fails loud by design."""
+    if payload[:1] != _LZMA_HEADER:
+        raise ValueError("unknown event content codec")
+    return lzma.decompress(payload[1:]).decode("utf-8")
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -222,10 +259,19 @@ class Database:
         );
         CREATE INDEX IF NOT EXISTS idx_jobs_pending
             ON jobs(status, run_after, created_at);
+
+        -- Single-row-per-key runtime bookkeeping (migration cursors, done
+        -- flags). Tables in this block auto-create on every boot, so no
+        -- probe migration is needed for it.
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         """
         await self.executescript(schema)
         await self._ensure_request_context_columns()
         await self._ensure_temporal_columns()
+        await self._ensure_event_content_blob_column()
         await self._initialize_fts()
         await self._backfill_observations()
 
@@ -281,6 +327,26 @@ class Database:
         for column in ("valid_from", "valid_until", "observed_at"):
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE memories ADD COLUMN {column} TEXT")
+        self._conn.commit()
+
+    async def _ensure_event_content_blob_column(self) -> None:
+        """Upgrade pre-compression databases in place with the events blob column.
+
+        Same PRAGMA-probe pattern as _ensure_temporal_columns: the CREATE block
+        only affects fresh databases, so an existing events table needs one
+        additive nullable ALTER that preserves every existing row (the new
+        column reads back NULL).
+        """
+
+        async with self._lock:
+            await asyncio.to_thread(self._ensure_event_content_blob_column_sync)
+
+    def _ensure_event_content_blob_column_sync(self) -> None:
+        assert self._conn is not None
+        rows = self._conn.execute("PRAGMA table_info(events)").fetchall()
+        existing = {row["name"] for row in rows}
+        if "content_blob" not in existing:
+            self._conn.execute("ALTER TABLE events ADD COLUMN content_blob BLOB")
         self._conn.commit()
 
     async def _backfill_observations(self) -> None:
@@ -413,9 +479,15 @@ class Database:
 
     # Events -----------------------------------------------------------------
     async def add_event(self, event: Event) -> Event:
+        """Persist one event, transparently lzma-compressing large content."""
+        if len(event.content) > _EVENT_CONTENT_COMPRESS_THRESHOLD:
+            content: str = ""
+            content_blob: bytes | None = _encode_event_content(event.content)
+        else:
+            content, content_blob = event.content, None
         await self.execute(
-            "INSERT INTO events(id, session_id, user_id, project_id, cwd, request_id, event_type, role, content, metadata_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO events(id, session_id, user_id, project_id, cwd, request_id, event_type, role, content, metadata_json, created_at, content_blob) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event.id,
                 event.session_id,
@@ -425,9 +497,10 @@ class Database:
                 event.request_id,
                 event.event_type,
                 event.role,
-                event.content,
+                content,
                 json.dumps(event.metadata, separators=(",", ":")),
                 _iso(event.created_at),
+                content_blob,
             ),
         )
         return event
@@ -464,6 +537,11 @@ class Database:
         return [self._row_to_event(r) for r in rows]
 
     def _row_to_event(self, row: sqlite3.Row) -> Event:
+        content = (
+            _decode_event_content(row["content_blob"])
+            if row["content_blob"] is not None
+            else row["content"]
+        )
         return Event(
             id=row["id"],
             session_id=row["session_id"],
@@ -473,10 +551,68 @@ class Database:
             request_id=row["request_id"],
             event_type=row["event_type"],
             role=row["role"],
-            content=row["content"],
+            content=content,
             metadata=json.loads(row["metadata_json"] or "{}"),
             created_at=_dt(row["created_at"]),
         )
+
+    async def compress_events_batch(self) -> int:
+        """Compress one bounded batch of pre-compression event rows; return count."""
+        async with self._lock:
+            return await asyncio.to_thread(self._compress_events_batch_sync)
+
+    def _compress_events_batch_sync(self) -> int:
+        assert self._conn is not None
+        # Done-flag and cursor reads sit ABOVE BEGIN IMMEDIATE: self._lock already
+        # serializes every writer in the process, so they need no read transaction.
+        if self._conn.execute(
+            "SELECT 1 FROM meta WHERE key='event_compression_done'"
+        ).fetchone():
+            return 0
+        cursor_row = self._conn.execute(
+            "SELECT value FROM meta WHERE key='event_compression_cursor'"
+        ).fetchone()
+        cursor = cursor_row["value"] if cursor_row else ""
+        self._conn.execute("BEGIN IMMEDIATE")
+        # ponytail: the LIMIT-bounded fetch materializes rows before the byte
+        # check, so a pathological store of many >8 MB rows refetches heavily per
+        # 8 MB processed; upgrade path = two-query id-then-content fetch.
+        rows = self._conn.execute(
+            "SELECT id, content FROM events WHERE content_blob IS NULL"
+            " AND length(content) > ? AND id > ? ORDER BY id LIMIT ?",
+            (_EVENT_CONTENT_COMPRESS_THRESHOLD, cursor, _EVENT_COMPRESSION_BATCH_ROWS),
+        ).fetchall()
+        if not rows:
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES('event_compression_done', '1')"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+            )
+            self._conn.commit()
+            return 0
+        processed = 0
+        raw_bytes = 0
+        last_id = ""
+        for row in rows:
+            self._conn.execute(
+                "UPDATE events SET content='', content_blob=? WHERE id=?",
+                (_encode_event_content(row["content"]), row["id"]),
+            )
+            processed += 1
+            last_id = row["id"]
+            raw_bytes += len(row["content"])
+            # The byte budget is checked AFTER processing a row: the first fetched
+            # row is always done, so even a single >8 MB row makes progress and a
+            # caller's while-loop can never stall. Rows fetched but not processed
+            # still match the selector and are redone next batch.
+            if raw_bytes >= _EVENT_COMPRESSION_BATCH_BYTES:
+                break
+        self._conn.execute(
+            "INSERT INTO meta(key, value) VALUES('event_compression_cursor', ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (last_id,),
+        )
+        self._conn.commit()
+        return processed
 
     # Memories ---------------------------------------------------------------
     async def _record_observation(
@@ -1277,6 +1413,25 @@ class Database:
                 "UPDATE jobs SET status='failed', last_error=?, locked_at=NULL WHERE id=?",
                 (error[:4000], job_id),
             )
+
+    async def purge_done_jobs(self, retention_days: int = _DONE_JOB_RETENTION_DAYS) -> int:
+        """Delete ``done`` job rows older than the retention window; return rowcount.
+
+        The cutoff reuses ``_iso`` so the bound has the identical tz-aware
+        shape jobs.created_at is written with, keeping the TEXT ``<``
+        chronological. Purging a done ``refresh_topic_summary`` row can drop
+        the model-hint row that ``_recover_dirty_topic_summary_jobs_sync``
+        reads as a fallback (its done-row scan), so with ``learning.model``
+        unset a dirty topic degrades to requeueing only on a later
+        interaction — accepted. Startup ordering is safe by construction:
+        that recovery runs inside ``build_runtime``, before any lifespan
+        maintenance task can purge.
+        """
+
+        cutoff = _iso(utc_now() - timedelta(days=retention_days))
+        return await self.execute(
+            "DELETE FROM jobs WHERE status='done' AND created_at < ?", (cutoff,)
+        )
 
     async def recover_interrupted_jobs(self) -> int:
         """Requeue every ``running`` job row.

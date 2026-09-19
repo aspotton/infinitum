@@ -118,6 +118,14 @@ erDiagram
     }
 ```
 
+### Event content compression
+
+Event content longer than 2048 characters is stored transparently lzma-compressed (preset 1) in a `content_blob` BLOB column on `events`, behind a one-byte codec header, with the plain `content` column left empty for those rows. Reads reconstruct byte-identical content, so `GET /events` output is unchanged before, during, and after migration. The behavior is unconditional; there are no config keys. At this threshold most `message.*` rows compress too, not only the large `request.received` audit records (the originating issue's claim that the threshold keeps `message.*` untouched was wrong for its own size averages; harmless either way because the codec is lossless). Rows written below the threshold stay bit-identical to the pre-compression storage format.
+
+On boot, a background maintenance task migrates pre-existing rows in bounded batches (at most 200 rows or 8 MB of raw content each, so the write lock is never held long enough to stall serving; idempotent and resumable via a cursor in the `meta` table), and separately sweeps finished background jobs older than 7 days out of the `jobs` table. Compression alone does not shrink the database file, so a manual `VACUUM` is recommended once, after the first boot on a large store, to reclaim the freed space; automatic VACUUM is intentionally not performed.
+
+Two failure semantics are deliberate. A corrupt or foreign `content_blob` fails loud: decoding raises `ValueError` and `GET /events` returns a 500, rather than serving silently truncated audit data. And once compression has run on a store, do not downgrade to a pre-compression build: old builds read compressed rows as empty `content`. The data is intact in `content_blob`, and re-upgrading restores it.
+
 ## Request context and global-memory affinity
 
 V0.2.0 introduces a first-class `RequestContext` containing nullable `user_id`, `project_id`, and `cwd`. The HTTP resolver accepts configurable canonical and compatibility aliases, including OpenCode's `x-opencode-directory`. An explicit project ID wins; otherwise a normalized CWD may produce a deterministic local project key. Chat Completions also recognizes OpenCode-compatible session headers (`x-opencode-session`, `x-session-id`, and `x-session-affinity`) when no explicit `x-infinitum-session-id` is supplied.

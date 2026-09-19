@@ -23,6 +23,8 @@ With `passthrough_authorization: true`, the inbound `Authorization` header is fo
 
 The annotated example in [`../config.example.yaml`](../config.example.yaml) writes `database_path` as `${INFINITUM_DATABASE_PATH:-./infinitum.db}`, so container users can pin the database location via environment variable without editing the file (see [DOCKER.md](DOCKER.md)).
 
+Storage maintenance (transparent lzma compression of event content over 2048 characters into `events.content_blob`, plus the 7-day sweep of finished background jobs) is unconditional startup behavior with no configuration keys. There is nothing to enable or tune here; see [ARCHITECTURE.md](ARCHITECTURE.md#event-content-compression) for the semantics.
+
 ## Request-context and OpenCode headers
 
 V0.2.0 can associate an OpenAI request with a user/project/CWD while keeping the memory store globally visible. Prefer the canonical headers:
