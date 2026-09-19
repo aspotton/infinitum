@@ -222,10 +222,19 @@ class Database:
         );
         CREATE INDEX IF NOT EXISTS idx_jobs_pending
             ON jobs(status, run_after, created_at);
+
+        -- Single-row-per-key runtime bookkeeping (migration cursors, done
+        -- flags). Tables in this block auto-create on every boot, so no
+        -- probe migration is needed for it.
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         """
         await self.executescript(schema)
         await self._ensure_request_context_columns()
         await self._ensure_temporal_columns()
+        await self._ensure_event_content_blob_column()
         await self._initialize_fts()
         await self._backfill_observations()
 
@@ -281,6 +290,26 @@ class Database:
         for column in ("valid_from", "valid_until", "observed_at"):
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE memories ADD COLUMN {column} TEXT")
+        self._conn.commit()
+
+    async def _ensure_event_content_blob_column(self) -> None:
+        """Upgrade pre-compression databases in place with the events blob column.
+
+        Same PRAGMA-probe pattern as _ensure_temporal_columns: the CREATE block
+        only affects fresh databases, so an existing events table needs one
+        additive nullable ALTER that preserves every existing row (the new
+        column reads back NULL).
+        """
+
+        async with self._lock:
+            await asyncio.to_thread(self._ensure_event_content_blob_column_sync)
+
+    def _ensure_event_content_blob_column_sync(self) -> None:
+        assert self._conn is not None
+        rows = self._conn.execute("PRAGMA table_info(events)").fetchall()
+        existing = {row["name"] for row in rows}
+        if "content_blob" not in existing:
+            self._conn.execute("ALTER TABLE events ADD COLUMN content_blob BLOB")
         self._conn.commit()
 
     async def _backfill_observations(self) -> None:
