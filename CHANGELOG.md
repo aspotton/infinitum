@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+Changed:
+
+- Event content longer than 2048 characters is now stored transparently lzma-compressed in a new `events.content_blob` column behind a one-byte codec header, and reads reconstruct it byte-for-byte, so `GET /events` is unchanged while raw request-audit records shrink to roughly a third of their stored size. New events compress at write time; pre-existing rows migrate in bounded, idempotent background batches at startup so serving is never blocked. The behavior is lossless and unconditional, with no new config keys, and OpenAI-compatible servers fronting these stores see identical response content before and after migration. A corrupt stored blob deliberately fails loud (`GET /events` returns a 500) instead of serving truncated audit data, and a store that has run compression should not be reopened by a pre-compression build, which would read those rows as empty content (the data stays intact and re-upgrading restores it). A manual `VACUUM` once after the first boot on a large store reclaims the freed file space; automatic VACUUM is intentionally not performed. (#32)
+- Finished background queue rows are now swept at startup once they are older than 7 days, trimming years of accumulated done jobs from the database. Pending, running, and failed jobs are untouched. (#32)
+
 ## 0.5.2
 
 Changed:

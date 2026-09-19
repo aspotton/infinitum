@@ -39,13 +39,13 @@ Preserve these unless a deliberate architecture change is documented and tested:
 Primary code lives in `src/infinitum/`.
 
 - `runtime.py` — DI hub: `build_runtime()` constructs Database, EmbeddingClient, UpstreamClient, Retriever, Compiler, Learner, RequestContextResolver, TokenCounter; also runs startup dirty-topic recovery. Routes access this via `app.state.runtime`.
-- `app.py` — thin FastAPI construction/lifespan (starts/stops the learning worker)
+- `app.py` — thin FastAPI construction/lifespan (starts/stops the learning worker; runs the event-maintenance task: done-jobs purge + batched event compression)
 - `__main__.py` — `infinitum` CLI entrypoint (argparse + `INFINITUM_CONFIG` + uvicorn factory)
 - `routes/openai.py` — OpenAI-compatible proxy endpoints and per-request controls
 - `routes/memory.py` — memory management/search endpoints
 - `routes/admin.py` — health, event, topic, and request-context diagnostics
 - `config.py` — configuration models and loading
-- `database.py` — SQLite schema, persistence, durable jobs, provenance, `memory_observations`/`memory_observation_sources` evidence ledger, and additive temporal columns on `memories` (largest module)
+- `database.py` — SQLite schema, persistence, durable jobs (incl. the 7-day done-jobs startup sweep), provenance, `memory_observations`/`memory_observation_sources` evidence ledger, transparent event-content compression (lzma past 2048 chars into `events.content_blob` behind a 1-byte codec header, byte-identical reads), and additive temporal columns on `memories` (largest module)
 - `request_context.py` — user/project/CWD header resolution
 - `retrieval.py` — hybrid scoring, temporal demotion, context affinity
 - `compiler.py` — token-aware memory selection/rendering/injection
@@ -84,7 +84,7 @@ Runtime-only headers must be stripped before normal upstream forwarding. Headroo
 
 ## Database compatibility
 
-The default database filename is `infinitum.db`. There is no legacy-database auto-detection; when an older SQLite database is pointed at via an explicit `memory.database_path`, it is opened and its schema migrates in place.
+The default database filename is `infinitum.db`. There is no legacy-database auto-detection; when an older SQLite database is pointed at via an explicit `memory.database_path`, it is opened and its schema migrates in place. The event-compression migration is additive: it adds the `events.content_blob` column and a `meta` table (compression cursor/done flag), then compresses large rows in background batches; event content stays byte-exact bit-for-bit on every read, and sub-threshold rows keep their original storage format untouched.
 
 Schema changes must be additive/migratable and must preserve immutable events and existing memory IDs unless a documented migration absolutely requires otherwise.
 
