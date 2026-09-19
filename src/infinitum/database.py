@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import lzma
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,27 @@ from .models import Event, Memory, Observation, RequestContext, TopicSummary, ne
 # Evidence kinds that carry full authority; paraphrases and derived
 # observations count half as much as direct evidence.
 _FULL_WEIGHT_EVIDENCE = frozenset({"user_assertion", "tool_verified", "manual_admin"})
+
+# Event content longer than this many characters is stored lzma-compressed
+# (preset 1) in events.content_blob behind a one-byte codec header. SQL
+# length() counts UTF-16 code units, so it is always >= Python str len — the
+# migration selector is therefore a SAFE SUPERSET of the write path: extra
+# lossless compression is harmless, and nothing above the write threshold is
+# ever missed.
+_EVENT_CONTENT_COMPRESS_THRESHOLD = 2048
+_LZMA_HEADER = b"\x01"
+
+
+def _encode_event_content(text: str) -> bytes:
+    """Codec convention shared by add_event and the batch migrator (no drift)."""
+    return _LZMA_HEADER + lzma.compress(text.encode("utf-8"), preset=1)
+
+
+def _decode_event_content(payload: bytes) -> str:
+    """Reconstruct event content; a foreign/corrupt blob fails loud by design."""
+    if payload[:1] != _LZMA_HEADER:
+        raise ValueError("unknown event content codec")
+    return lzma.decompress(payload[1:]).decode("utf-8")
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -442,9 +464,15 @@ class Database:
 
     # Events -----------------------------------------------------------------
     async def add_event(self, event: Event) -> Event:
+        """Persist one event, transparently lzma-compressing large content."""
+        if len(event.content) > _EVENT_CONTENT_COMPRESS_THRESHOLD:
+            content: str = ""
+            content_blob: bytes | None = _encode_event_content(event.content)
+        else:
+            content, content_blob = event.content, None
         await self.execute(
-            "INSERT INTO events(id, session_id, user_id, project_id, cwd, request_id, event_type, role, content, metadata_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO events(id, session_id, user_id, project_id, cwd, request_id, event_type, role, content, metadata_json, created_at, content_blob) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event.id,
                 event.session_id,
@@ -454,9 +482,10 @@ class Database:
                 event.request_id,
                 event.event_type,
                 event.role,
-                event.content,
+                content,
                 json.dumps(event.metadata, separators=(",", ":")),
                 _iso(event.created_at),
+                content_blob,
             ),
         )
         return event
@@ -493,6 +522,11 @@ class Database:
         return [self._row_to_event(r) for r in rows]
 
     def _row_to_event(self, row: sqlite3.Row) -> Event:
+        content = (
+            _decode_event_content(row["content_blob"])
+            if row["content_blob"] is not None
+            else row["content"]
+        )
         return Event(
             id=row["id"],
             session_id=row["session_id"],
@@ -502,7 +536,7 @@ class Database:
             request_id=row["request_id"],
             event_type=row["event_type"],
             role=row["role"],
-            content=row["content"],
+            content=content,
             metadata=json.loads(row["metadata_json"] or "{}"),
             created_at=_dt(row["created_at"]),
         )
