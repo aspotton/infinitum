@@ -31,10 +31,17 @@ _JSON_RE = re.compile(r"\{.*\}", re.S)
 # one per created memory — which can exceed the lease; safe in-process because
 # the sole worker only claims when idle and can never steal a job it is
 # running; recompute the lease per job type if multiple LLM calls ever land on
-# the claim path. max_attempts is enforced only on the worker's exception path;
-# a job that hard-crashes the process would loop crash-requeue-crash every
-# lease. Upgrade path: one-line attempts check on the adoption path.
+# the claim path. max_attempts is now enforced on all paths: the worker's
+# exception path plus a strict-greater attempts guard right after claim, so a
+# crash-requeue-crash loop is terminally failed instead of looping per lease.
 STALE_LOCK_GRACE_SECONDS = 60.0
+
+# Ponytail: consolidation sweep tick: one ensure pass per 60s, batch cap 1, so
+# FIFO queue depth of consolidate_topic jobs stays <=1 and learn_interaction
+# latency is never starved. Deliberately hardcoded (no config key); the
+# last-sweep timestamp starts at 0.0 so the first poll after startup is due.
+_CONSOLIDATION_SWEEP_SECONDS = 60.0
+_CONSOLIDATION_SWEEP_BATCH = 1
 
 STOP_GRACE_SECONDS = 5.0
 # Grace for worker shutdown before the worker task is cancelled. Deliberately
@@ -731,6 +738,9 @@ class LearningWorker:
         self.config = config
         self._active_requests = active_requests
         self.consolidator = consolidator
+        # 0.0 (not monotonic() at startup) so the first sweep falls due on the
+        # worker's first poll rather than stalling a full tick interval.
+        self._last_consolidation_sweep = 0.0
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
@@ -774,6 +784,22 @@ class LearningWorker:
                     except TimeoutError:
                         pass
                     continue
+            # Sweeps pause with the same deferral above: the tick is only
+            # stamped when the sweep actually runs, so deferred iterations
+            # never advance it.
+            if (
+                self.config.learning.consolidation
+                and self.consolidator
+                and self.config.learning.model
+                and time.monotonic() - self._last_consolidation_sweep
+                >= _CONSOLIDATION_SWEEP_SECONDS
+            ):
+                self._last_consolidation_sweep = time.monotonic()
+                await self.db.ensure_consolidation_jobs(
+                    self.config.learning.consolidation_interval_seconds,
+                    _CONSOLIDATION_SWEEP_BATCH,
+                    model=self.config.learning.model or "",
+                )
             cutoff = (
                 datetime.now(timezone.utc)
                 - timedelta(
@@ -788,6 +814,12 @@ class LearningWorker:
                     )
                 except asyncio.TimeoutError:
                     pass
+                continue
+            # Poison-loop guard: claim increments attempts BEFORE this check,
+            # so a strict > keeps the legitimate final retry (attempts == max)
+            # executable, matching the old exception-path ceiling exactly.
+            if job["attempts"] > self.config.learning.max_attempts:
+                await self.db.fail_job(job["id"], "max attempts exceeded", retry=False)
                 continue
             try:
                 followup_topic: str | None = None
@@ -804,6 +836,32 @@ class LearningWorker:
                         if await self.learner.refresh_topic_summary(topic, model):
                             followup_topic = topic
                             followup_model = model
+                elif job["job_type"] == "consolidate_topic":
+                    topic = str(job["payload"].get("topic") or "")
+                    model = (
+                        self.config.learning.model
+                        or str(job["payload"].get("model") or "")
+                    )
+                    if topic and model:
+                        await self.consolidator.consolidate_topic(
+                            topic,
+                            model,
+                            continuation=bool(job["payload"].get("continuation")),
+                        )
+                    else:
+                        log.warning(
+                            "consolidation job %s skipped: missing %s",
+                            job["id"],
+                            "topic" if not topic else "learning.model",
+                        )
+                        await self.db.fail_job(
+                            job["id"],
+                            "consolidation skipped: missing topic or learning.model",
+                            retry=False,
+                        )
+                        continue
+                else:
+                    raise RuntimeError(f"unknown job_type {job['job_type']!r}")
                 await self.db.finish_job(job["id"])
                 if followup_topic:
                     # The just-finished job is no longer "running", so remaining
