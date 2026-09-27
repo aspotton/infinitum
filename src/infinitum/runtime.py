@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 from .compiler import ContextCompiler
 from .config import AppConfig
+from .consolidation import MemoryConsolidator
 from .database import Database
 from .embeddings import EmbeddingClient
 from .learning import LearningWorker, MemoryLearner
@@ -78,7 +79,10 @@ async def build_runtime(config: AppConfig) -> Runtime:
     if config.learning.enabled and config.learning.topic_summaries:
         await db.recover_dirty_topic_summary_jobs(default_model=config.learning.model)
     active_requests = ActiveRequestCounter()
-    worker = LearningWorker(db, learner, config, active_requests)
+    consolidator = (
+        MemoryConsolidator(db, upstream, config) if config.learning.consolidation else None
+    )
+    worker = LearningWorker(db, learner, config, active_requests, consolidator=consolidator)
     return Runtime(
         config,
         db,

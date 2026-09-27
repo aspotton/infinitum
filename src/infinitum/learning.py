@@ -18,6 +18,7 @@ from .text import compact_whitespace, lexical_similarity, normalize_text
 from .upstream import UpstreamClient, extract_nonstream_assistant
 
 if TYPE_CHECKING:
+    from .consolidation import MemoryConsolidator
     from .runtime import ActiveRequestCounter
 
 log = logging.getLogger(__name__)
@@ -723,11 +724,13 @@ class LearningWorker:
         learner: MemoryLearner,
         config: AppConfig,
         active_requests: ActiveRequestCounter | None = None,
+        consolidator: MemoryConsolidator | None = None,
     ):
         self.db = db
         self.learner = learner
         self.config = config
         self._active_requests = active_requests
+        self.consolidator = consolidator
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
