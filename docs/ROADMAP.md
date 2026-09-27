@@ -8,9 +8,9 @@ The phases are ordered so each one can be built and validated independently.
 
 ## Progress at a glance
 
-Status as of **v0.3.0 (2026-09-10)**. A checked box means the item is shipped; unchecked headings with checked sub-items are partially complete. Details and caveats live in each section below.
+Status as of **v0.5.x (2026-09-27)**. A checked box means the item is shipped; unchecked headings with checked sub-items are partially complete. Details and caveats live in each section below.
 
-- [x] **Phase 0 — Global intelligent memory** — shipped through v0.3.x
+- [x] **Phase 0 — Global intelligent memory** — shipped by v0.3
   - [x] Event-sourced global memory, hybrid retrieval, bounded context compilation, async learning
   - [x] Request-context provenance and soft affinity (`X-Infinitum-*` headers)
   - [x] Every-interaction learning and incremental topic summaries
@@ -20,7 +20,7 @@ Status as of **v0.3.0 (2026-09-10)**. A checked box means the item is shipped; u
   - [ ] 1.2 Retrieval feedback — injection recording works offline; outcome-signal ingestion deferred
   - [x] 1.3 Temporal truth at minimum depth — validity windows + temporal views (no typed edges; natural-expiry cache caveat)
   - [x] 1.4 First-class evidence ledger — idempotent observations; ranking integration deferred
-  - [ ] 1.5 Periodic deep consolidation — deferred, scheduled as its own update
+  - [x] 1.5 Periodic deep consolidation — implemented at topic-level depth — cross-topic/corpus passes deferred
 - [ ] **Phase 2 — Progressive and tool-assisted retrieval** — partial
   - [ ] 2.1 Native memory tools — `infinitum_memory_search`/`infinitum_memory_get` shipped; `memory_history`/`event_get` open
   - [x] 2.2 Progressive context — cache-stable injection (v0.2.3) plus tool-loop drill-down with deeper-detail hints
@@ -263,7 +263,7 @@ Retrieval ranking can later use bounded evidence features such as `log1p(indepen
 
 ### 1.5 Periodic deep consolidation scheduler
 
-**Status: Deferred - scheduled as its own future update; design preserved below.**
+**Status: implemented at topic-level depth — cross-topic/corpus passes deferred. The design prose below is preserved as the historical plan of record.**
 
 V0.1.2+ already handles the **incremental** layer, so the next scheduler should be explicitly slower and deeper rather than another per-turn summarizer. It should operate on dirty/high-churn topics first, then optionally across topic boundaries.
 
