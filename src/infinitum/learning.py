@@ -39,7 +39,7 @@ STALE_LOCK_GRACE_SECONDS = 60.0
 # Ponytail: consolidation sweep tick: one ensure pass per 60s, batch cap 1, so
 # FIFO queue depth of consolidate_topic jobs stays <=1 and learn_interaction
 # latency is never starved. Deliberately hardcoded (no config key); the
-# last-sweep timestamp starts at 0.0 so the first poll after startup is due.
+# last-sweep timestamp starts at -inf so the first poll is unconditionally due.
 _CONSOLIDATION_SWEEP_SECONDS = 60.0
 _CONSOLIDATION_SWEEP_BATCH = 1
 
@@ -738,9 +738,10 @@ class LearningWorker:
         self.config = config
         self._active_requests = active_requests
         self.consolidator = consolidator
-        # 0.0 (not monotonic() at startup) so the first sweep falls due on the
-        # worker's first poll rather than stalling a full tick interval.
-        self._last_consolidation_sweep = 0.0
+        # -inf makes the first poll due unconditionally; 0.0 only made it due
+        # once the monotonic epoch itself exceeded 60s, which fresh-boot CI
+        # runners violate.
+        self._last_consolidation_sweep = float("-inf")
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 

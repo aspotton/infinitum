@@ -42,19 +42,19 @@ async def _wait_for_row(db: Database, job_id: str, statuses: set[str], timeout: 
     return row
 
 
-def test_last_sweep_initializes_to_zero_so_the_first_poll_is_due():
-    # F3's premise, stated directly: the timestamp starts at 0.0, not at
-    # monotonic()-at-startup. time.monotonic() is host uptime and always
-    # exceeds the 60s tick on any running host, so the worker's first poll
-    # after startup is due. No loop needed; construction-time invariant.
+def test_last_sweep_initializes_to_neg_inf_so_the_first_poll_is_due():
+    # F3's premise, stated directly: the timestamp starts at -inf, not at
+    # monotonic()-at-startup, so the first poll is due unconditionally even on
+    # a freshly-booted host where time.monotonic() can still be under the 60s
+    # tick. No loop needed; construction-time invariant.
     worker = LearningWorker(MagicMock(), MagicMock(), AppConfig())
-    assert worker._last_consolidation_sweep == 0.0
+    assert worker._last_consolidation_sweep == float("-inf")
 
 
 @pytest.mark.asyncio
 async def test_sweep_enqueues_on_first_poll_and_dispatch_threads_topic_model_continuation():
     """Given consolidation on with a model and one active topic, When the worker
-    polls (last-sweep 0.0 makes the very first poll due on the real clock),
+    polls (last-sweep -inf makes the very first poll due unconditionally),
     Then the sweep enqueues exactly one consolidate_topic job, the dispatch
     branch awaits consolidator.consolidate_topic with (topic, model,
     continuation=False), and the job reaches done."""
@@ -91,7 +91,7 @@ async def test_sweep_enqueues_on_first_poll_and_dispatch_threads_topic_model_con
         )
         rows = await db.fetchall("SELECT * FROM jobs WHERE job_type='consolidate_topic'")
         assert len(rows) == 1 and rows[0]["status"] == "done", rows
-        assert worker._last_consolidation_sweep > 0.0  # tick stamped when it ran
+        assert worker._last_consolidation_sweep > float("-inf")  # stamped when it ran
         await db.close()
 
 
@@ -99,7 +99,8 @@ async def test_sweep_enqueues_on_first_poll_and_dispatch_threads_topic_model_con
 async def test_sweep_tick_does_not_advance_while_upstream_busy_defers():
     """Given the upstream-busy deferral active, When the worker spins deferred
     polls, Then ensure_consolidation_jobs is never called and the tick
-    timestamp stays at 0.0 (deferred iterations never advance it); once idle,
+    timestamp stays at the -inf init value (deferred iterations never advance
+    it); once idle,
     the still-due tick fires exactly once with (interval, batch 1, model)."""
     with tempfile.TemporaryDirectory() as tmp:
         db = Database(f"{tmp}/runtime.db")
@@ -121,7 +122,7 @@ async def test_sweep_tick_does_not_advance_while_upstream_busy_defers():
             worker.start()
             await asyncio.sleep(0.3)  # several deferred poll cycles
             assert ensure.await_count == 0
-            assert worker._last_consolidation_sweep == 0.0  # never stamped while deferred
+            assert worker._last_consolidation_sweep == float("-inf")  # never stamped while deferred
             counter.value = 0  # go idle: the still-due tick must now fire
             deadline = asyncio.get_running_loop().time() + 5.0
             while asyncio.get_running_loop().time() < deadline and ensure.await_count == 0:
