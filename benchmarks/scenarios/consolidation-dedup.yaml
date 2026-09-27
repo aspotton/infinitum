@@ -1,0 +1,42 @@
+name: consolidation-dedup
+description: >-
+  Three near-identical fact rows entered the store before consolidation existed
+  (seeded directly, bypassing learning, so the per-interaction learner never
+  sees them side by side); one scripted consolidation pass over the topic must
+  cluster them on lexical edges alone, reinforce the survivor, and supersede
+  the two variants.
+context:
+  user_id: eval
+  project_id: consolidation-dedup
+# Offline-only scenario: embeddings stay disabled, so clustering must pass on
+# lexical edges alone. The duplicates are SEED rows on purpose: the learner
+# merges >=0.86-lexical content it actually sees in-turn, so anything learned
+# through turns would be merged by the learner first and the consolidator's
+# whole-topic clustering would never be exercised.
+consolidation: true
+seed_memories:
+  - memory_type: fact
+    topic: mtp-bench-platform
+    content: "The MTP bench platform runs benchmark ingest jobs nightly on the shared k3s cluster in the mtp-bench GCP project using the flashstore pipeline for regression test artifacts"
+    importance: 0.7
+    confidence: 0.85
+  - memory_type: fact
+    topic: mtp-bench-platform
+    content: "The MTP bench platform runs benchmark ingest jobs nightly on the primary k3s cluster in the mtp-bench GCP project using the flashstore pipeline for regression test artifacts"
+    importance: 0.7
+    confidence: 0.85
+  - memory_type: fact
+    topic: mtp-bench-platform
+    content: "The MTP bench platform runs benchmark ingest jobs nightly on the dedicated k3s cluster in the mtp-bench GCP project using the flashstore pipeline for regression test artifacts"
+    importance: 0.7
+    confidence: 0.85
+turns:
+  - user: "Unrelated quick one - what does git blame do?"
+    assistant: "git blame shows the last commit and author for each line of a file."
+    learn: []
+final_expect:
+  created: ["shared k3s"]
+  superseded: ["primary k3s", "dedicated k3s"]
+final_probe:
+  query: "where do MTP bench platform benchmark ingest jobs run"
+  must_include: ["shared k3s"]

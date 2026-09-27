@@ -179,11 +179,33 @@ class Turn(StrictModel):
     probe: Probe | None = None
 
 
+class SeedMemory(StrictModel):
+    """A memory written straight into the store before the turn loop runs.
+
+    Seeded rows bypass learning entirely (the runner inserts them via
+    ``db.create_memory``), which is how a scenario can present duplicates the
+    per-interaction learner has already proven it cannot see.
+    """
+
+    memory_type: MemoryType
+    topic: str
+    content: str
+    importance: float = 0.5
+    confidence: float = 0.7
+
+
 class Scenario(StrictModel):
     name: str = Field(min_length=1)
     description: str
     context: ScenarioContext
     turns: list[Turn] = Field(min_length=1)
+    # Run one scripted consolidation pass over the seeded topic after the turn
+    # loop; final_expect/final_probe then grade the post-consolidation store
+    # (per-turn expects always grade in-loop, i.e. pre-consolidation).
+    consolidation: bool = False
+    seed_memories: list[SeedMemory] = Field(default_factory=list)
+    final_expect: Expectation | None = None
+    final_probe: Probe | None = None
 
 
 def load_scenario(path: str | Path) -> Scenario:

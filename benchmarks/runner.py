@@ -20,13 +20,16 @@ from fastapi.testclient import TestClient
 
 from infinitum.app import create_app
 from infinitum.config import AppConfig
+from infinitum.consolidation import MemoryConsolidator
 from infinitum.database import Database
+from infinitum.models import Memory
 
 from .corpus import (
     Expectation,
     Probe,
     Scenario,
     ScenarioContext,
+    SeedMemory,
     Turn,
     demotion_violations,
     rank_pair_label,
@@ -140,6 +143,40 @@ def _make_learn_fn(scenario: Scenario, db: Database, state: RunnerState):
         return _envelope(memories)
 
     return learn_fn
+
+
+async def _seed_memories(db: Database, seeds: list[SeedMemory]) -> None:
+    # Sequential ids make "lowest id wins" in the scripted survivor rule
+    # deterministic, so the first-authored seed is always the canonical.
+    for index, seed in enumerate(seeds):
+        await db.create_memory(
+            Memory(
+                id=f"mem_seed{index:02d}",
+                memory_type=seed.memory_type,
+                topic=seed.topic,
+                content=seed.content,
+                importance=seed.importance,
+                confidence=seed.confidence,
+            )
+        )
+
+
+def _make_consolidation_fn():
+    async def proposal_fn(clusters: Any, *, topic: str, model: str) -> dict[str, Any]:
+        entries = []
+        for index, cluster in enumerate(clusters):
+            survivor = min(cluster, key=lambda m: (-m.observation_count, m.id))
+            entries.append(
+                {
+                    "cluster_id": index,
+                    "survivor_id": survivor.id,
+                    "canonical_content": survivor.content,
+                    "conflict": False,
+                }
+            )
+        return {"clusters": entries}
+
+    return proposal_fn
 
 
 def _make_fg_handler(fg: dict[str, str]):
@@ -309,6 +346,8 @@ def run_scenario(scenario: Scenario) -> ScenarioResult:
             )
             conn = _reader(db_path)
             try:
+                if scenario.seed_memories:
+                    client.portal.call(_seed_memories, runtime.db, scenario.seed_memories)
                 for turn_index, turn in enumerate(scenario.turns):
                     fg["assistant"] = turn.assistant
                     body = {
@@ -326,6 +365,30 @@ def run_scenario(scenario: Scenario) -> ScenarioResult:
                     records.extend(_eval_expectation(conn, turn_index, turn.expect, counts0))
                     if turn.probe is not None:
                         records.extend(_eval_probe(client, headers, turn_index, turn.probe))
+                if scenario.consolidation:
+                    if not scenario.seed_memories:
+                        raise RunnerError("consolidation scenario has no seed_memories")
+                    # Three seeded rows sit under the default churn floor of 8
+                    # and would churn no-op the only pass.
+                    cfg.learning.consolidation_min_changed_memories = 1
+                    consolidator = MemoryConsolidator(
+                        runtime.db,
+                        runtime.upstream,
+                        cfg,
+                        proposal_fn=_make_consolidation_fn(),
+                    )
+                    client.portal.call(
+                        consolidator.consolidate_topic,
+                        scenario.seed_memories[0].topic,
+                        "scripted",
+                    )
+                final_index = len(scenario.turns)
+                if scenario.final_expect is not None:
+                    records.extend(
+                        _eval_expectation(conn, final_index, scenario.final_expect, {})
+                    )
+                if scenario.final_probe is not None:
+                    records.extend(_eval_probe(client, headers, final_index, scenario.final_probe))
                 snapshot = _snapshot(conn)
                 total_tokens = _total_tokens(conn)
             finally:

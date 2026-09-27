@@ -111,6 +111,16 @@ def test_defaults_when_omitted():
     assert probe.temporal_view == "current"
     assert probe.as_of is None
     assert ScenarioContext(project_id="p").user_id == "eval"
+    scenario = Scenario(
+        name="n",
+        description="d",
+        context=ScenarioContext(project_id="p"),
+        turns=[turn],
+    )
+    assert scenario.consolidation is False
+    assert scenario.seed_memories == []
+    assert scenario.final_expect is None
+    assert scenario.final_probe is None
 
 
 def test_load_scenarios_returns_sorted_and_empty_dir_ok(tmp_path):
