@@ -114,3 +114,24 @@ async def test_oldest_first_listing_and_since_count():
 
         since = _iso(base + timedelta(hours=1, minutes=30))
         assert await db.count_active_topic_memories_updated_since("t", since) == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_prefers_higher_churn_topic_when_batch_cap_is_one():
+    """Given two due topics, one with 3 active memories and one with 1, When the
+    sweep runs with batch_cap=1, Then the single enqueued job is for the
+    higher-churn topic, not the alphabetically-first one."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Database(f"{tmp}/runtime.db")
+        await db.connect()
+        for _ in range(3):
+            await _seed(db, "busy")
+        await _seed(db, "quiet")
+
+        assert await db.ensure_consolidation_jobs(604800.0, 1, "m") == 1
+        n = await db.fetchone("SELECT COUNT(*) AS n FROM jobs")
+        assert int(n["n"]) == 1
+        row = await db.fetchone(
+            "SELECT * FROM jobs WHERE job_type='consolidate_topic'"
+        )
+        assert json.loads(row["payload_json"])["topic"] == "busy"

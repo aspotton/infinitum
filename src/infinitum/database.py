@@ -46,6 +46,10 @@ _DONE_JOB_RETENTION_DAYS = 7
 # set_meta_value and read by ensure_consolidation_jobs for cadence.
 _CONSOLIDATION_META_PREFIX = "consolidation:last:"
 
+# Floor used when a topic has no checkpoint yet; mirrors _EPOCH_ISO in
+# consolidation.py so churn ranking matches the run-time churn floor.
+_CONSOLIDATION_EPOCH = "0001-01-01T00:00:00+00:00"
+
 
 def _encode_event_content(text: str) -> bytes:
     """Codec convention shared by add_event and the batch migrator (no drift)."""
@@ -1503,6 +1507,9 @@ class Database:
 
         Due means the topic has active memories, no pending/running
         consolidate_topic job, and no checkpoint newer than now-interval.
+        Due topics are ranked by churn descending (most-changed first, using
+        the same created/updated-since-checkpoint formula as
+        count_active_topic_memories_updated_since), ties broken alphabetically.
         """
         async with self._lock:
             return await asyncio.to_thread(
@@ -1518,15 +1525,21 @@ class Database:
         now_iso = now.isoformat()
         self._conn.execute("BEGIN IMMEDIATE")
         rows = self._conn.execute(
-            "SELECT DISTINCT m.topic AS topic FROM memories m"
+            "SELECT topic FROM ("
+            " SELECT m.topic AS topic,"
+            " SUM(CASE WHEN m.created_at > COALESCE(mt.value, ?)"
+            " OR m.updated_at > COALESCE(mt.value, ?)"
+            " THEN 1 ELSE 0 END) AS churn"
+            " FROM memories m"
             " LEFT JOIN jobs j ON j.job_type='consolidate_topic'"
             " AND j.status IN ('pending','running')"
             " AND json_extract(j.payload_json, '$.topic') = m.topic"
+            " LEFT JOIN meta mt ON mt.key = ? || m.topic"
             " WHERE m.status='active' AND j.id IS NULL"
-            " AND NOT EXISTS (SELECT 1 FROM meta mt"
-            " WHERE mt.key = ? || m.topic AND mt.value > ?)"
-            " ORDER BY topic LIMIT ?",
-            (_CONSOLIDATION_META_PREFIX, cutoff, batch_cap),
+            " AND (mt.key IS NULL OR mt.value <= ?)"
+            " GROUP BY m.topic ORDER BY churn DESC, m.topic LIMIT ?)",
+            (_CONSOLIDATION_EPOCH, _CONSOLIDATION_EPOCH,
+             _CONSOLIDATION_META_PREFIX, cutoff, batch_cap),
         ).fetchall()
         enqueued = 0
         for row in rows:
