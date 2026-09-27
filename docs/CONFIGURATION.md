@@ -334,7 +334,7 @@ learning:
   consolidation_max_tokens: 2048
 ```
 
-- `consolidation`: master gate, `false` by default. When unset, behavior is byte-identical to pre-consolidation builds.
+- `consolidation`: master gate, `false` by default. When unset, behavior is byte-identical to pre-consolidation builds. Enabling it also requires `learning.enabled` and an explicit `learning.model`: unlike per-interaction learning, a background sweep has no request model to reuse, so with the model unset the sweep stays silently idle.
 - `consolidation_interval_seconds`: how often one topic is eligible for a pass (default 7 days). The sweep enqueues at most one topic per minute and never while `learning.model` is unset.
 - `consolidation_min_changed_memories`: churn floor. A topic needs at least this many changed memories since its last checkpoint to be worth a pass. Consolidation's own writes do **not** count as churn for the next window — the checkpoint is stamped after mutations — so oversized topics advance via explicit continuation jobs that bypass only the churn floor.
 - `consolidation_max_memories_per_pass`: bounded working set consumed by one pass.
