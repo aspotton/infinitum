@@ -139,6 +139,21 @@ class LearningConfig(BaseModel):
     # deterministic summary from active memories rather than retrying the same
     # doomed job repeatedly.
     topic_summary_fallback_memories: int = 12
+    # Periodic deep consolidation (master gate). Off by default; when true, the
+    # learning worker runs a slow sweep over stale, changed topics in addition
+    # to per-interaction learning, so it requires learning.enabled.
+    consolidation: bool = False
+    # How often one topic is eligible for a consolidation pass (7 days).
+    consolidation_interval_seconds: float = 604800.0
+    # Churn floor: a topic needs at least this many changed memories since its
+    # last consolidation checkpoint to be worth a pass. Consolidation's own
+    # writes do not count toward this (checkpoint is stamped after mutations).
+    consolidation_min_changed_memories: int = 8
+    # Bounded working set per pass; oversized topics advance via explicit
+    # continuation jobs rather than an unbounded single call.
+    consolidation_max_memories_per_pass: int = 60
+    # Token cap for the consolidation generation itself.
+    consolidation_max_tokens: int = 2048
 
 
 class RequestContextConfig(BaseModel):

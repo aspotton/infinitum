@@ -9,7 +9,7 @@ This file is the working guide for coding agents contributing to Infinitum.
 - Repository slug: `infinitum`
 - Python distribution/package: `infinitum`
 - Primary CLI: `infinitum`
-- Current release line: `0.3.x`
+- Current release line: `0.5.x`
 
 The pre-0.2 project name was **Context Runtime**. All pre-0.2 compatibility shims (the old Python namespace, the old CLI alias, the old config environment variable, and the old header aliases) were removed. Do not use the old name in new public APIs, examples, or prose except in historical notes.
 
@@ -49,7 +49,8 @@ Primary code lives in `src/infinitum/`.
 - `request_context.py` — user/project/CWD header resolution
 - `retrieval.py` — hybrid scoring, temporal demotion, context affinity
 - `compiler.py` — token-aware memory selection/rendering/injection
-- `learning.py` — extraction, reinforcement, supersession, incremental topic summaries, worker
+- `learning.py` — extraction, reinforcement, supersession, incremental topic summaries, worker (also hosts the gated consolidation sweep)
+- `consolidation.py` — periodic deep consolidation: pure greedy union-find clustering (`build_clusters`) plus `MemoryConsolidator`, one bounded LLM proposal call per topic pass, merges applied only through the learner's guarded reinforce/supersede primitives, `consolidation.pass`/`consolidation.conflict` events, per-topic meta checkpoint
 - `text.py` — shared scoring primitives: normalization, lexical/topic similarity, bounded phrase comparison (length-bound skip + 8192-char backstop), freshness decay (used by retrieval and reinforcement guards)
 - `tokenizer.py` — `TokenCounter` feeding the compiler token budget
 - `embeddings.py` — OpenAI-compatible embedding client
@@ -129,16 +130,24 @@ Streaming has two `memory.stream_reasoning` modes: `live` tees model reasoning d
 Background path:
 
 ```
-learning.py:LearningWorker._run → db.claim_job (jobs table, SQLite)
-  → MemoryLearner.learn → retriever.search (bounded nearby set)
+learning.py:LearningWorker._run → db.claim_job (jobs table, SQLite; three job kinds:
+    learn_interaction, refresh_topic_summary, consolidate_topic; unknown kinds raise loud)
+  → learn_interaction → MemoryLearner.learn → retriever.search (bounded nearby set)
   → LLM proposes → _apply (deterministic guards; text.py similarity) → db.mark_topic_dirty
   → refresh_topic_summary → _deterministic_topic_fallback on empty output
-  → db.finish_job / db.fail_job (backoff 2**attempts, capped 60s)
+  → consolidate_topic → gated sweep (learning.consolidation + learning.model set) enqueues
+    via db.ensure_consolidation_jobs, one topic/min → consolidation.py:
+    MemoryConsolidator.consolidate_topic → build_clusters → one LLM proposal →
+    guarded reinforce/supersede merge → consolidation.pass/conflict events → meta
+    checkpoint stamped after mutations → mark_topic_dirty rebuilds the summary;
+    full working sets re-enqueue as explicit continuation passes bypassing only the
+    churn floor
+  → db.finish_job / db.fail_job (backoff 2**attempts, capped 60s; attempts > max_attempts fails)
 ```
 
 Interrupted jobs self-heal two ways: `claim_job` adopts a stale `running` lock past a lease of `learning.timeout_seconds + 60s` (derived from config, no new config key), and `recover_interrupted_jobs` in `build_runtime` requeues interrupted jobs at startup. The startup call sits above the dirty-topic recovery, though the order is functionally neutral. Both paths assume a single process: the startup requeue presumes no other live instance is using the DB. Graceful shutdown waits up to `STOP_GRACE_SECONDS` (5s, module constant, no config key) for the worker task, then cancels it; a cancelled mid-job task leaves the row in the same `running` state as a crash, which these two recovery paths already handle.
 
-Key symbols: `build_runtime` (runtime.py), `create_app` (app.py), `chat_completions` (routes/openai.py), `ContextCompiler.compile/inject` (compiler.py), `MemoryRetriever.search` (retrieval.py), `MemoryLearner.learn/_apply` (learning.py), `LearningWorker` (learning.py), durable job queue `enqueue_job/claim_job/finish_job/fail_job` (database.py).
+Key symbols: `build_runtime` (runtime.py), `create_app` (app.py), `chat_completions` (routes/openai.py), `ContextCompiler.compile/inject` (compiler.py), `MemoryRetriever.search` (retrieval.py), `MemoryLearner.learn/_apply` (learning.py), `LearningWorker` (learning.py), `MemoryConsolidator.consolidate_topic` and `build_clusters` (consolidation.py), durable job queue `enqueue_job/claim_job/finish_job/fail_job` plus `ensure_consolidation_jobs` (database.py).
 
 Temporal view wiring: the `current` view (used by `compiler.py` for injected context and by `POST /memory/search` via the `MemorySearchRequest` default) demotes naturally-expired active rows by `EXPIRED_FACTOR = 0.70` applied after the relevance gates rather than excluding them, while the learner (`learning.py`) and drill-down memory tools (`memory_tools.py`) keep the retriever's `"all"` default; the retriever's `superseded_by` score-factor tier is documented-unreachable because supersede always flips status off active, keeping the candidate set active-only.
 
@@ -186,7 +195,7 @@ Before packaging a release, verify at minimum:
 
 Read `docs/ROADMAP.md` before implementing larger features. Key future work includes:
 
-- the Phase 1 evaluation loop is implemented in `benchmarks/` (golden corpus, offline runner, precision/recall + token metrics, live replay); the remaining Phase 1 item is periodic deep consolidation, deferred to its own future update;
+- Phase 1 is implemented except for 1.2 retrieval-outcome ingestion: the evaluation loop lives in `benchmarks/` (golden corpus, offline runner, precision/recall + token metrics, live replay) and periodic deep consolidation ships at topic-level depth (`consolidation.py`, opt-in via `learning.consolidation`); cross-topic and corpus-wide consolidation passes remain deferred;
 - hard user/project/session/agent memory scopes;
 - authenticated identity from a trusted LiteLLM edge;
 - organization/team memory and authoritative directives/goals;

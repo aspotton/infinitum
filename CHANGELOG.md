@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+Added:
+
+- Periodic deep consolidation now ships as an opt-in third processing timescale (roadmap 1.5), off by default and gated on `learning.enabled` and a configured `learning.model`. A sweep inside the learning worker enqueues at most one `consolidate_topic` job per minute for stale, high-churn topics, and each pass clusters a bounded working set deterministically, makes a single bounded model proposal, and applies merges only through the same guarded reinforce/supersede primitives the per-turn learner already trusts, so the model proposes and deterministic code owns mutation. A per-topic checkpoint is stamped after the mutations, so a pass's own writes never count as churn for the next window, and oversized topics advance through explicit continuation passes that bypass only the churn floor. Every pass writes a `consolidation.pass` audit event, contradictions surface as inert `consolidation.conflict` events that nothing auto-resolves, and the affected topic summary is rebuilt through the existing dirty-marking path. Consolidation is implemented at topic-level depth; cross-topic and corpus-wide passes remain deferred.
+
 ## 0.5.3
 
 Changed:

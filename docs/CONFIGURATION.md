@@ -321,6 +321,27 @@ learning:
 
 Dirty state is cleared only after a usable model summary or the deterministic active-memory fallback has been persisted. If new evidence arrives while a summary is running, it remains dirty and is scheduled for a follow-up rather than being lost.
 
+## Periodic consolidation controls
+
+Periodic deep consolidation is the third timescale: a slow sweep over stale, changed topics that clusters near-duplicates, canonicalizes them, and records conflicts. It is opt-in and requires `learning.enabled`, because the learner worker hosts the sweep.
+
+```yaml
+learning:
+  consolidation: true
+  consolidation_interval_seconds: 604800
+  consolidation_min_changed_memories: 8
+  consolidation_max_memories_per_pass: 60
+  consolidation_max_tokens: 2048
+```
+
+- `consolidation`: master gate, `false` by default. When unset, behavior is byte-identical to pre-consolidation builds. Enabling it also requires `learning.enabled` and an explicit `learning.model`: unlike per-interaction learning, a background sweep has no request model to reuse, so with the model unset the sweep stays silently idle.
+- `consolidation_interval_seconds`: how often one topic is eligible for a pass (default 7 days). The sweep enqueues at most one topic per minute and never while `learning.model` is unset.
+- `consolidation_min_changed_memories`: churn floor. A topic needs at least this many changed memories since its last checkpoint to be worth a pass. Consolidation's own writes do **not** count as churn for the next window — the checkpoint is stamped after mutations — so oversized topics advance via explicit continuation jobs that bypass only the churn floor.
+- `consolidation_max_memories_per_pass`: bounded working set consumed by one pass.
+- `consolidation_max_tokens`: token cap for the consolidation generation itself.
+
+Conflicts found during consolidation are recorded as `consolidation.conflict` events and are otherwise inert; nothing is auto-resolved.
+
 ## Reinforcement tuning knobs
 
 Useful tuning controls:
