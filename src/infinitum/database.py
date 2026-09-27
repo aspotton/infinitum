@@ -41,6 +41,11 @@ _EVENT_COMPRESSION_BATCH_BYTES = 8 * 1024 * 1024
 # ponytail: no config key; add one only when someone needs shorter retention.
 _DONE_JOB_RETENTION_DAYS = 7
 
+# Meta key prefix for the per-topic consolidation checkpoint: one ISO timestamp
+# of the last completed consolidation pass, written by MemoryConsolidator via
+# set_meta_value and read by ensure_consolidation_jobs for cadence.
+_CONSOLIDATION_META_PREFIX = "consolidation:last:"
+
 
 def _encode_event_content(text: str) -> bytes:
     """Codec convention shared by add_event and the batch migrator (no drift)."""
@@ -1457,3 +1462,84 @@ class Database:
         )
         self._conn.commit()
         return cursor.rowcount
+
+    # Periodic consolidation --------------------------------------------------
+    async def get_meta_value(self, key: str) -> str | None:
+        row = await self.fetchone("SELECT value FROM meta WHERE key=?", (key,))
+        return str(row["value"]) if row else None
+
+    async def set_meta_value(self, key: str, value: str) -> None:
+        await self.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+
+    async def list_active_topic_memories_oldest(
+        self, topic: str, limit: int = 100
+    ) -> list[Memory]:
+        """Oldest-first topic page; rotated processing moves survivors out of the window."""
+        rows = await self.fetchall(
+            "SELECT * FROM memories WHERE status='active' AND topic=?"
+            " ORDER BY updated_at ASC, id ASC LIMIT ?",
+            (topic, limit),
+        )
+        return [await self._row_to_memory(r) for r in rows]
+
+    async def count_active_topic_memories_updated_since(
+        self, topic: str, since_iso: str
+    ) -> int:
+        row = await self.fetchone(
+            "SELECT COUNT(*) AS n FROM memories"
+            " WHERE status='active' AND topic=? AND (created_at > ? OR updated_at > ?)",
+            (topic, since_iso, since_iso),
+        )
+        return int(row["n"]) if row else 0
+
+    async def ensure_consolidation_jobs(
+        self, interval_seconds: float, batch_cap: int, model: str
+    ) -> int:
+        """Enqueue due consolidate_topic jobs; at most batch_cap per sweep.
+
+        Due means the topic has active memories, no pending/running
+        consolidate_topic job, and no checkpoint newer than now-interval.
+        """
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._ensure_consolidation_jobs_sync, interval_seconds, batch_cap, model
+            )
+
+    def _ensure_consolidation_jobs_sync(
+        self, interval_seconds: float, batch_cap: int, model: str
+    ) -> int:
+        assert self._conn is not None
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(seconds=max(0.0, interval_seconds))).isoformat()
+        now_iso = now.isoformat()
+        self._conn.execute("BEGIN IMMEDIATE")
+        rows = self._conn.execute(
+            "SELECT DISTINCT m.topic AS topic FROM memories m"
+            " LEFT JOIN jobs j ON j.job_type='consolidate_topic'"
+            " AND j.status IN ('pending','running')"
+            " AND json_extract(j.payload_json, '$.topic') = m.topic"
+            " WHERE m.status='active' AND j.id IS NULL"
+            " AND NOT EXISTS (SELECT 1 FROM meta mt"
+            " WHERE mt.key = ? || m.topic AND mt.value > ?)"
+            " ORDER BY topic LIMIT ?",
+            (_CONSOLIDATION_META_PREFIX, cutoff, batch_cap),
+        ).fetchall()
+        enqueued = 0
+        for row in rows:
+            self._conn.execute(
+                "INSERT INTO jobs(id, job_type, status, payload_json, created_at, run_after, attempts) "
+                "VALUES (?, 'consolidate_topic', 'pending', ?, ?, ?, 0)",
+                (
+                    new_id("job"),
+                    json.dumps({"topic": row["topic"], "model": model}, separators=(",", ":")),
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            enqueued += 1
+        self._conn.commit()
+        return enqueued
