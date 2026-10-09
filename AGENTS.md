@@ -9,7 +9,7 @@ This file is the working guide for coding agents contributing to Infinitum.
 - Repository slug: `infinitum`
 - Python distribution/package: `infinitum`
 - Primary CLI: `infinitum`
-- Current release line: `0.5.x`
+- Current release line: `0.6.x`
 
 The pre-0.2 project name was **Context Runtime**. All pre-0.2 compatibility shims (the old Python namespace, the old CLI alias, the old config environment variable, and the old header aliases) were removed. Do not use the old name in new public APIs, examples, or prose except in historical notes.
 
@@ -193,7 +193,7 @@ Before packaging a release, verify at minimum:
 
 ## Roadmap direction
 
-Read `docs/ROADMAP.md` before implementing larger features. Key future work includes:
+Read `docs/ROADMAP.md` before implementing larger features. The recommended next-release order is the evidence-ranked **Immediate next work (N1–N7)** section in `docs/ROADMAP.md` (topic canonicalization, FTS-first retrieval candidates, live embeddings/tools decision, evidence features in ranking, outcome signals v0, history/event drill-down tools, PROJECT-vs-GLOBAL hard eligibility); N2 is a prerequisite for N7. Key future work includes:
 
 - Phase 1 is implemented except for 1.2 retrieval-outcome ingestion: the evaluation loop lives in `benchmarks/` (golden corpus, offline runner, precision/recall + token metrics, live replay) and periodic deep consolidation ships at topic-level depth (`consolidation.py`, opt-in via `learning.consolidation`); cross-topic and corpus-wide consolidation passes remain deferred;
 - hard user/project/session/agent memory scopes;
