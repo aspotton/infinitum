@@ -14,7 +14,7 @@ from .database import Database
 from .embeddings import EmbeddingClient
 from .models import Memory, MemoryCandidate, RequestContext, TopicSummary
 from .retrieval import MemoryRetriever
-from .text import compact_whitespace, lexical_similarity, normalize_text
+from .text import compact_whitespace, lexical_similarity, normalize_text, topic_slug_similarity
 from .upstream import UpstreamClient, extract_nonstream_assistant
 
 if TYPE_CHECKING:
@@ -100,6 +100,23 @@ class MemoryLearner:
             f"{x.memory.id} | {x.memory.memory_type} | {x.memory.topic} | {x.memory.content}"
             for x in existing
         ]
+        # One topic-count snapshot feeds BOTH the prompt's reusable-topic list
+        # and apply-time canonicalization below, so the model is steered toward
+        # exactly the slugs the deterministic gate would canonicalize onto.
+        topic_counts = await self.db.list_topic_counts()
+        prompt_topic_cap = self.config.memory.topic_canonicalization_prompt_topics
+        shown_topics = {x.memory.topic for x in existing}
+        listed_topics = [t for t, _c, _e in topic_counts if t not in shown_topics][
+            :prompt_topic_cap
+        ]
+        topics_section = (
+            "\nExisting topics (reuse verbatim when the subject matches; coin a new slug "
+            "only if none fits):\n"
+            + "\n".join(f"- {t}" for t in listed_topics)
+            + "\n"
+            if prompt_topic_cap > 0 and listed_topics
+            else ""
+        )
         context_lines = []
         if request_context.user_id:
             context_lines.append(f"user_id={request_context.user_id}")
@@ -125,6 +142,7 @@ class MemoryLearner:
         prompt = f"""Extract durable memories from this interaction. Return JSON only. Do not call tools or functions.
 Do not save transient chit-chat, guesses, assistant inventions, or obvious restatements, \
 or facts the user marks as temporary or today-only.
+Do not memorize session-start boilerplate or instructions that repeat verbatim across sessions.
 Prefer concise current-state facts, decisions, preferences, goals, procedures, lessons, or episodic events.
 If the user explicitly corrects or replaces an existing memory, set operation_hint='supersede', explicit_correction=true, list only relevant existing memory IDs, and copy that memory's memory_type and topic exactly.
 If this merely confirms an existing memory, use operation_hint='reinforce', set reinforces_memory_id to that existing memory ID, and copy that memory's memory_type and topic exactly.
@@ -135,7 +153,7 @@ The request context below is provenance/affinity metadata. Use it only to disamb
 Request context:\n{context_text}
 
 Existing nearby memories:\n{chr(10).join(existing_lines) or '(none)'}
-
+{topics_section}
 Interaction:\nUSER: {query}\nASSISTANT: {assistant}{tool_results_section}
 
 Schema:
@@ -185,6 +203,12 @@ Schema:
                 candidate = MemoryCandidate.model_validate(item)
                 candidate.content = compact_whitespace(candidate.content)
                 candidate.topic = compact_whitespace(candidate.topic.lower()) or "general"
+                canonical = self._canonical_topic(candidate.topic, topic_counts)
+                if canonical != candidate.topic:
+                    log.debug(
+                        "topic canonicalized on candidate: %r -> %r", candidate.topic, canonical
+                    )
+                    candidate.topic = canonical
                 candidate.importance = min(1.0, max(0.0, candidate.importance))
                 candidate.confidence = min(1.0, max(0.0, candidate.confidence))
                 if candidate.content:
@@ -211,6 +235,23 @@ Schema:
                     debounce_seconds=self.config.learning.topic_summary_debounce_seconds,
                     update_threshold=self.config.learning.topic_summary_update_threshold,
                 )
+
+    def _canonical_topic(self, topic: str, counts: list[tuple[str, int, str]]) -> str:
+        """Map a candidate topic slug onto an existing topic above the canonical floor.
+
+        The representative of the floor-matched existing-topic set is chosen by
+        active count DESC, then earliest created ASC, then topic lexicographic
+        ASC, so a candidate already at a representative is a fixed point and a
+        candidate matching nothing keeps its own slug. Deterministic code owns
+        the mapping; the extraction model only proposed the variant.
+        """
+
+        floor = self.config.memory.topic_canonical_floor
+        by_topic = {t: (c, e) for t, c, e in counts}
+        matches = [t for t in by_topic if topic_slug_similarity(topic, t) >= floor]
+        if not matches:
+            return topic
+        return min(matches, key=lambda t: (-by_topic[t][0], by_topic[t][1], t))
 
     def _parse_json(self, text: str) -> dict[str, Any]:
         text = text.strip()
@@ -315,6 +356,20 @@ Schema:
         matches = await self.retriever.search(
             candidate.content, limit=12, request_context=request_context
         )
+        # A named, shown, active reinforce target's stored topic wins over a
+        # model copy-drift in the candidate — topic ONLY, never memory_type — so
+        # the exact-equality compatibility filter below can match the target the
+        # extractor pointed at. _reinforcement_reason stays the real guard.
+        if candidate.reinforces_memory_id and candidate.reinforces_memory_id in allowed_ids:
+            named = await self.db.get_memory(candidate.reinforces_memory_id)
+            if named is not None and named.status == "active" and named.topic != candidate.topic:
+                log.debug(
+                    "reinforce topic affinity: candidate topic %r -> named target %s topic %r",
+                    candidate.topic,
+                    named.id,
+                    named.topic,
+                )
+                candidate.topic = named.topic
         compatible = [
             m
             for m in matches
@@ -407,7 +462,10 @@ Schema:
                         "missing" if not old else old.status,
                     )
                     continue
-                if old.topic != candidate.topic and not candidate.explicit_correction:
+                topic_equivalent = old.topic == candidate.topic or topic_slug_similarity(
+                    old.topic, candidate.topic
+                ) >= self.config.memory.topic_canonical_floor
+                if not topic_equivalent and not candidate.explicit_correction:
                     log.debug(
                         "supersede skipped: id %s topic mismatch (%s != %s)",
                         old_id,
@@ -415,6 +473,13 @@ Schema:
                         candidate.topic,
                     )
                     continue
+                if old.topic != candidate.topic and not candidate.explicit_correction:
+                    log.debug(
+                        "supersede topic-equivalence relaxation: id %s topic %r accepted for candidate topic %r",
+                        old_id,
+                        old.topic,
+                        candidate.topic,
+                    )
                 lexical = lexical_similarity(old.content, candidate.content)
                 related = lexical >= self.config.memory.supersede_similarity_floor
                 if related or candidate.explicit_correction:
@@ -433,13 +498,15 @@ Schema:
     ) -> set[str] | None:
         """Refine an unmarked single-target supersede proposal in place (issue #34).
 
-        An elaboration that names exactly one shown, active, same type/topic
-        target and stays above the supersede similarity floor is applied as a
-        refine: the target keeps its id, observation chain, and validity window
-        while its content converges to the newer wording. Every gate here is
-        deterministic; the LLM only names the target. Returns the refined id
-        set, or None to decline so the caller falls through to the create +
-        supersede path unchanged.
+        An elaboration that names exactly one shown, active, exact-type,
+        topic-equivalent target and stays above the supersede similarity floor
+        is applied as a refine: the target keeps its id, observation chain, and
+        validity window while its content converges to the newer wording.
+        Topic-equivalent means the stored topic may be a slug variant of the
+        candidate's above memory.topic_canonical_floor; the type stays exact.
+        Every gate here is deterministic; the LLM only names the target.
+        Returns the refined id set, or None to decline so the caller falls
+        through to the create + supersede path unchanged.
         """
 
         if candidate.explicit_correction or len(candidate.supersedes_memory_ids) != 1:
@@ -456,14 +523,27 @@ Schema:
                 "missing" if not old else old.status,
             )
             return None
-        if old.topic != candidate.topic or old.memory_type != candidate.memory_type:
+        if old.memory_type != candidate.memory_type:
             log.debug(
-                "refine declined: id %s type/topic mismatch (%s/%s)",
+                "refine declined: id %s type mismatch (%s != %s)",
                 old_id,
                 old.memory_type,
-                old.topic,
+                candidate.memory_type,
             )
             return None
+        topic_equivalent = old.topic == candidate.topic or topic_slug_similarity(
+            old.topic, candidate.topic
+        ) >= self.config.memory.topic_canonical_floor
+        if not topic_equivalent:
+            log.debug("refine declined: id %s topic mismatch (%s)", old_id, old.topic)
+            return None
+        if old.topic != candidate.topic:
+            log.debug(
+                "refine topic-equivalence relaxation: id %s topic %r accepted for candidate topic %r",
+                old_id,
+                old.topic,
+                candidate.topic,
+            )
         sim = lexical_similarity(old.content, candidate.content)
         if sim < self.config.memory.supersede_similarity_floor:
             log.debug("refine declined: similarity %.3f below floor", sim)
