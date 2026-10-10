@@ -8,7 +8,9 @@ The phases are ordered so each one can be built and validated independently.
 
 ## Progress at a glance
 
-Status as of **v0.5.x (2026-09-27)**. A checked box means the item is shipped; unchecked headings with checked sub-items are partially complete. Details and caveats live in each section below.
+Status as of **v0.6.0 (2026-10-09)**. A checked box means the item is shipped; unchecked headings with checked sub-items are partially complete. Details and caveats live in each section below.
+
+The recommended execution order for the next releases is the evidence-ranked **Immediate next work** section below (N1–N7), which supersedes any implicit ordering in the phase list.
 
 - [x] **Phase 0 — Global intelligent memory** — shipped by v0.3
   - [x] Event-sourced global memory, hybrid retrieval, bounded context compilation, async learning
@@ -38,6 +40,115 @@ Status as of **v0.5.x (2026-09-27)**. A checked box means the item is shipped; u
 - [ ] **Phase 13 — Enterprise security and governance** — not started
 - [ ] **Phase 14 — Admin and inspection UI** — not started
 - [ ] **Phase 15 — Long-term event-derived intelligence** — not started
+
+---
+
+## Immediate next work (post-v0.6.0) — evidence-ranked
+
+Work packages N1–N7, ordered by evidence collected 2026-10-09 from the maintainer's daily-driver instance (v0.6.0, one user, three CWD-derived projects, ~480 interactions in a five-hour working window, 42 days of history):
+
+| Measured | Value |
+|---|---|
+| Active memories vs topics | 2,121 active memories across 1,760 distinct topics (median topic size = 1 memory) |
+| Topic-summary coverage | 84 summarized topics ≈ 15% of active memories (summaries require `learning.topic_summary_min_memories = 3`) |
+| Reinforcement | median `observation_count` = 1; ~87% of active memories were never reinforced |
+| Live retrieval signals | embeddings disabled (the semantic weight is inert), so lexical/FTS + topic only; drill-down tools off (`memory.tools_enabled=false`) and never called (zero `memory.tool_call` events); consolidation running but reaching only the ≥3-memory topics |
+| Scale headroom | every retrieval pass loads all active rows capped at 5,000 and silently truncates above it (`retrieval.py`, `ponytail:` comment at the `list_active_memories(limit=5000)` call); actives grow ≈ 60/day, so the cap arrives in roughly 6–10 weeks |
+
+Each package is independently plannable: a planning agent should be able to turn any one of N1–N7 into a decision-complete plan without re-deriving the problem. Recommended sequence: **N1 → N2 → N3 (ops decision) → N4 → N5 → N6**, with N7 planned deliberately afterwards.
+
+### N1 — Topic discipline: canonicalization at apply time, boilerplate suppression (quality root cause)
+
+**Problem.** Topic strings are free-form LLM output — the extraction prompt asks for a `"short-stable-topic"` and nothing validates it against the existing topic namespace. The live store shows the result: 1,760 distinct topics for 2,121 active memories, including per-run slugs such as `...-execution-start-2026-09-24` where session-start boilerplate was learned as durable episodic memory with a date in the topic, so every session mints a fresh topic and a fresh memory. Consequences compound: topic summaries never trigger for one-memory topics (85% of the store has no summary); consolidation cannot find duplicates because they were filed under different topics (cross-topic passes are deferred); the topic relevance tier of the scorer is nearly inert; the store grows with session count rather than with new information.
+
+**Design guidance.**
+
+1. Apply-time canonicalization (deterministic, owns mutation per invariant 2): before `create` in `MemoryLearner._apply`, fuzzy-match the candidate's topic against the existing topic list using the similarity helpers already in `text.py`; at or above a configured floor, remap the candidate onto the existing canonical topic instead of minting a new one.
+2. Reuse over invention: include a bounded list of the current top topics (by memory count or churn; a few hundred tokens) in the extraction prompt so the extractor reuses names.
+3. Boilerplate suppression: extraction prompt guidance plus the deterministic layer must not learn session-start scaffolding text (repeated template lines with no new content).
+4. One-time backfill: a merge pass over the existing topic-slug soup (rename memories onto canonical topics, rebuild affected summaries) that rides the existing consolidation/dirty-topic machinery — renames touch only the `topic` column; memory content, ids, observation chains, and provenance are untouched.
+
+**Invariants.** Deterministic code owns the remap decision; the LLM only proposes. Topic renames never mutate events. Replaying a job converges (no observation inflation).
+
+**Acceptance.** Same-fact paraphrases across sessions land on one topic and reinforce (corpus scenario required, mirroring the issue #34 style); summary coverage on a seeded replay store rises materially above the 15% baseline; a re-run backfill writes zero changes; existing corpus gate stays green.
+
+**Deferred.** Learned topic taxonomy; embedding-clustered topic merging (N1 is lexical-first — the `ponytail:` ceiling: upgrade to embedding clustering if lexical canonicalization measurably falls short).
+
+### N2 — FTS-first retrieval candidate generation (retire the silent 5,000 scan cap)
+
+**Problem.** `MemoryRetriever.search` calls `list_active_memories(limit=5000)` and scores every row in Python on every request (plus `get_embeddings` for all ids when vectors exist). Above the cap, truncation is silent — retrieval recall decays with no signal. At ~2,100 actives and current growth this becomes a correctness regression within roughly two months, and per-request latency already scales linearly.
+
+**Design guidance.**
+
+1. Immediate stopgap (one line, ship separately if convenient): log a warning when the cap is hit.
+2. Real fix: construct the candidate set before scoring — union of FTS5 matches (`fts_memory_ids` already exists), topic-table matches, and embedding nearest neighbors when embeddings are enabled — then score only that union. Under a small-store threshold (or when the union underflows a floor), fall back to today's full scan so small stores behave byte-identically and the corpus gate is unaffected.
+3. The eligibility filter must land here: any scope filter (N7) must be a SQL predicate inside candidate construction, never a post-ranking filter (invariants 9–10). Design the candidate-builder seam so N7 drops in without restructuring.
+
+**Invariants.** The relevance gate semantics are unchanged (at least one genuine signal before query-independent terms qualify a memory); ranking weights are unchanged; results must be a superset of today's top-k for stores below the fallback threshold.
+
+**Acceptance.** Zero silent truncation at any store size (warning proves it); corpus gate and temporal-view probes green; a scale test or benchmark shows scoring cost bounded by candidate count, not active count.
+
+**Out of scope.** ANN indexes, pgvector, persistence of candidate sets (Phase 9).
+
+### N3 — Live-instance decision: enable embeddings and drill-down tools (ops, not code)
+
+**Status.** Both are shipped features running dark: `/health` on the live store reports `embeddings_enabled: false`, and `memory.tools_enabled` defaults to false with zero drill-down calls recorded. With embeddings off, the scorer's largest weight (semantic, 0.45 by default) is inert and paraphrase near-duplicates are only caught by lexical coincidence — the main driver of the never-reinforced 87% in N1's evidence.
+
+**Decision required from the maintainer.** Either (a) point `embeddings.base_url` at an OpenAI-compatible embedding model on the same hardware and enable `memory.tools_enabled` in the live config, or (b) deliberately stay lexical-only and retune `retrieval_weights` for the FTS path. Option (a) first needs a config-only trial + one `python -m benchmarks.replay` / eval-skill pass against the live store; option (b) needs a weights sweep against the corpus. Record the outcome here and in the CHANGELOG if behavior changes.
+
+**Deferred.** Vector storage beyond float32 blobs; embedding version migration tooling.
+
+### N4 — Evidence features in retrieval ranking (completes 1.4)
+
+**Problem.** The `memory_observations`/`memory_observation_sources` ledger ships, but ranking ignores it (1.4's own text: "retrieval ranking still ignores the evidence features... deferred"). With ~87% singletons, a stale repeated fact and a freshly corrected one rank on importance/freshness alone.
+
+**Design guidance.** Add bounded features to `base_score`: `log1p(independent_evidence_count)` (distinct source events or distinct sessions, not raw repetition) and optionally an `evidence_type` weight (user_assertion/tool_verified vs legacy/assistant_inference). Default the new weight(s) to 0.0 (or ship behind the existing weights validation), sweep against the corpus offline, then enable at the measured best value. Never let repetition alone dominate a newer explicit correction (the ledger already distinguishes them).
+
+**Acceptance.** Corpus precision/recall does not regress with features off (weight 0) and improves measurably with them on; replayed evidence never changes scores (fingerprints already dedupe); docs/CONFIGURATION.md gains the new knob(s).
+
+### N5 — Retrieval outcome signals v0 (completes 1.2)
+
+**Problem.** 1.2 is offline-only: `request_memories` records injections, but no outcome signals are ingested, so quality loops run on manual replay alone.
+
+**Design guidance.** v0 emits deterministic outcome events only — no online ranking loop (1.2's own warning against self-reinforcement):
+
+1. Next-turn correction detection: when the next user message lexically contradicts content that was injected into the immediately prior request (compare against the injected set already recorded in `request_memories`), record one event (new `event_type`, e.g. `retrieval.outcome`, with the memory ids and the signal kind).
+2. Drill-down outcomes: `memory.tool_call` events already record calls and stripping; classify hit/miss against what was injected.
+
+Consumption stays offline: `benchmarks/` and the eval skill read these events; nothing feeds live ranking until evaluation proves benefit. Cost must stay on the background path, never the foreground response path (invariant 5).
+
+**Acceptance.** Detection fires on a scripted corpus probe (correction-after-injection) and on a negative control (unrelated follow-up) does not; event volume bounded (one per turn pair); replay tool/eval skill report outcome counts.
+
+**Deferred.** Application-facing feedback endpoints (thumbs, task callbacks) — no client exists yet; keep the event schema open for them.
+
+### N6 — `memory_history` and `event_get` tools (completes 2.1)
+
+**Design guidance.** The `TOOL_DEFS`/`build_tool_defs`/name-dispatch `execute` scaffolding in `memory_tools.py` is already generic; add exactly two read-only tools: `memory_history(memory_id)` walks the `superseded_by` chain plus source events and observations (the "why does it believe this" drill path), `event_get(event_id)` returns one raw event through the existing transparent decode path (events are truth — return recorded content as stored, including `request.received` byte-exactness). The hallucination contract is unchanged: any `infinitum_`-prefixed call not exposed this request is rejected server-side; streaming/non-stream loop behavior is untouched. Update the docs/API.md tool contract and the memory-block footer hint (watch the footer literal coupling noted in `compiler.py` — share one constant).
+
+**Acceptance.** Both tools appear only with `memory.tools_enabled`; hallucinated names still rejected; debug reject counter unchanged for them; focused tests on both transport paths (this codebase's streaming loop tests are the template).
+
+### N7 — Phase 3-lite: hard PROJECT vs GLOBAL eligibility (plan deliberately)
+
+**Why now.** The three live projects already contaminate each other's context (cross-scope interference is N1-adjacent but survives topic fixes), and the `subtle-supersession` corpus canary in this file's Phase 0 section is the standing expectation this retires. Full Phase 3 (USER/SESSION/AGENT scopes, promotion, trusted identity) stays deferred — but the minimal two-scope boundary is small, and it must be built into N2's candidate construction, which is why N2 precedes it.
+
+**Design guidance.**
+
+1. Additive column `memories.scope` (`'global'|'project'`, existing rows migrate to `'global'`) plus `project_key` resolved through the existing `RequestContextResolver`.
+2. Learner-side classification stays deterministic: a candidate whose source events all share one resolved project AND matches an existing project-scoped topic/type may be project-scoped; everything else defaults global. Promotion project→global requires evidence across distinct projects.
+3. Retrieval: eligible set = `GLOBAL ∪ PROJECT(current)` as a SQL filter **before** semantic ranking (invariants 9–10). Supersession/refine eligibility gated to the same boundary: one request never silently rewrites another scope's derived state.
+4. Identity remains untrusted headers — this is a scoping-hygiene boundary, not security (invariant 9; Phase 4 supplies real identity). Say exactly that in docs.
+
+**Acceptance.** The `subtle-supersession` shared-store probe passes unmodified (the canary retires); cross-project replay probes show project A's memories absent from project B's candidate set (eligibility-before-ranking, proven by test); an old database opens and migrates in place with zero behavior change until `scope` is written; all existing tests green with the default-everything migration.
+
+**Out of scope.** Authentication, signed identity, USER/SESSION scopes, promotion machinery beyond the two-scope rule, any UI.
+
+### Housekeeping bundle (fold into any PR touching these files)
+
+- The roadmap progress header carries an evidence date (v0.6.0, 2026-10-09), not a maintained version stamp; AGENTS.md no longer duplicates the version number at all — `__version__` in `src/infinitum/__init__.py` is the only source, per the AGENTS.md versioning rules.
+- Memory-block footer literal is coupled across three sites (`compiler.py` ×2, `routes/openai.py`) with no test tying them — extract one shared constant.
+- Rebuild the dev `.venv` when it next breaks (`uv venv && uv pip install -e '.[dev]'`); the corpus gate is the canary that this matters.
+- Thin coverage: `upstream.py` (2 tests), retrieval-limit behavior (2 tests), `tokenizer.py` (none).
+- Optional: a single `GET /status` diagnostics endpoint consolidating health + queue/topic/store stats for operator visibility (a previously approved plan for it never landed).
 
 ---
 
