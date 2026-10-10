@@ -144,7 +144,7 @@ Consumption stays offline: `benchmarks/` and the eval skill read these events; n
 
 ### Housekeeping bundle (fold into any PR touching these files)
 
-- The `v0.6.0` version stamps (ROADMAP progress header, AGENTS.md release line) were corrected with this section's addition; future releases update both sites at bump time.
+- The roadmap progress header carries an evidence date (v0.6.0, 2026-10-09), not a maintained version stamp; AGENTS.md no longer duplicates the version number at all — `__version__` in `src/infinitum/__init__.py` is the only source, per the AGENTS.md versioning rules.
 - Memory-block footer literal is coupled across three sites (`compiler.py` ×2, `routes/openai.py`) with no test tying them — extract one shared constant.
 - Rebuild the dev `.venv` when it next breaks (`uv venv && uv pip install -e '.[dev]'`); the corpus gate is the canary that this matters.
 - Thin coverage: `upstream.py` (2 tests), retrieval-limit behavior (2 tests), `tokenizer.py` (none).
