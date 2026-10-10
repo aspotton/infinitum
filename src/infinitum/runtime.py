@@ -12,7 +12,7 @@ from .embeddings import EmbeddingClient
 from .learning import LearningWorker, MemoryLearner
 from .request_context import RequestContextResolver
 from .retrieval import MemoryRetriever
-from .text import topic_slug_similarity
+from .text import _DIGITS_RE, topic_slug_similarity
 from .tokenizer import TokenCounter
 from .upstream import UpstreamClient
 
@@ -67,9 +67,9 @@ async def backfill_topic_canonicalization(db: Database, config: AppConfig) -> No
 
     Every distinct active topic is clustered transitively via greedy
     union-find (mirroring ``consolidation.build_clusters``) at
-    ``memory.topic_canonical_floor`` slug similarity — the digit veto in
-    ``topic_slug_similarity`` means date-distinct slugs never share an edge,
-    so they land in separate clusters. Each multi-member cluster's
+    ``memory.topic_canonical_floor`` slug similarity — the veto is enforced
+    transitively via per-root digit signatures, so date-distinct slugs never
+    share a cluster even via undated bridges. Each multi-member cluster's
     representative is picked by the same rule as
     ``learning.MemoryLearner._canonical_topic`` (active count DESC, earliest
     created ASC, topic lexicographic ASC) and every other member is mapped
@@ -88,6 +88,15 @@ async def backfill_topic_canonicalization(db: Database, config: AppConfig) -> No
     topics = [topic for topic, _, _ in counts]
     floor = config.memory.topic_canonical_floor
     parent = list(range(len(topics)))
+    # Per-root digit-multiset signatures contributed by DATED members
+    # (undated members contribute nothing). The both-sided digit veto is
+    # enforced at cluster level here, not just per edge, so an undated bridge
+    # can never join two date-distinct slugs transitively.
+    sigs: dict[int, set[tuple[str, ...]]] = {}
+    for i, topic in enumerate(topics):
+        seqs = _DIGITS_RE.findall(topic)
+        if seqs:
+            sigs[i] = {tuple(sorted(seqs))}
 
     def find(i: int) -> int:
         while parent[i] != i:
@@ -97,8 +106,14 @@ async def backfill_topic_canonicalization(db: Database, config: AppConfig) -> No
 
     def union(i: int, j: int) -> None:
         ri, rj = find(i), find(j)
-        if ri != rj:
-            parent[max(ri, rj)] = min(ri, rj)
+        if ri == rj:
+            return
+        if any(a != b for a in sigs.get(ri, ()) for b in sigs.get(rj, ())):
+            return
+        parent[max(ri, rj)] = min(ri, rj)
+        moved = sigs.pop(max(ri, rj), set())
+        if moved:
+            sigs.setdefault(min(ri, rj), set()).update(moved)
 
     for i in range(len(topics)):
         for j in range(i + 1, len(topics)):

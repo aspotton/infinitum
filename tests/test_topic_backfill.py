@@ -24,6 +24,9 @@ SINGLETON = "lakeside-outpost-log"
 MAPPING_KEYS = {CLUSTER_A_VARIANT, CLUSTER_B_VARIANT}
 CHECKPOINT_OLD = "2021-01-01T00:00:00+00:00"
 CHECKPOINT_NEW = "2023-01-01T00:00:00+00:00"
+X_BRIDGE = "x-start"
+X_DATE_A = "x-start-2026-09-24"
+X_DATE_B = "x-start-2026-10-01"
 
 
 def _config(path: str) -> AppConfig:
@@ -119,6 +122,32 @@ async def test_backfill_remaps_clusters_and_keeps_date_distinct_pair():
         for mem_id in by_topic[SINGLETON]:
             assert topics[mem_id] == SINGLETON
         assert await db.get_meta_value("topic_canonicalization_done") == "1"
+        await db.close()
+
+
+async def test_backfill_undated_bridge_never_joins_date_distinct_slugs():
+    """F4 rejection case: an undated bridge slug must not transitively merge
+    two date-distinct siblings; it merges with exactly one of them."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Database(f"{tmp}/runtime.db")
+        await db.connect()
+        ids = {}
+        for topic in (X_BRIDGE, X_DATE_A, X_DATE_B):
+            mem = await db.create_memory(Memory(topic=topic, content=f"{topic} note"))
+            ids[topic] = mem.id
+        await db.execute("UPDATE memories SET created_at=? WHERE id=?", (EARLY, ids[X_DATE_A]))
+        await db.execute("UPDATE memories SET created_at=? WHERE id=?", (LATE, ids[X_DATE_B]))
+
+        await backfill_topic_canonicalization(db, _config(f"{tmp}/runtime.db"))
+
+        topics = await _topics_of(db)
+        assert topics[ids[X_DATE_A]] == X_DATE_A
+        assert topics[ids[X_DATE_B]] == X_DATE_B  # the dated pair stays apart
+        assert len({topics[ids[t]] for t in ids}) == 2  # bridge merged with exactly one
+        # Count tie -> earliest-created wins: the bridge joins the earliest dated
+        # sibling (edge order is deterministic, so it is always the first one).
+        assert topics[ids[X_BRIDGE]] == X_DATE_A
+        assert not await db.fetchall("SELECT 1 FROM memories WHERE topic=?", (X_BRIDGE,))
         await db.close()
 
 
