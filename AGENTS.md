@@ -99,13 +99,14 @@ Per interaction, the learner should see the current interaction plus a bounded n
 For candidate mutation:
 
 - explicit correction/supersession takes precedence over reinforcement;
-- an explicit correction may supersede across a drifted topic as a replacement of the target memory, not a merge; implicit supersede and reinforcement remain type/topic-gated (invariant 4 unchanged);
-- reinforcement requires exact memory type/topic compatibility;
+- an explicit correction may supersede across a drifted topic as a replacement of the target memory, not a merge; implicit supersede and reinforcement remain type/topic-gated (invariant 4 unchanged), where topic equivalence at `memory.topic_canonical_floor` counts as the same topic and `memory_type` matching stays exact everywhere;
+- candidate topics are canonicalized deterministically at apply time: at or above `memory.topic_canonical_floor` slug similarity a candidate is filed under the existing topic's representative (active count DESC, earliest created ASC, lexicographic ASC), with a digit-sequence veto keeping date-distinct slugs never remapped onto each other;
+- reinforcement requires exact memory type/topic compatibility (after that canonicalization);
 - near-identical lexical matches may reinforce deterministically;
 - high semantic similarity may reinforce when embeddings are available;
 - learner-proposed `reinforces_memory_id` is advisory and must pass deterministic guards;
 - retries/replays of the same source events must not inflate `observation_count`;
-- an unmarked supersede proposal (explicit_correction=false) naming a single shown, active, same-type/topic target at or above `memory.supersede_similarity_floor` resolves to a refine: the target is reinforced with the candidate's content (same id, observation chain, and validity window), not superseded; explicit corrections keep the correction/supersede behavior above unchanged (issue #34).
+- an unmarked supersede proposal (explicit_correction=false) naming a single shown, active target of the same type and a topic equivalent to the candidate's at `memory.topic_canonical_floor` (topic equivalence replaces the exact topic copy) at or above `memory.supersede_similarity_floor` resolves to a refine: the target is reinforced with the candidate's content (same id, observation chain, and validity window), not superseded; explicit corrections keep the correction/supersede behavior above unchanged (issue #34).
 
 Topic summaries are incremental: dirty topic deltas are coalesced, then an existing summary is updated from a bounded set of changed memories plus a small context sample. Do not regress to resending an entire large topic after every interaction.
 
