@@ -357,6 +357,19 @@ memory:
 
 The `memory.supersede_similarity_floor` knob (default `0.30`), which already gates implicit supersede similarity, also gates refine routing: an unmarked supersede proposal naming a single shown, active, same type/topic target refines that memory in place only when lexical similarity sits at or above this floor (issue #34).
 
+## Topic canonicalization knobs
+
+Topic slugs that differ only by word order, separator, or affix variants are the same topic. Without canonicalization, exact-string topic gates never match slug variants, which is why 87% of active memories in a measured live store have `observation_count = 1` — equivalent facts keep landing in sibling topics instead of reinforcing one memory.
+
+```yaml
+memory:
+  topic_canonical_floor: 0.85
+  topic_canonicalization_prompt_topics: 40
+```
+
+- `memory.topic_canonical_floor` (default `0.85`) — slug-aware similarity required to treat two topics as equivalent when merging at apply time and during the one-time startup backfill. This is deliberately separate from `supersede_similarity_floor`; topic slugs are short strings where a 0.30 floor would collapse unrelated topics.
+- `memory.topic_canonicalization_prompt_topics` (default `40`) — how many existing topics are listed in the extraction prompt so the extractor reuses canonical topic names instead of inventing near-duplicates. Set to `0` to disable the block.
+
 ## Sample setup that works for me
 
 The primary maintainer runs a local Qwen model on an NVIDIA DGX Spark, with Infinitum pointing directly at it. This is the working configuration for that single-machine setup:
