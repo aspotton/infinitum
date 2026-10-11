@@ -59,6 +59,8 @@ Each package is independently plannable: a planning agent should be able to turn
 
 ### N1 — Topic discipline: canonicalization at apply time, boilerplate suppression (quality root cause)
 
+**Status.** Landed on `feat/topic-canonicalization` (open PR, pre-release): apply-time canonicalization at `memory.topic_canonical_floor`, a bounded existing-topics list in the extraction prompt, similarity-gated implicit supersede/refine routes, and a one-time idempotent startup backfill; the `topic-discipline` corpus scenario is the standing regression gate. Boilerplate suppression remains prompt-guidance only.
+
 **Problem.** Topic strings are free-form LLM output — the extraction prompt asks for a `"short-stable-topic"` and nothing validates it against the existing topic namespace. The live store shows the result: 1,760 distinct topics for 2,121 active memories, including per-run slugs such as `...-execution-start-2026-09-24` where session-start boilerplate was learned as durable episodic memory with a date in the topic, so every session mints a fresh topic and a fresh memory. Consequences compound: topic summaries never trigger for one-memory topics (85% of the store has no summary); consolidation cannot find duplicates because they were filed under different topics (cross-topic passes are deferred); the topic relevance tier of the scorer is nearly inert; the store grows with session count rather than with new information.
 
 **Design guidance.**

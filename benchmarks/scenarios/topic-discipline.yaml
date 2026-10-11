@@ -1,0 +1,45 @@
+name: topic-discipline
+description: >-
+  The same decision learned across two sessions where the extraction model
+  labels the second one with a suffix-variant topic slug (deploy vs
+  deployment style, no digit difference); apply-time canonicalization must file
+  it under the existing topic and reinforce the existing memory instead of
+  minting a duplicate under a near-identical topic.
+context:
+  user_id: eval
+  project_id: topic-discipline
+turns:
+  - user: "Decision from the platform review: we're standardizing the deploy pipeline on ArgoCD, not Jenkins."
+    assistant: "Recorded - the deploy pipeline standardizes on ArgoCD."
+    learn:
+      - operation: new
+        memory_type: decision
+        topic: argocd-deploy-pipeline
+        content: "Deploy pipeline standardized on ArgoCD instead of Jenkins"
+        importance: 0.7
+        confidence: 0.85
+    expect:
+      created: ["ArgoCD instead of Jenkins"]
+
+  - user: "Quick unrelated one - does ArgoCD sync automatically when I push to the tracked git branch?"
+    assistant: "By default auto-sync is opt-in per Application; set syncPolicy.automated if you want push-to-sync."
+    learn: []
+
+  - user: "New session, picking the infra work back up. What's our policy on storing pipeline secrets?"
+    assistant: "Pipeline secrets stay in the vault and are referenced from the manifests, never committed to the repo."
+    learn: []
+
+  - user: "Confirming from the infra side: the deployment pipeline decision stands, ArgoCD over Jenkins."
+    assistant: "Confirmed - the deployment pipeline uses ArgoCD, chosen over Jenkins."
+    learn:
+      - operation: new
+        memory_type: decision
+        topic: argocd-deployment-pipeline
+        content: "Deploy pipeline standardized on ArgoCD instead of Jenkins"
+        importance: 0.7
+        confidence: 0.85
+    expect:
+      reinforced: ["ArgoCD instead of Jenkins"]
+    probe:
+      query: "deployment pipeline tool decision argocd"
+      must_include: ["ArgoCD instead of Jenkins"]

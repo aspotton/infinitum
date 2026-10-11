@@ -40,6 +40,12 @@ def test_reinforcement_controls_have_safe_defaults():
     assert cfg.memory.reinforce_hint_min_semantic == 0.72
 
 
+def test_topic_canonicalization_controls_have_safe_defaults():
+    cfg = load_config()
+    assert cfg.memory.topic_canonical_floor == 0.85
+    assert cfg.memory.topic_canonicalization_prompt_topics == 40
+
+
 def test_stream_reasoning_defaults():
     cfg = AppConfig()
     assert cfg.memory.stream_reasoning == "live"

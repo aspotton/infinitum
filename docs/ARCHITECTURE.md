@@ -232,7 +232,7 @@ The dirty set is revision-safe: if the same memory changes again while a summary
 
 ### Three processing timescales
 
-- **Every interaction:** extract durable memories using the current interaction plus a small nearest-memory set.
+- **Every interaction:** extract durable memories using the current interaction, a small nearest-memory set, and a bounded list of existing topic names to reuse verbatim when the subject matches. A proposed topic slug is then canonicalized deterministically onto the nearest existing topic at or above `memory.topic_canonical_floor` (digit-vetoed, count/age/lexicographic representative rule) before any gate sees it.
 - **Incremental:** coalesce topic changes and maintain current topic summaries from deltas. This is implemented in V0.1.2+.
 - **Periodic:** implemented at topic-level depth, opt-in via `learning.consolidation` (off by default, requires `learning.enabled`). A gated sweep inside the learning worker enqueues `consolidate_topic` jobs for stale, high-churn topics (at most one topic per minute, only while `learning.model` is set). Each pass clusters a bounded working set deterministically, makes one bounded LLM proposal call, and applies merges only through the guarded reinforce/supersede primitives the learner already trusts, then stamps a per-topic checkpoint in the meta table after the mutations and records `consolidation.pass` / `consolidation.conflict` audit events. The topic summary is rebuilt through the existing dirty-marking path; oversized topics advance via explicit continuation passes that bypass only the churn floor. Cross-topic and corpus-wide passes remain roadmap work. Controls: [docs/CONFIGURATION.md](CONFIGURATION.md#periodic-consolidation-controls).
 

@@ -12,6 +12,7 @@ from .embeddings import EmbeddingClient
 from .learning import LearningWorker, MemoryLearner
 from .request_context import RequestContextResolver
 from .retrieval import MemoryRetriever
+from .text import _DIGITS_RE, topic_slug_similarity
 from .tokenizer import TokenCounter
 from .upstream import UpstreamClient
 
@@ -61,9 +62,100 @@ class Runtime:
     active_requests: ActiveRequestCounter = field(default_factory=ActiveRequestCounter)
 
 
+async def backfill_topic_canonicalization(db: Database, config: AppConfig) -> None:
+    """One-time repair of a historical store's drifted topic slugs.
+
+    Every distinct active topic is clustered transitively via greedy
+    union-find (mirroring ``consolidation.build_clusters``) at
+    ``memory.topic_canonical_floor`` slug similarity — the veto is enforced
+    transitively via per-root digit signatures, so date-distinct slugs never
+    share a cluster even via undated bridges. Each multi-member cluster's
+    representative is picked by the same rule as
+    ``learning.MemoryLearner._canonical_topic`` (active count DESC, earliest
+    created ASC, topic lexicographic ASC) and every other member is mapped
+    onto it; singletons contribute nothing. The mapping is applied through
+    ``db.rename_topics`` (one transaction keeping FTS, jobs, checkpoints, and
+    the topics table consistent), then the done flag is stamped LAST, so a
+    crash before the stamp re-runs the whole pass and ``rename_topics`` of an
+    already-applied mapping is a verified no-op. Data hygiene, not a learning
+    feature: this runs regardless of ``learning.enabled`` — without
+    ``learning.model`` the summary enqueue inside ``rename_topics`` degrades
+    to dirty-marking, which startup dirty-recovery picks up.
+    """
+    if await db.get_meta_value("topic_canonicalization_done"):
+        return
+    counts = await db.list_topic_counts()
+    topics = [topic for topic, _, _ in counts]
+    floor = config.memory.topic_canonical_floor
+    parent = list(range(len(topics)))
+    # Per-root digit-multiset signatures contributed by DATED members
+    # (undated members contribute nothing). The both-sided digit veto is
+    # enforced at cluster level here, not just per edge, so an undated bridge
+    # can never join two date-distinct slugs transitively.
+    sigs: dict[int, set[tuple[str, ...]]] = {}
+    for i, topic in enumerate(topics):
+        seqs = _DIGITS_RE.findall(topic)
+        if seqs:
+            sigs[i] = {tuple(sorted(seqs))}
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri == rj:
+            return
+        if any(a != b for a in sigs.get(ri, ()) for b in sigs.get(rj, ())):
+            return
+        parent[max(ri, rj)] = min(ri, rj)
+        moved = sigs.pop(max(ri, rj), set())
+        if moved:
+            sigs.setdefault(min(ri, rj), set()).update(moved)
+
+    for i in range(len(topics)):
+        for j in range(i + 1, len(topics)):
+            if topic_slug_similarity(topics[i], topics[j]) >= floor:
+                union(i, j)
+
+    groups: dict[int, list[str]] = {}
+    for i, topic in enumerate(topics):
+        groups.setdefault(find(i), []).append(topic)
+
+    by_topic = {topic: (count, earliest) for topic, count, earliest in counts}
+    mapping: dict[str, str] = {}
+    clusters = 0
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        representative = min(members, key=lambda t: (-by_topic[t][0], by_topic[t][1], t))
+        clusters += 1
+        for member in members:
+            if member != representative:
+                mapping[member] = representative
+
+    await db.rename_topics(
+        mapping,
+        model=config.learning.model,
+        debounce_seconds=config.learning.topic_summary_debounce_seconds,
+        min_memories=config.learning.topic_summary_min_memories,
+    )
+    await db.set_meta_value("topic_canonicalization_done", "1")
+    log.info(
+        "topic canonicalization backfill: %d topics remapped from %d clusters",
+        len(mapping),
+        clusters,
+    )
+
+
 async def build_runtime(config: AppConfig) -> Runtime:
     db = Database(config.memory.database_path)
     await db.connect()
+    # Runs BEFORE the recovery blocks below: dirty-recovery re-enqueues from
+    # the renamed topic_updates rows, so the store repair must land first.
+    await backfill_topic_canonicalization(db, config)
     embeddings = EmbeddingClient(config.embeddings)
     upstream = UpstreamClient(config)
     retriever = MemoryRetriever(db, embeddings, config)

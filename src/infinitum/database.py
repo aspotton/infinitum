@@ -1104,6 +1104,170 @@ class Database:
             updated_at=_dt(row["updated_at"]),
         )
 
+    async def list_topic_counts(self) -> list[tuple[str, int, str]]:
+        """Active-memory counts per topic: (topic, count, earliest created_at ISO).
+
+        Ordered by count descending then topic ascending — the deterministic
+        representative rule shared by learner canonicalization and the startup
+        backfill clustering.
+        """
+        rows = await self.fetchall(
+            "SELECT topic, COUNT(*) AS c, MIN(created_at) AS earliest"
+            " FROM memories WHERE status='active' GROUP BY topic"
+            " ORDER BY c DESC, topic ASC"
+        )
+        return [(r["topic"], int(r["c"]), str(r["earliest"])) for r in rows]
+
+    async def rename_topics(
+        self,
+        mapping: dict[str, str],
+        *,
+        model: str = "",
+        debounce_seconds: float = 0.0,
+        min_memories: int = 0,
+    ) -> int:
+        """Retag variant topic slugs to canonical ones in ONE transaction.
+
+        For each variant != canonical pair in the mapping: memories rows are
+        retagged (the ``updated_at`` bump is INTENTIONAL — it drives later
+        consolidation reconciliation), ``topic_updates`` rows move merge-safely
+        (a ``(topic, memory_id)`` PK collision just means the canonical side
+        already holds the dirty row), pending/running job payloads have their
+        top-level ``$.topic`` rewritten via ``json_set`` — never a blind string
+        REPLACE, so content mentioning the slug survives byte-identical — while
+        failed/done jobs stay untouched, ``consolidation:last:`` checkpoints
+        merge into the canonical key via MIN (oldest wins = most overdue), and
+        ``topics`` rows are deleted ONLY for mapping-key topics left with zero
+        active memories; survivor counts refresh from the live counts and
+        topics absent from the mapping are NEVER touched.
+
+        Canonical topics that actually gained rows AND reach ``min_memories``
+        active memories are marked dirty for a summary rebuild (a
+        ``refresh_topic_summary`` job is enqueued only when ``model`` is
+        given); below-threshold and lost topics are never marked. ``running``
+        job rows are rewritten because only the pre-worker startup backfill may
+        call this, so any running row is a crashed leftover whose stale payload
+        would otherwise requeue and stamp a phantom checkpoint. Idempotent:
+        re-applying an already-applied mapping (or ``{}``) writes nothing and
+        skips even the post-commit FTS rebuild, which runs once because
+        memories_fts indexes ``topic`` and stale variant tokens would poison
+        FTS candidate generation. Returns the number of memories rows moved.
+        """
+        async with self._lock:
+            moved = await asyncio.to_thread(
+                self._rename_topics_sync,
+                mapping,
+                model,
+                debounce_seconds,
+                min_memories,
+            )
+        if moved and self.fts_enabled:
+            # _rebuild_fts_sync commits internally, so it can only run after
+            # the rename transaction committed — same to_thread+lock pattern
+            # as its startup caller in _initialize_fts.
+            async with self._lock:
+                await asyncio.to_thread(self._rebuild_fts_sync)
+        return moved
+
+    def _rename_topics_sync(
+        self,
+        mapping: dict[str, str],
+        model: str,
+        debounce_seconds: float,
+        min_memories: int,
+    ) -> int:
+        assert self._conn is not None
+        pairs = [(variant, canonical) for variant, canonical in mapping.items() if variant != canonical]
+        if not pairs:
+            return 0
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        moved = 0
+        gained_by_canonical: dict[str, list[str]] = {}
+        self._conn.execute("BEGIN IMMEDIATE")
+        for variant, canonical in pairs:
+            gained = [
+                r["id"]
+                for r in self._conn.execute(
+                    "SELECT id FROM memories WHERE topic=?", (variant,)
+                ).fetchall()
+            ]
+            if gained:
+                self._conn.execute(
+                    "UPDATE memories SET topic=?, updated_at=? WHERE topic=?",
+                    (canonical, now_iso, variant),
+                )
+                moved += len(gained)
+                gained_by_canonical.setdefault(canonical, []).extend(gained)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO topic_updates(topic, memory_id, created_at)"
+                " SELECT ?, memory_id, created_at FROM topic_updates WHERE topic=?",
+                (canonical, variant),
+            )
+            self._conn.execute(
+                "DELETE FROM topic_updates WHERE topic=?", (variant,)
+            )
+            self._conn.execute(
+                "UPDATE jobs SET payload_json=json_set(payload_json, '$.topic', ?)"
+                " WHERE status IN ('pending','running')"
+                " AND json_extract(payload_json, '$.topic')=?",
+                (canonical, variant),
+            )
+            checkpoint = self._conn.execute(
+                "SELECT value FROM meta WHERE key=?",
+                (_CONSOLIDATION_META_PREFIX + variant,),
+            ).fetchone()
+            if checkpoint:
+                self._conn.execute(
+                    "INSERT INTO meta(key, value) VALUES(?, ?)"
+                    " ON CONFLICT(key) DO UPDATE SET value=MIN(meta.value, excluded.value)",
+                    (_CONSOLIDATION_META_PREFIX + canonical, checkpoint["value"]),
+                )
+                self._conn.execute(
+                    "DELETE FROM meta WHERE key=?",
+                    (_CONSOLIDATION_META_PREFIX + variant,),
+                )
+        counts = {
+            r["topic"]: int(r["c"])
+            for r in self._conn.execute(
+                "SELECT topic, COUNT(*) AS c FROM memories"
+                " WHERE status='active' GROUP BY topic"
+            ).fetchall()
+        }
+        for variant in {v for v, _ in pairs}:
+            if not counts.get(variant):
+                self._conn.execute("DELETE FROM topics WHERE topic=?", (variant,))
+        for canonical in {c for _, c in pairs}:
+            self._conn.execute(
+                "UPDATE topics SET memory_count=? WHERE topic=? AND memory_count<>?",
+                (counts.get(canonical, 0), canonical, counts.get(canonical, 0)),
+            )
+        threshold = max(1, min_memories)
+        for canonical, gained_ids in gained_by_canonical.items():
+            if counts.get(canonical, 0) < threshold:
+                continue
+            for memory_id in dict.fromkeys(gained_ids):
+                self._conn.execute(
+                    "INSERT INTO topic_updates(topic, memory_id, created_at)"
+                    " VALUES(?, ?, ?)"
+                    " ON CONFLICT(topic, memory_id) DO UPDATE SET created_at=excluded.created_at",
+                    (canonical, memory_id, now_iso),
+                )
+            if not model:
+                continue
+            dirty_row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM topic_updates WHERE topic=?", (canonical,)
+            ).fetchone()
+            dirty = int(dirty_row["n"]) if dirty_row else 0
+            due = (
+                now
+                if dirty >= threshold
+                else datetime.fromtimestamp(now.timestamp() + max(0.0, debounce_seconds), timezone.utc)
+            )
+            self._ensure_topic_summary_job_sync(canonical, model, due)
+        self._conn.commit()
+        return moved
+
     # Incremental topic-summary dirty state ----------------------------------
     async def mark_topic_dirty(
         self,

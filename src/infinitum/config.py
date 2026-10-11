@@ -62,6 +62,13 @@ class MemoryConfig(BaseModel):
     reinforce_hint_min_lexical: float = 0.40
     reinforce_hint_min_semantic: float = 0.72
     supersede_similarity_floor: float = 0.30
+    # Slug-aware topic equivalence floor for canonicalization merges and the
+    # startup backfill. Deliberately separate from supersede_similarity_floor:
+    # topic slugs are short strings where 0.30 would collapse unrelated topics.
+    topic_canonical_floor: float = 0.85
+    # Size of the existing-topics list injected into the extraction prompt so
+    # the extractor reuses canonical topic names; 0 disables the block.
+    topic_canonicalization_prompt_topics: int = 40
     freshness_half_life_days: float = 120.0
     # Exposes infinitum_memory_search/infinitum_memory_get to the model on every
     # memory-enabled request (static exposure for prompt-cache stability);
