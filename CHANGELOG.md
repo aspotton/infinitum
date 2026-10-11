@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.1
+
+Added:
+
+- Topic canonicalization makes repeated facts converge onto one topic instead of sprouting lexical variants. A candidate topic is snapped deterministically to an existing topic at apply time when slug similarity reaches `memory.topic_canonical_floor` (default 0.85), with a hard veto: two slugs carrying different digit sequences (dates) are never treated as the same topic, so date-distinct episodic records never merge. The extraction prompt now shows the model the current active-topic list so it reuses canonical names, supersede/refine proposals that name a shown, active, type-equal, topic-equivalent target resolve to a refine of that memory rather than a duplicate-plus-supersede, and misnamed targets are gated by the same similarity floor. A one-time, idempotent startup backfill clusters and renames accumulated topic variants in existing stores inside a single transaction (search index, queued jobs, and consolidation checkpoints kept consistent, provenance preserved), stamping a done flag so every later boot is a zero-write no-op; no manual migration or configuration is required, and the digit veto is enforced at cluster level so an undated bridge topic can never transitively join date-distinct siblings. (#54)
+- The benchmarks corpus gained a `topic-discipline` scenario locking this behavior into the evaluation gate. (#54)
+
 ## 0.6.0
 
 Added:
