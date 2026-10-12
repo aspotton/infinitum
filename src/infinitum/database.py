@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import lzma
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,8 @@ from typing import Any
 import numpy as np
 
 from .models import Event, Memory, Observation, RequestContext, TopicSummary, new_id, utc_now
+
+log = logging.getLogger(__name__)
 
 # Evidence kinds that carry full authority; paraphrases and derived
 # observations count half as much as direct evidence.
@@ -761,7 +764,14 @@ class Database:
         return [await self._row_to_memory(r) for r in rows]
 
     async def list_active_memories(self, limit: int = 5000) -> list[Memory]:
-        return await self.list_memories(limit=limit, status="active")
+        result = await self.list_memories(limit=limit, status="active")
+        if len(result) == limit:
+            log.warning(
+                "active memory scan hit limit=%d; results are truncated past the cap"
+                " - see N2 candidate retrieval",
+                limit,
+            )
+        return result
 
     async def list_active_topic_memories(self, topic: str, limit: int = 100) -> list[Memory]:
         return await self.list_memories(limit=limit, status="active", topic=topic)
