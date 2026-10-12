@@ -962,3 +962,69 @@ class LearningWorker:
                     retry=retry,
                     delay_seconds=min(60.0, 2.0 ** job["attempts"]),
                 )
+
+
+# Startup embedding backfill (N2 todo 6, GAP-8). Bounded probe batch per pass;
+# the plan fixes the batch cap, so one embed call per text never buffers more
+# than this many vectors in RAM.
+_BACKFILL_BATCH = 16
+
+
+async def embedding_backfill_sweep(
+    db: Database, embeddings: EmbeddingClient, config: AppConfig
+) -> None:
+    """Heal vectorless active memories at startup (model-scoped, cursor-only).
+
+    The startup probe IS the selector: there is NO sticky done flag, so a
+    failed embed leaves the meta cursor ``vector_backfill_cursor:<model>``
+    below the failed id and the next startup retries exactly those ids
+    (Metis E7). The cursor advances per successfully embedded id (monotonic
+    max, ids probed ascending), so a mid-batch failure or a crash never skips
+    an unhealed row. An empty probe terminates the sweep after a full pass —
+    this is a one-shot coroutine, never a sleep loop; the next boot's probe is
+    the idle check. Started with ``asyncio.create_task`` from ``build_runtime``
+    and never awaited (invariant 5: learning stays off the foreground path).
+    """
+    # First statement returns before any await, so a disabled-embeddings task
+    # spawned by tests/CI finishes on its first scheduling tick.
+    if not config.embeddings.enabled:
+        return
+    model = config.embeddings.model
+    key = f"vector_backfill_cursor:{model}"
+    cursor = await db.get_meta_value(key) or ""
+    while True:
+        ids = await db.vector_backfill_probe(model, cursor, _BACKFILL_BATCH)
+        if not ids:
+            return
+        for memory_id in ids:
+            memory = await db.get_memory(memory_id)
+            if memory is None:
+                # Row deleted between probe and fetch: it can never be
+                # selected again, so carry the cursor past it.
+                cursor = memory_id
+                await db.set_meta_value(key, cursor)
+                continue
+            try:
+                vector = await embeddings.embed(memory.content)
+            except Exception as exc:  # graceful degradation is intentional here
+                log.warning(
+                    "embedding backfill failed for %s (%s); cursor kept at %r,"
+                    " these ids retry at next startup",
+                    memory_id,
+                    exc,
+                    cursor,
+                )
+                return
+            if vector is None:
+                # EmbeddingClient's own swallowed failure mode: stopping here
+                # (not spinning) is what makes "next startup retries" true.
+                log.warning(
+                    "embedding backfill got no vector for %s; cursor kept at %r,"
+                    " these ids retry at next startup",
+                    memory_id,
+                    cursor,
+                )
+                return
+            await db.set_embedding(memory_id, model, vector)
+            cursor = memory_id
+            await db.set_meta_value(key, cursor)

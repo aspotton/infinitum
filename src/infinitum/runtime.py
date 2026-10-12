@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -9,7 +10,7 @@ from .config import AppConfig
 from .consolidation import MemoryConsolidator
 from .database import Database
 from .embeddings import EmbeddingClient
-from .learning import LearningWorker, MemoryLearner
+from .learning import LearningWorker, MemoryLearner, embedding_backfill_sweep
 from .request_context import RequestContextResolver
 from .retrieval import MemoryRetriever
 from .text import _DIGITS_RE, topic_slug_similarity
@@ -175,6 +176,15 @@ async def build_runtime(config: AppConfig) -> Runtime:
         MemoryConsolidator(db, upstream, config) if config.learning.consolidation else None
     )
     worker = LearningWorker(db, learner, config, active_requests, consolidator=consolidator)
+    # Fire-and-forget AFTER the startup recoveries (invariant 5): the sweep
+    # returns without awaiting anything when embeddings are disabled, so the
+    # task finishes on its first scheduling tick in tests; when enabled it
+    # heals vectorless rows in bounded batches and terminates after a full
+    # pass. Never awaited here, so serve never blocks on embedding calls.
+    asyncio.create_task(
+        embedding_backfill_sweep(db, embeddings, config),
+        name="infinitum-embedding-backfill",
+    )
     return Runtime(
         config,
         db,

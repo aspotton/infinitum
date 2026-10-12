@@ -1216,6 +1216,26 @@ class Database:
             result[row["memory_id"]] = (row["model"], vec)
         return result
 
+    async def vector_backfill_probe(
+        self, model: str, cursor: str, limit: int
+    ) -> list[str]:
+        """Active memory ids with no embedding row for ``model``, past ``cursor``.
+
+        Startup-backfill selector (N2 todo 6): the LEFT JOIN is conditioned on
+        ``e.model`` so rows vectorized under a different model count as
+        vectorless and heal via the ``set_embedding`` upsert on a model change.
+        ``id > cursor ORDER BY id`` copies the event-compression cursor
+        pattern; an empty result means the pass is done, not an error.
+        """
+        rows = await self.fetchall(
+            "SELECT m.id FROM memories m"
+            " LEFT JOIN memory_embeddings e ON e.memory_id=m.id AND e.model=?"
+            " WHERE m.status='active' AND e.memory_id IS NULL AND m.id > ?"
+            " ORDER BY m.id LIMIT ?",
+            (model, cursor, limit),
+        )
+        return [row["id"] for row in rows]
+
     # Topics -----------------------------------------------------------------
     async def upsert_topic(self, summary: TopicSummary) -> None:
         await self.execute(
