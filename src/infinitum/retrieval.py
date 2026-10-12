@@ -74,6 +74,12 @@ def validity_factor(valid_until: str | None, now: datetime) -> float:
     return EXPIRED_FACTOR if until is not None and until < now else 1.0
 
 
+def _query_dim(query_vec: np.ndarray | list[float]) -> int:
+    # One dim derivation for both cache call sites: a list from a mocked
+    # embed() (test pattern) must not crash or key differently from an ndarray.
+    return int(np.asarray(query_vec).ravel().shape[0])
+
+
 def _is_high_authority(memory: Memory) -> bool:
     """High-authority persistent goals/decisions that survive wording mismatch."""
     return memory.memory_type in {"goal", "decision"} and memory.importance >= 0.85
@@ -85,6 +91,18 @@ class MemoryRetriever:
         self.embeddings = embeddings
         self.config = config
         self._warned_fallbacks: set[tuple[str, str]] = set()
+        # Watermark-invalidated embedding-matrix cache (N2 todo 5, see
+        # ``_vector_cache``). Single-process assumption, already a documented
+        # runtime property (claim_job lease in database.py; __main__.py serves
+        # uvicorn with no workers): a crash or a second process simply starts
+        # with an empty cache, which is correct, just one rebuild behind.
+        self._vec_watermark: tuple[str | None, int] | None = None
+        self._vec_model: str | None = None
+        self._vec_dim: int | None = None
+        self._vec_rows: dict[str, tuple[str, np.ndarray]] | None = None
+        self._vec_ids: list[str] = []
+        self._vec_matrix: np.ndarray | None = None
+        self._vector_cache_rebuilds: int = 0
 
     async def search(
         self,
@@ -271,30 +289,34 @@ class MemoryRetriever:
             now,
         )
 
-    async def _semantic_candidates(
-        self, query_vec: np.ndarray | None, floor: float | None = None
-    ) -> list[str]:
-        """Ids whose stored vector clears ``floor`` against the query vector.
+    async def _vector_cache(self, model: str, dim: int) -> dict[str, tuple[str, np.ndarray]]:
+        """Ensure the normalized embedding matrix matches the table; return the raw row map.
 
-        Isolated so the todo-5 watermark cache can replace this bulk fetch
-        without touching dispatch. One whole-store vector read (``None`` is
-        the fetch-all marker; an empty list would hit the same fetch-all
-        branch in ``Database.get_embeddings``, never an empty result). The
-        model/dim filter and zero-norm treatment mirror the scorer's own
-        guards (cosine 0.0), so this arm is a superset of the scorer's
-        semantic gate clears; the ``floor - 1e-9`` margin absorbs 1-ULP drift
-        between the matrix dot form and the per-row ``cosine_similarity``.
+        The cache key is ``(embeddings_watermark, model, dim)``: the embeddings
+        table's OWN watermark (``memory_state_watermark`` deliberately ignores
+        embedding writes, compiler.py:136-137), so any inserted or replaced
+        vector invalidates while unchanged state never re-fetches a blob. A
+        model or dim change forces a rebuild even at an unchanged watermark,
+        so a mid-life config change can never serve a poisoned matrix. The
+        rebuild is ONE ``get_embeddings(None)`` fetch (``None`` is the
+        fetch-all marker; an empty list would hit the same fetch-all branch,
+        never an empty result) and decodes every blob exactly once. Rows
+        failing the model/dim filter never enter the matrix (they score 0.0
+        by absence, exactly the scorer's ``cosine_similarity`` shape guard);
+        zero-norm rows stay as zero rows (cos 0.0, matching the same guard's
+        zero-denominator branch). Single-process assumption: same documented
+        runtime property as the claim_job lease; a crash or second process
+        simply starts with an empty cache, which is correct.
         """
-        if query_vec is None:
-            return []
-        threshold = (
-            self.config.memory.minimum_relevance_score - 1e-9
-            if floor is None
-            else floor
-        )
+        watermark = await self.db.embeddings_watermark()
+        if (
+            self._vec_rows is not None
+            and self._vec_watermark == watermark
+            and self._vec_model == model
+            and self._vec_dim == dim
+        ):
+            return self._vec_rows
         rows = await self.db.get_embeddings(None)
-        model = self.config.embeddings.model
-        dim = int(query_vec.shape[0])
         ids: list[str] = []
         vectors: list[np.ndarray] = []
         for memory_id, (row_model, vector) in rows.items():
@@ -302,17 +324,48 @@ class MemoryRetriever:
                 continue
             ids.append(memory_id)
             vectors.append(vector)
-        if not vectors:
+        matrix = np.zeros((len(ids), dim), dtype=np.float64)
+        if vectors:
+            stacked = np.asarray(vectors, dtype=np.float64)
+            norms = np.linalg.norm(stacked, axis=1, keepdims=True)
+            norms[norms == 0.0] = 1.0
+            matrix = stacked / norms
+        self._vector_cache_rebuilds += 1
+        self._vec_watermark = watermark
+        self._vec_model = model
+        self._vec_dim = dim
+        self._vec_rows = rows
+        self._vec_ids = ids
+        self._vec_matrix = matrix
+        return rows
+
+    async def _semantic_candidates(
+        self, query_vec: np.ndarray | None, floor: float | None = None
+    ) -> list[str]:
+        """Ids whose stored vector clears ``floor`` against the query vector.
+
+        Membership arm over the watermark-guarded matrix cache
+        (``_vector_cache``): unchanged watermark -> pure matmul, no blob
+        fetch. Excluded/mismatched rows score 0.0 by absence and zero-norm
+        rows score cos 0.0, mirroring the scorer's own guards, so this arm
+        stays a superset of the scorer's semantic gate clears; the
+        ``floor - 1e-9`` margin absorbs 1-ULP drift between the matrix's
+        normalized-dot form and the per-row ``cosine_similarity``.
+        """
+        if query_vec is None:
             return []
-        matrix = np.asarray(vectors, dtype=np.float64)
-        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-        norms[norms == 0.0] = 1.0
         q = np.asarray(query_vec, dtype=np.float64).ravel()
         q_norm = float(np.linalg.norm(q))
         if q_norm == 0.0:
             return []
-        cos = (matrix / norms) @ (q / q_norm)
-        return [memory_id for memory_id, value in zip(ids, cos) if value >= threshold]
+        threshold = (
+            self.config.memory.minimum_relevance_score - 1e-9
+            if floor is None
+            else floor
+        )
+        _ = await self._vector_cache(self.config.embeddings.model, _query_dim(query_vec))
+        cos = self._vec_matrix @ (q / q_norm)
+        return [memory_id for memory_id, value in zip(self._vec_ids, cos) if value >= threshold]
 
     async def _fallback_with_reason(
         self,
@@ -364,7 +417,17 @@ class MemoryRetriever:
 
         fts_ids = set(await self.db.fts_memory_ids(query, limit=candidate_limit * 3))
         query_vec = await self.embeddings.embed(query)
-        embedding_map = await self.db.get_embeddings([m.id for m in active]) if query_vec is not None else {}
+        # Served from the shared vector cache's raw row map (todo-5's one
+        # authorized deviation from the verbatim extraction): identical rows ->
+        # identical id->(model,vector) values -> byte-identical scores, without
+        # the per-request blob fetch.
+        embedding_map: dict[str, tuple[str, np.ndarray]] = {}
+        if query_vec is not None:
+            rows = await self._vector_cache(
+                self.config.embeddings.model, _query_dim(query_vec)
+            )
+            wanted = {m.id for m in active}
+            embedding_map = {k: v for k, v in rows.items() if k in wanted}
         affinity_map = await self.db.memory_context_affinity(
             [m.id for m in active], request_context
         )

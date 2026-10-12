@@ -1192,6 +1192,23 @@ class Database:
         }
 
     # Embeddings -------------------------------------------------------------
+    async def embeddings_watermark(self) -> tuple[str | None, int]:
+        """Invalidation watermark for the embedding table alone (N2 todo 5).
+
+        ``(MAX(updated_at), COUNT(*))`` over ``memory_embeddings``. Deliberately
+        separate from ``memory_state_watermark``: embedding writes must not move
+        that one (compiler.py:136-137), yet the retriever's vector-matrix cache
+        must invalidate whenever any vector is inserted or replaced. The COUNT
+        term catches a same-timestamp write that leaves MAX unmoved; the
+        ``set_embedding`` upsert refreshes ``updated_at`` even on the ON
+        CONFLICT path, so a replaced vector always moves MAX. Returns
+        ``(None, 0)`` when the table is empty.
+        """
+        row = await self.fetchone(
+            "SELECT MAX(updated_at) AS w, COUNT(*) AS n FROM memory_embeddings"
+        )
+        return (row["w"], int(row["n"])) if row is not None else (None, 0)
+
     async def set_embedding(self, memory_id: str, model: str, vector: np.ndarray) -> None:
         arr = np.asarray(vector, dtype=np.float32)
         await self.execute(
