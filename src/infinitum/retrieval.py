@@ -116,7 +116,7 @@ class MemoryRetriever:
         Limitation: a naturally expiring memory (``valid_until`` passing with
         no row write) does not move the session-block invalidation watermark,
         which is MAX(updated_at)-based (``Database.memory_state_watermark``,
-        database.py:780). A session-pinned compiled block can therefore
+        database.py:1040). A session-pinned compiled block can therefore
         keep showing a naturally-expired fact until the next memory write
         bumps the watermark.
         """

@@ -78,6 +78,8 @@ Each package is independently plannable: a planning agent should be able to turn
 
 ### N2 — FTS-first retrieval candidate generation (retire the silent 5,000 scan cap)
 
+**Status.** Implemented (pre-release, `feat/n2-fts-first-candidates`): the cap now warns when hit; above `memory.full_scan_threshold` (default 500) retrieval scores a five-arm candidate union (FTS5 all-terms, semantic membership, high-authority, phrase-window, topic-window) whose completeness is derived from the scorer's own gate math, with a byte-identical small-store path and a loud, rate-limited fallback on degeneracy. The candidate builder carries the N7 eligibility seam as `extra_predicate_sql`, ANDed into every arm's SQL. ANN indexes and the N7 scoped-eligibility predicate itself stay open; the honest degeneration note is in [ARCHITECTURE.md](ARCHITECTURE.md#relevance-eligibility). The design prose below is preserved as the historical plan of record.
+
 **Problem.** `MemoryRetriever.search` calls `list_active_memories(limit=5000)` and scores every row in Python on every request (plus `get_embeddings` for all ids when vectors exist). Above the cap, truncation is silent — retrieval recall decays with no signal. At ~2,100 actives and current growth this becomes a correctness regression within roughly two months, and per-request latency already scales linearly.
 
 **Design guidance.**

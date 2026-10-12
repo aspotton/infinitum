@@ -44,9 +44,10 @@ class MemoryConfig(BaseModel):
     enabled: bool = True
     database_path: str = "./infinitum.db"
     retrieve_candidates: int = 50
-    # N2 fallback/kill-switch threshold: below this active-memory count the fast
-    # candidate path may run; the huge default means the full scan always runs.
-    full_scan_threshold: int = 10**9
+    # N2 fallback/kill-switch threshold: stores at or below this active-memory
+    # count keep the byte-identical verbatim full-scan path; a huge value is the
+    # kill switch that pins every store to the full scan.
+    full_scan_threshold: int = 500
     minimum_retrieval_score: float = 0.18
     # Eligibility gate requiring at least one query-dependent signal (semantic,
     # lexical, or topic) above a deliberately low zero-signal net. This is NOT a

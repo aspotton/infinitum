@@ -370,6 +370,15 @@ memory:
 - `memory.topic_canonical_floor` (default `0.85`) — slug-aware similarity required to treat two topics as equivalent when merging at apply time and during the one-time startup backfill. This is deliberately separate from `supersede_similarity_floor`; topic slugs are short strings where a 0.30 floor would collapse unrelated topics.
 - `memory.topic_canonicalization_prompt_topics` (default `40`) — how many existing topics are listed in the extraction prompt so the extractor reuses canonical topic names instead of inventing near-duplicates. Set to `0` to disable the block.
 
+## Retrieval candidate fast path
+
+```yaml
+memory:
+  full_scan_threshold: 500
+```
+
+- `memory.full_scan_threshold` (default `500`) — stores with an active-memory count at or below this value keep the byte-identical full-scan retrieval path; above it, retrieval scores a provably-complete candidate shortlist instead of every active memory (mechanics in [ARCHITECTURE.md](ARCHITECTURE.md#relevance-eligibility)). No configuration is required to benefit. Setting a huge value (e.g. `1000000000`) is the kill switch: every store takes the full-scan path. The shortlist also yields to the full scan whenever `memory.minimum_relevance_score` sits below `0.08`, because the shortlist's completeness proof rests on that floor.
+
 ## Sample setup that works for me
 
 The primary maintainer runs a local Qwen model on an NVIDIA DGX Spark, with Infinitum pointing directly at it. This is the working configuration for that single-machine setup:

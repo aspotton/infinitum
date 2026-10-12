@@ -320,11 +320,20 @@ def _total_tokens(conn: sqlite3.Connection) -> int:
     return int(row["n"])
 
 
-def run_scenario(scenario: Scenario) -> ScenarioResult:
+def run_scenario(scenario: Scenario, *, candidates: bool = False) -> ScenarioResult:
+    """Replay one scenario offline.
+
+    ``candidates=True`` forces the retrieval candidate fast path on the
+    constructed config (``full_scan_threshold=1``) so the corpus gate can
+    exercise it; the ceiling stays ``max(1, 50*3)=150``, above every corpus
+    store size, so the arms run without degenerating.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         db_path = f"{tmp}/eval.db"
         cfg = AppConfig()
         cfg.memory.database_path = db_path
+        if candidates:
+            cfg.memory.full_scan_threshold = 1
         cfg.learning.enabled = True
         cfg.learning.poll_interval_seconds = _POLL_SECONDS
         cfg.learning.topic_summaries = False

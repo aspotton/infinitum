@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+Added:
+
+- Memory retrieval shortlists instead of reading the whole store. Above `memory.full_scan_threshold` (default `500` active memories), each search scores a provably-complete candidate shortlist — FTS5 text matches, semantic-membership matches, topic and phrase-length windows, and high-importance goals/decisions — while smaller stores keep byte-identical full-scan behavior and a huge threshold value is the kill switch back to always scanning. A shortlist that cannot narrow retreats to the full scan with a warning logged at most once per cause, never silently, and per-request row loads no longer run a sources query per memory. Results, gates, weights, and ranking are unchanged; a seeded parity test and both corpus-gate modes pin that down.
+- Active memories missing an embedding vector heal themselves at startup: a model-scoped, bounded, non-blocking backfill embeds whatever lacks a vector for the configured embedding model, so enabling embeddings or changing models no longer leaves part of the store silently invisible to semantic search.
+- The offline corpus runner gained a `--candidates` flag that forces the fast candidate path, so the evaluation gate now exercises both retrieval modes.
+
+Changed:
+
+- A retrieval pass that reads its 5,000-row ceiling now logs a warning. Above the cap truncation was silent, so recall decayed with no signal.
+
 ## 0.6.1
 
 Added:
