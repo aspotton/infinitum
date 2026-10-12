@@ -125,6 +125,37 @@ class MemoryRetriever:
 
         result_limit = limit if limit is not None else self.config.memory.retrieve_candidates
         candidate_limit = max(result_limit, self.config.memory.retrieve_candidates)
+        now = datetime.now(timezone.utc)
+        # todo 4 inserts the threshold/fast-path dispatch here; the full scan is
+        # the unconditional path until then. The "as_of" view only reaches here
+        # with a validated bound (the block above raises otherwise); other views
+        # never read the bound, so `now` stands in to keep the type total.
+        return await self._full_scan(
+            query,
+            result_limit,
+            candidate_limit,
+            request_context,
+            temporal_view,
+            as_of_dt if as_of_dt is not None else now,
+            now,
+        )
+
+    async def _full_scan(
+        self,
+        query: str,
+        result_limit: int,
+        candidate_limit: int,
+        request_context: RequestContext | None,
+        temporal_view: Literal["all", "current", "as_of"],
+        as_of_dt: datetime,
+        now: datetime,
+    ) -> list[ScoredMemory]:
+        """Full-corpus scan behind search: scores every active memory.
+
+        Body relocated verbatim from search (pre-N2 behavior) so the threshold
+        dispatch can share this scorer; the ``now`` and ``as_of_dt`` locals are
+        computed by search and passed in.
+        """
         # ponytail: hard 5000-memory scan cap per retrieval pass, silent above it;
         # upgrade path: progressive/paginated retrieval (docs/ROADMAP.md). See docs/ARCHITECTURE.md.
         active = await self.db.list_active_memories(limit=5000)
@@ -138,7 +169,6 @@ class MemoryRetriever:
             [m.id for m in active], request_context
         )
 
-        now = datetime.now(timezone.utc)
         weights = self.config.retrieval_weights
         weight_total = sum(
             [
