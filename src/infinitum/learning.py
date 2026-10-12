@@ -143,6 +143,7 @@ class MemoryLearner:
 Do not save transient chit-chat, guesses, assistant inventions, or obvious restatements, \
 or facts the user marks as temporary or today-only.
 Do not memorize session-start boilerplate or instructions that repeat verbatim across sessions.
+Do not memorize generic how-to answers about tools the user merely asked about; a procedure is memory only when it describes the user's own project, environment, or decisions.
 Prefer concise current-state facts, decisions, preferences, goals, procedures, lessons, or episodic events.
 If the user explicitly corrects or replaces an existing memory, set operation_hint='supersede', explicit_correction=true, list only relevant existing memory IDs, and copy that memory's memory_type and topic exactly.
 If this merely confirms an existing memory, use operation_hint='reinforce', set reinforces_memory_id to that existing memory ID, and copy that memory's memory_type and topic exactly.

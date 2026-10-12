@@ -11,6 +11,7 @@ Added:
 Changed:
 
 - A retrieval pass that reads its 5,000-row ceiling now logs a warning. Above the cap truncation was silent, so recall decayed with no signal.
+- Memory extraction is more selective about procedures. A generic how-to answer — a reply to a question about a tool the user merely asked about, not one they work through — is no longer stored as a procedure, so tool-agnostic snippets stop polluting the store and surfacing in unrelated retrieval. A procedure is remembered only when it describes the user's own project, environment, or decisions, so genuinely user-taught runbooks are still learned. (#57)
 
 ## 0.6.1
 
