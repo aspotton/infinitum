@@ -123,6 +123,9 @@ pyproject [project.scripts] → __main__.py:main → uvicorn(create_app)
 app.py:create_app → runtime.py:build_runtime → app.state.runtime; worker.start()
 routes/openai.py:chat_completions → request_context.resolve → compiler.compile
   → retrieval.search → compiler.inject → db.add_request_memory → upstream
+  (retrieval.search: verbatim full scan at/below memory.full_scan_threshold or below the
+  0.08 relevance floor; else five-arm candidate shortlist with the N7 extra_predicate_sql
+  eligibility seam and a loud, rate-limited full-scan fallback on degeneracy)
   → _record_completion → db.add_event + db.enqueue_job("learn_interaction")
 ```
 
@@ -194,7 +197,7 @@ Before packaging a release, verify at minimum:
 
 ## Roadmap direction
 
-Read `docs/ROADMAP.md` before implementing larger features. The recommended next-release order is the evidence-ranked **Immediate next work (N1–N7)** section in `docs/ROADMAP.md` (topic canonicalization, FTS-first retrieval candidates, live embeddings/tools decision, evidence features in ranking, outcome signals v0, history/event drill-down tools, PROJECT-vs-GLOBAL hard eligibility); N2 is a prerequisite for N7. Key future work includes:
+Read `docs/ROADMAP.md` before implementing larger features. The recommended next-release order is the evidence-ranked **Immediate next work (N1–N7)** section in `docs/ROADMAP.md` (topic canonicalization and FTS-first retrieval candidates are implemented; live embeddings/tools decision, evidence features in ranking, outcome signals v0, history/event drill-down tools, PROJECT-vs-GLOBAL hard eligibility remain); N2's `extra_predicate_sql` candidate seam is where N7's eligibility predicate drops in. Key future work includes:
 
 - Phase 1 is implemented except for 1.2 retrieval-outcome ingestion: the evaluation loop lives in `benchmarks/` (golden corpus, offline runner, precision/recall + token metrics, live replay) and periodic deep consolidation ships at topic-level depth (`consolidation.py`, opt-in via `learning.consolidation`); cross-topic and corpus-wide consolidation passes remain deferred;
 - hard user/project/session/agent memory scopes;

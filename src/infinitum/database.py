@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import lzma
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,9 @@ from typing import Any
 import numpy as np
 
 from .models import Event, Memory, Observation, RequestContext, TopicSummary, new_id, utc_now
+from .text import _PHRASE_MAX_CHARS
+
+log = logging.getLogger(__name__)
 
 # Evidence kinds that carry full authority; paraphrases and derived
 # observations count half as much as direct evidence.
@@ -54,6 +58,22 @@ _CONSOLIDATION_EPOCH = "0001-01-01T00:00:00+00:00"
 def _encode_event_content(text: str) -> bytes:
     """Codec convention shared by add_event and the batch migrator (no drift)."""
     return _LZMA_HEADER + lzma.compress(text.encode("utf-8"), preset=1)
+
+
+def _non_ws_length_sql(col: str) -> str:
+    """SQL LENGTH() of ``col`` with only the six ASCII whitespace chars stripped.
+
+    Used by the N2 candidate phrase/topic windows. Non-whitespace length is
+    always <= the normalize_text() length, so the 4x-window derivation (a
+    zero-token-intersection gate clear needs SequenceMatcher ratio >= 0.4,
+    forcing max_len <= 4*min_len) stays sound against ASCII tab/space-padded
+    content. Residual hole: Unicode whitespace beyond these six chars (rare in
+    extractor prose; probe-counted in the N2 plan).
+    """
+    expr = col
+    for ch in ("char(9)", "char(10)", "char(11)", "char(12)", "char(13)", "char(32)"):
+        expr = f"REPLACE({expr},{ch},'')"
+    return f"LENGTH({expr})"
 
 
 def _decode_event_content(payload: bytes) -> str:
@@ -758,10 +778,17 @@ class Database:
             f"SELECT * FROM memories {where} ORDER BY updated_at DESC, id DESC LIMIT ?",
             tuple(params),
         )
-        return [await self._row_to_memory(r) for r in rows]
+        return await self._rows_to_memories(rows)
 
     async def list_active_memories(self, limit: int = 5000) -> list[Memory]:
-        return await self.list_memories(limit=limit, status="active")
+        result = await self.list_memories(limit=limit, status="active")
+        if len(result) == limit:
+            log.warning(
+                "active memory scan hit limit=%d; results are truncated past the cap"
+                " - see N2 candidate retrieval",
+                limit,
+            )
+        return result
 
     async def list_active_topic_memories(self, topic: str, limit: int = 100) -> list[Memory]:
         return await self.list_memories(limit=limit, status="active", topic=topic)
@@ -769,6 +796,13 @@ class Database:
     async def count_active_topic_memories(self, topic: str) -> int:
         row = await self.fetchone(
             "SELECT COUNT(*) AS n FROM memories WHERE status='active' AND topic=?", (topic,)
+        )
+        return int(row["n"]) if row else 0
+
+    async def count_active(self) -> int:
+        """Scalar count of active memories (N2 fast-path dispatch check, todo 4)."""
+        row = await self.fetchone(
+            "SELECT COUNT(*) AS n FROM memories WHERE status='active'"
         )
         return int(row["n"]) if row else 0
 
@@ -780,36 +814,71 @@ class Database:
             f"SELECT * FROM memories WHERE id IN ({placeholders})", tuple(memory_ids)
         )
         by_id = {r["id"]: r for r in rows}
+        ordered = [by_id[memory_id] for memory_id in memory_ids if memory_id in by_id]
+        return await self._rows_to_memories(ordered)
+
+    async def list_memories_by_ids_active(self, memory_ids: list[str]) -> list[Memory]:
+        """Batched active-filtered id fetch (chunks of 500); empty input -> [].
+
+        Candidate arms can surface archived/superseded ids, so retrieval loads
+        candidate unions through this method and NOT list_memories_by_ids,
+        which deliberately carries no status filter (Metis E4).
+        """
         result: list[Memory] = []
-        for memory_id in memory_ids:
-            row = by_id.get(memory_id)
-            if row is not None:
-                result.append(await self._row_to_memory(row))
+        for start in range(0, len(memory_ids), 500):
+            chunk = memory_ids[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = await self.fetchall(
+                f"SELECT * FROM memories WHERE id IN ({placeholders}) AND status='active'",
+                tuple(chunk),
+            )
+            result.extend(await self._rows_to_memories(rows))
         return result
 
+    async def _rows_to_memories(self, rows: list[sqlite3.Row]) -> list[Memory]:
+        """Convert memory rows to Memory objects with ONE batched sources read.
+
+        Kills the per-row memory_sources N+1 (chunked IN-queries of 500,
+        ordered by event_id - the same per-memory ascending order the old
+        per-row query produced). Output is field-equal to _row_to_memory.
+        """
+        ids = [row["id"] for row in rows]
+        sources_by_id: dict[str, list[str]] = {memory_id: [] for memory_id in ids}
+        for start in range(0, len(ids), 500):
+            chunk = ids[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            src_rows = await self.fetchall(
+                f"SELECT memory_id, event_id FROM memory_sources WHERE memory_id IN ({placeholders})"
+                " ORDER BY event_id",
+                tuple(chunk),
+            )
+            for src in src_rows:
+                sources_by_id[src["memory_id"]].append(src["event_id"])
+        return [
+            Memory(
+                id=row["id"],
+                memory_type=row["memory_type"],
+                topic=row["topic"],
+                content=row["content"],
+                status=row["status"],
+                importance=float(row["importance"]),
+                confidence=float(row["confidence"]),
+                observation_count=int(row["observation_count"]),
+                created_at=_dt(row["created_at"]),
+                updated_at=_dt(row["updated_at"]),
+                last_accessed_at=_dt(row["last_accessed_at"]),
+                superseded_by=row["superseded_by"],
+                metadata=json.loads(row["metadata_json"] or "{}"),
+                source_event_ids=sources_by_id[row["id"]],
+                valid_from=row["valid_from"],
+                valid_until=row["valid_until"],
+                observed_at=row["observed_at"],
+            )
+            for row in rows
+        ]
+
     async def _row_to_memory(self, row: sqlite3.Row) -> Memory:
-        sources = await self.fetchall(
-            "SELECT event_id FROM memory_sources WHERE memory_id=? ORDER BY event_id", (row["id"],)
-        )
-        return Memory(
-            id=row["id"],
-            memory_type=row["memory_type"],
-            topic=row["topic"],
-            content=row["content"],
-            status=row["status"],
-            importance=float(row["importance"]),
-            confidence=float(row["confidence"]),
-            observation_count=int(row["observation_count"]),
-            created_at=_dt(row["created_at"]),
-            updated_at=_dt(row["updated_at"]),
-            last_accessed_at=_dt(row["last_accessed_at"]),
-            superseded_by=row["superseded_by"],
-            metadata=json.loads(row["metadata_json"] or "{}"),
-            source_event_ids=[r["event_id"] for r in sources],
-            valid_from=row["valid_from"],
-            valid_until=row["valid_until"],
-            observed_at=row["observed_at"],
-        )
+        return (await self._rows_to_memories([row]))[0]
 
     async def list_observations(self, memory_id: str) -> list[Observation]:
         """Every evidence row recorded for one memory, oldest first."""
@@ -985,6 +1054,94 @@ class Database:
         )
         return row["w"] if row and row["w"] is not None else ""
 
+    async def build_retrieval_candidates(
+        self,
+        *,
+        terms: list[str],
+        qnorm: str,
+        limit: int,
+        extra_predicate_sql: str = "",
+        extra_params: tuple = (),
+    ) -> list[str] | None:
+        """SQL candidate arms for N2 candidate-union retrieval.
+
+        Returns deduped candidate memory ids, or None meaning the caller MUST
+        full-scan: FTS disabled/erroring, any single arm hitting ``limit``
+        rows, or the deduped union exceeding ``limit`` (degeneracy). A
+        legitimate empty shortlist is [], never None. The semantic arm lives
+        on the retrieval (numpy) side; the caller unions its ids on top.
+
+        ``extra_predicate_sql`` is the N7 eligibility seam (AGENTS invariants
+        9-10): when provided it is ANDed verbatim (parenthesized) into EVERY
+        arm's WHERE, with ``extra_params`` bound after each arm's own
+        qnorm/term params, so a future scope predicate filters eligibility
+        BEFORE ranking, never post-ranked results.
+        """
+        if not self.fts_enabled:
+            return None
+        guard = f" AND ({extra_predicate_sql})" if extra_predicate_sql else ""
+        candidates: list[str] = []
+
+        # Arm (a): FTS5 MATCH over ALL query tokens, reusing fts_memory_ids'
+        # per-term sanitize-then-quote approach (quote chars blanked, the
+        # remaining fragments quoted as phrases so embedded operator chars
+        # cannot break the query or alter matching semantics; a fragment-less
+        # term is skipped, not fatal). Joined back to memories so status and
+        # the eligibility seam filter before ranking. The +0.15 bonus call
+        # (fts_memory_ids) stays a separate, byte-identical query.
+        fragments: list[str] = []
+        for term in terms:
+            fragments.extend(term.replace("\"", " ").split())
+        if fragments:
+            fts_query = " OR ".join(f'"{f}"' for f in fragments)
+            try:
+                rows = await self.fetchall(
+                    "SELECT m.id FROM memories m JOIN memories_fts ON memories_fts.memory_id=m.id"
+                    f" WHERE memories_fts MATCH ? AND m.status='active'{guard} LIMIT ?",
+                    (fts_query, *extra_params, limit),
+                )
+            except sqlite3.OperationalError:
+                return None
+            if len(rows) >= limit:
+                return None
+            candidates.extend(r["id"] for r in rows)
+
+        # Arm (c): high-authority rows the scorer admits on importance alone
+        # with zero lexical/semantic signal (EVIDENCE-DOMINANCE coverage).
+        rows = await self.fetchall(
+            "SELECT m.id FROM memories m WHERE m.status='active'"
+            " AND m.memory_type IN ('goal','decision') AND m.importance >= 0.85"
+            f"{guard} LIMIT ?",
+            (*extra_params, limit),
+        )
+        if len(rows) >= limit:
+            return None
+        candidates.extend(r["id"] for r in rows)
+
+        # Arms (d)/(e): phrase window over content, mirrored over topic. A
+        # zero-token-intersection gate clear requires SequenceMatcher ratio
+        # >= 0.4, forcing max_len <= 4*min_len; measuring on the
+        # whitespace-stripped length keeps that derivation sound against
+        # ASCII-padded content. The >_PHRASE_MAX_CHARS OR mirrors the
+        # prefix-truncation blind spot in lexical_similarity (text.py:49) -
+        # rows past 8192 chars are lexical-opaque to the scorer and must
+        # always be candidates regardless of the window.
+        for col in ("m.content", "m.topic"):
+            rows = await self.fetchall(
+                f"SELECT m.id FROM memories m WHERE m.status='active'"
+                f" AND ({_non_ws_length_sql(col)} <= 4 * LENGTH(?) OR LENGTH({col}) > {_PHRASE_MAX_CHARS})"
+                f"{guard} LIMIT ?",
+                (qnorm, *extra_params, limit),
+            )
+            if len(rows) >= limit:
+                return None
+            candidates.extend(r["id"] for r in rows)
+
+        union = list(dict.fromkeys(candidates))
+        if len(union) > limit:
+            return None
+        return union
+
     async def fts_memory_ids(self, query: str, limit: int = 100) -> list[str]:
         if not self.fts_enabled or not query.strip():
             return []
@@ -1035,6 +1192,23 @@ class Database:
         }
 
     # Embeddings -------------------------------------------------------------
+    async def embeddings_watermark(self) -> tuple[str | None, int]:
+        """Invalidation watermark for the embedding table alone (N2 todo 5).
+
+        ``(MAX(updated_at), COUNT(*))`` over ``memory_embeddings``. Deliberately
+        separate from ``memory_state_watermark``: embedding writes must not move
+        that one (compiler.py:136-137), yet the retriever's vector-matrix cache
+        must invalidate whenever any vector is inserted or replaced. The COUNT
+        term catches a same-timestamp write that leaves MAX unmoved; the
+        ``set_embedding`` upsert refreshes ``updated_at`` even on the ON
+        CONFLICT path, so a replaced vector always moves MAX. Returns
+        ``(None, 0)`` when the table is empty.
+        """
+        row = await self.fetchone(
+            "SELECT MAX(updated_at) AS w, COUNT(*) AS n FROM memory_embeddings"
+        )
+        return (row["w"], int(row["n"])) if row is not None else (None, 0)
+
     async def set_embedding(self, memory_id: str, model: str, vector: np.ndarray) -> None:
         arr = np.asarray(vector, dtype=np.float32)
         await self.execute(
@@ -1058,6 +1232,26 @@ class Database:
             vec = np.frombuffer(row["vector"], dtype=np.float32, count=int(row["dim"])).copy()
             result[row["memory_id"]] = (row["model"], vec)
         return result
+
+    async def vector_backfill_probe(
+        self, model: str, cursor: str, limit: int
+    ) -> list[str]:
+        """Active memory ids with no embedding row for ``model``, past ``cursor``.
+
+        Startup-backfill selector (N2 todo 6): the LEFT JOIN is conditioned on
+        ``e.model`` so rows vectorized under a different model count as
+        vectorless and heal via the ``set_embedding`` upsert on a model change.
+        ``id > cursor ORDER BY id`` copies the event-compression cursor
+        pattern; an empty result means the pass is done, not an error.
+        """
+        rows = await self.fetchall(
+            "SELECT m.id FROM memories m"
+            " LEFT JOIN memory_embeddings e ON e.memory_id=m.id AND e.model=?"
+            " WHERE m.status='active' AND e.memory_id IS NULL AND m.id > ?"
+            " ORDER BY m.id LIMIT ?",
+            (model, cursor, limit),
+        )
+        return [row["id"] for row in rows]
 
     # Topics -----------------------------------------------------------------
     async def upsert_topic(self, summary: TopicSummary) -> None:
@@ -1652,7 +1846,7 @@ class Database:
             " ORDER BY updated_at ASC, id ASC LIMIT ?",
             (topic, limit),
         )
-        return [await self._row_to_memory(r) for r in rows]
+        return await self._rows_to_memories(rows)
 
     async def count_active_topic_memories_updated_since(
         self, topic: str, since_iso: str

@@ -3,6 +3,7 @@
 Usage from the repo root::
 
     python -m benchmarks.run [--scenario NAME]... [--json PATH] [--scenarios-dir DIR]
+                             [--candidates]
 
 Exit code is 1 if any scenario fails (or errors), 0 otherwise. No latency
 metric: foreground timing does not exist in the runner, deliberately dropped.
@@ -64,6 +65,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="run only this scenario (repeatable)")
     parser.add_argument("--json", type=Path, metavar="PATH", help="also write the report JSON here")
     parser.add_argument("--scenarios-dir", default="benchmarks/scenarios")
+    parser.add_argument("--candidates", action="store_true",
+                        help="force the retrieval candidate fast path (full_scan_threshold=1)")
     args = parser.parse_args(argv)
 
     try:
@@ -77,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     errors: list[tuple[str, str]] = []
     for scenario in selected:
         try:
-            result = run_scenario(scenario)
+            result = run_scenario(scenario, candidates=args.candidates)
         except RunnerError as exc:
             print(f"error: scenario {scenario.name}: {exc}", file=sys.stderr)
             errors.append((scenario.name, str(exc)))
