@@ -799,6 +799,13 @@ class Database:
         )
         return int(row["n"]) if row else 0
 
+    async def count_active(self) -> int:
+        """Scalar count of active memories (N2 fast-path dispatch check, todo 4)."""
+        row = await self.fetchone(
+            "SELECT COUNT(*) AS n FROM memories WHERE status='active'"
+        )
+        return int(row["n"]) if row else 0
+
     async def list_memories_by_ids(self, memory_ids: list[str]) -> list[Memory]:
         if not memory_ids:
             return []
