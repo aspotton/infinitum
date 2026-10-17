@@ -127,6 +127,9 @@ def test_lifespan_shutdown_bounded_by_grace_not_upstream_timeout():
         cfg.learning.enabled = True
         cfg.learning.poll_interval_seconds = 0.05
         cfg.embeddings.enabled = False
+        # This test checks shutdown bounding, not deferral: the default 5s idle
+        # grace would defer the claim past the 5s claim-poll deadline.
+        cfg.learning.upstream_idle_grace_seconds = 0.0
         # No learning.timeout_seconds tweak: the patched learn bypasses the HTTP layer
         # where that config applies; the broken-fix ceiling is _hang's 30 s sleep.
         with (

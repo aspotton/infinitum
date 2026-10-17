@@ -25,6 +25,9 @@ def _yesterday() -> str:
 
 async def _open(tmp: str):
     cfg = AppConfig()
+    # Temporal ranking pins are score-tuned against the pre-0.7 0.18 precision
+    # floor; pin it so the reworded successors stay eligible as designed.
+    cfg.memory.minimum_retrieval_score = 0.18
     cfg.memory.database_path = f"{tmp}/runtime.db"
     db = Database(cfg.memory.database_path)
     await db.connect()

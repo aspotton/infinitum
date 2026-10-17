@@ -214,6 +214,9 @@ async def test_startup_integration_recovers_stale_job_and_worker_finishes_it():
         cfg.learning.enabled = True
         cfg.learning.topic_summaries = False
         cfg.learning.poll_interval_seconds = 0.05
+        # This test checks startup requeue, not deferral: the default 5s idle
+        # grace would collide with the 5s done-poll deadline below.
+        cfg.learning.upstream_idle_grace_seconds = 0.0
 
         empty = {"choices": [{"message": {"content": '{"memories": []}'}}]}
         with patch.object(

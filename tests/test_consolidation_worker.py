@@ -109,6 +109,9 @@ async def test_sweep_tick_does_not_advance_while_upstream_busy_defers():
         cfg.learning.consolidation = True
         cfg.learning.model = "test-model"
         cfg.learning.skip_when_upstream_busy = True
+        # Grace 0 keeps the value > 0 busy arm alive without the worker
+        # evaluating the idle-grace comparison against the MagicMock last_busy.
+        cfg.learning.upstream_idle_grace_seconds = 0.0
 
         counter = MagicMock()
         counter.value = 1  # busy -> every iteration defers before the tick

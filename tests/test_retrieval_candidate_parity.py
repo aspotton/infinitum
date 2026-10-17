@@ -69,6 +69,9 @@ def _cfg(threshold: int, embeddings_on: bool) -> AppConfig:
     cfg = AppConfig()
     cfg.memory.full_scan_threshold = threshold
     cfg.embeddings.enabled = embeddings_on
+    # Parity fixtures are score-tuned against the pre-0.7 0.18 precision floor;
+    # pin it so the crafted counterexample cosines keep landing where designed.
+    cfg.memory.minimum_retrieval_score = 0.18
     return cfg
 
 
