@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+Changed:
+
+- Tuned minimal-setup defaults so a configuration file now needs only the `upstream:` block (base URL and key); every other setting ships with a working value. A reference table of every key and its default is in [docs/CONFIGURATION.md](docs/CONFIGURATION.md#defaults-at-a-glance).
+- `memory.tools_enabled` now defaults to true, so the read-only drill-down memory tools are exposed on memory-enabled requests out of the box; set it to false to restore the prior tool-free behavior on strict upstreams without an automatic tool-call parser.
+- `learning.extra_body` now defaults to `{tool_choice: none}`, keeping background extraction calls from spuriously emitting tool calls; only vendor switches such as `chat_template_kwargs` remain an opt-in addition.
+- Background learning now defers job starts while the upstream is busy (`skip_when_upstream_busy` defaults to true) with a 5-second idle grace (`upstream_idle_grace_seconds`), so deferred learning no longer competes with foreground traffic on the same model.
+
 ## 0.6.2
 
 Added:

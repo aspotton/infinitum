@@ -75,7 +75,7 @@ Use these canonical names in new code/docs:
 - `X-Infinitum-Learning`
 - `X-Infinitum-Debug`
 - `<infinitum_memory>...</infinitum_memory>`
-- `infinitum_memory_search` / `infinitum_memory_get` (read-only drill-down tool names, not headers; gated by `memory.tools_enabled`)
+- `infinitum_memory_search` / `infinitum_memory_get` (read-only drill-down tool names, not headers; gated by `memory.tools_enabled`, which defaults to true; set it false to restore the prior tool-free behavior on upstreams without a tool parser)
 - `x-infinitum-memory-tool-rejects` (debug-only response header; count of rejected or forward-stripped memory-tool calls)
 - `x-next-cursor` (response header on `GET /memory`, `GET /events`, `GET /topics`; opaque keyset pagination position, not a security token)
 

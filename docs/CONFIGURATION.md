@@ -1,25 +1,53 @@
 # Configuration
 
-Every configuration surface, grouped by area. The annotated key-by-key example lives in [`../config.example.yaml`](../config.example.yaml).
+Every configuration surface, grouped by area. Every key and its factory default is collected in the [reference table below](#defaults-at-a-glance); the annotated starter example lives in [`../config.example.yaml`](../config.example.yaml).
+
+## Defaults at a glance
+
+A working setup needs only the two `upstream:` keys below; every other setting ships with a tuned default. The full surface:
+
+| key | default | what it does |
+| --- | --- | --- |
+| `upstream.base_url` | `http://localhost:4000/v1` | OpenAI-compatible upstream to forward to (the one required key in practice) |
+| `upstream.api_key` | `""` (empty) | key for the upstream; unnecessary when `passthrough_authorization` forwards the inbound key |
+| `upstream.passthrough_authorization` | `true` | forward the inbound `Authorization` header to the upstream |
+| `memory.enabled` | `true` | master memory toggle |
+| `memory.database_path` | `./infinitum.db` | SQLite database location |
+| `memory.minimum_relevance_score` | `0.08` | eligibility gate: at least one genuine relevance signal |
+| `memory.minimum_retrieval_score` | `0.25` | precision floor for retrieval and injection |
+| `memory.inject_max_memories` | `8` | maximum memories injected into one request |
+| `memory.tools_enabled` | `true` | expose the read-only drill-down tools (set `false` for upstreams without a tool parser) |
+| `memory.stream_reasoning` | `live` | streaming reasoning mode (`buffered` restores pre-0.2 hold) |
+| `memory.full_scan_threshold` | `500` | active-count ceiling for the byte-identical full-scan path |
+| `embeddings.enabled` | `false` | opt-in semantic retrieval |
+| `learning.enabled` | `true` | asynchronous learning worker |
+| `learning.skip_subsessions` | `true` | do not learn from parent-session-marked sub-sessions |
+| `learning.timeout_seconds` | `600` | background learning request timeout |
+| `learning.max_tokens` | `1024` | extraction/summary generation cap |
+| `learning.extra_body` | `{tool_choice: none}` | fields merged into background calls (add `chat_template_kwargs` to disable thinking) |
+| `learning.skip_when_upstream_busy` | `true` | do not claim learning jobs while a request is in flight |
+| `learning.upstream_idle_grace_seconds` | `5` | keep learning deferred until the upstream has been idle this long |
+| `learning.topic_summaries` | `true` | incremental topic summaries |
+| `learning.topic_summary_min_memories` | `3` | minimum active memories before a topic gets a summary |
+| `learning.topic_summary_debounce_seconds` | `60` | quiet period before summarizing a burst of changes |
+| `learning.topic_summary_update_threshold` | `3` | dirty memories that make a summary job immediately eligible |
+| `learning.topic_summary_max_changed_memories` | `6` | maximum dirty records consumed by one summary call |
+| `learning.topic_summary_context_memories` | `4` | active-topic sample supplied beside the changed records |
+| `learning.topic_summary_bootstrap_max_memories` | `8` | bounded bootstrap sample for a summary-less topic |
+| `learning.topic_summary_max_tokens` | `512` | topic-summary generation cap |
+| `learning.topic_summary_fallback_memories` | `12` | active memories used when the model returns no summary text |
+| `learning.consolidation` | `false` | periodic deep consolidation master gate |
+| `learning.consolidation_max_tokens` | `2048` | token cap for the consolidation generation itself |
 
 ## Minimal config
 
 ```yaml
 upstream:
   base_url: http://localhost:4000/v1
-  passthrough_authorization: true
-
-memory:
-  database_path: ./infinitum.db
-
-learning:
-  enabled: true
-
-embeddings:
-  enabled: false
+  api_key: ${UPSTREAM_API_KEY:-}
 ```
 
-With `passthrough_authorization: true`, the inbound `Authorization` header is forwarded to the upstream. Background learning cannot reuse a per-request key after the request ends, so either configure a service key under `learning.api_key` or configure `upstream.api_key` when the learning endpoint requires authentication.
+These two keys are the whole minimal setup; everything else takes the tuned defaults above. `upstream.passthrough_authorization` already defaults to `true`, so the inbound `Authorization` header is forwarded to the upstream without being listed. Background learning cannot reuse a per-request key after the request ends, so either configure a service key under `learning.api_key` or set `upstream.api_key` when the learning endpoint requires authentication.
 
 The annotated example in [`../config.example.yaml`](../config.example.yaml) writes `database_path` as `${INFINITUM_DATABASE_PATH:-./infinitum.db}`, so container users can pin the database location via environment variable without editing the file (see [DOCKER.md](DOCKER.md)).
 
@@ -122,11 +150,11 @@ Any OpenAI-compatible `/v1/embeddings` implementation can be used. When enabled,
 
 ## Memory drill-down tools
 
-The read-only drill-down tool behavior contract is in [API.md](./API.md); the keys below gate it.
+The read-only drill-down tool behavior contract is in [API.md](./API.md); the keys below gate it. The tools are now on by default; set `memory.tools_enabled: false` to restore the prior tool-free behavior for upstreams without a tool parser.
 
 ```yaml
 memory:
-  tools_enabled: true  # default: false
+  tools_enabled: true  # default: true
   # "live" streams model reasoning deltas before a round decides;
   # "buffered" holds everything until the decision (pre-0.2 behavior).
   stream_reasoning: live  # default: live
@@ -145,7 +173,7 @@ learning:
   api_key: ${LEARNING_API_KEY:-}
   model: memory-extractor
   timeout_seconds: 600
-  max_tokens: 2048
+  max_tokens: 1024
 ```
 
 If `learning.model` is empty, the original answering model is reused.
@@ -160,8 +188,9 @@ unbounded generation budget.
 ```yaml
 learning:
   timeout_seconds: 600
-  max_tokens: 2048
-  extra_body: {}
+  max_tokens: 1024
+  extra_body:
+    tool_choice: none  # already the default; only chat_template_kwargs is an opt-in addition
 ```
 
 If a learning request times out, the user's original chat response is unaffected.
@@ -202,9 +231,11 @@ is honest. Only job *start* is deferred: a job already running continues to
 completion within `learning.timeout_seconds`, and a hung streaming request keeps
 learning deferred while it counts as active. `GET /health` reports the live
 `active_requests` count so you can see why the worker is idle. Set
-`learning.upstream_idle_grace_seconds` (default `0`) to keep learning deferred
+`learning.upstream_idle_grace_seconds` (default `5`, pairing with
+`skip_when_upstream_busy` which defaults `true`) to keep learning deferred
 until the upstream has been continuously idle for that long after traffic
-drains; any new foreground request restarts the window.
+drains; any new foreground request restarts the window. Set it to `0` to
+claim as soon as the active-request counter drains.
 
 The mechanism internals are covered in [ARCHITECTURE.md](./ARCHITECTURE.md#deferring-learning-under-upstream-contention).
 
@@ -303,12 +334,12 @@ V0.1.2+ no longer regenerates a topic summary from up to 100 topic memories afte
 learning:
   topic_summaries: true
   topic_summary_min_memories: 3
-  topic_summary_debounce_seconds: 30
-  topic_summary_update_threshold: 5
-  topic_summary_max_changed_memories: 24
-  topic_summary_context_memories: 8
-  topic_summary_bootstrap_max_memories: 32
-  topic_summary_max_tokens: 1024
+  topic_summary_debounce_seconds: 60
+  topic_summary_update_threshold: 3
+  topic_summary_max_changed_memories: 6
+  topic_summary_context_memories: 4
+  topic_summary_bootstrap_max_memories: 8
+  topic_summary_max_tokens: 512
   topic_summary_fallback_memories: 12
 ```
 
