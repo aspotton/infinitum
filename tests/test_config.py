@@ -18,21 +18,31 @@ def test_config_environment_expansion():
 
 
 def test_learning_controls_have_safe_defaults():
-    cfg = load_config()
+    cfg = AppConfig()
     assert cfg.learning.timeout_seconds == 600.0
-    assert cfg.learning.max_tokens == 2048
-    assert cfg.learning.extra_body == {}
-    assert cfg.learning.topic_summary_debounce_seconds == 30.0
-    assert cfg.learning.topic_summary_update_threshold == 5
-    assert cfg.learning.topic_summary_max_changed_memories == 24
-    assert cfg.learning.topic_summary_context_memories == 8
-    assert cfg.learning.topic_summary_bootstrap_max_memories == 32
-    assert cfg.learning.topic_summary_max_tokens == 1024
+    assert cfg.learning.max_tokens == 1024
+    assert cfg.learning.extra_body == {"tool_choice": "none"}
+    assert cfg.learning.topic_summary_debounce_seconds == 60.0
+    assert cfg.learning.topic_summary_update_threshold == 3
+    assert cfg.learning.topic_summary_max_changed_memories == 6
+    assert cfg.learning.topic_summary_context_memories == 4
+    assert cfg.learning.topic_summary_bootstrap_max_memories == 8
+    assert cfg.learning.topic_summary_max_tokens == 512
     assert cfg.learning.topic_summary_fallback_memories == 12
 
 
+def test_minimal_setup_defaults_are_tuned():
+    cfg = AppConfig()
+    assert cfg.memory.minimum_retrieval_score == 0.25
+    assert cfg.memory.inject_max_memories == 8
+    assert cfg.memory.tools_enabled is True
+    assert cfg.memory.minimum_relevance_score == 0.08
+    assert cfg.learning.skip_when_upstream_busy is True
+    assert cfg.learning.upstream_idle_grace_seconds == 5.0
+
+
 def test_reinforcement_controls_have_safe_defaults():
-    cfg = load_config()
+    cfg = AppConfig()
     assert cfg.memory.reinforce_similarity == 0.86
     assert cfg.memory.reinforce_semantic_similarity == 0.90
     assert cfg.memory.reinforce_hint_min_score == 0.55
@@ -41,7 +51,7 @@ def test_reinforcement_controls_have_safe_defaults():
 
 
 def test_topic_canonicalization_controls_have_safe_defaults():
-    cfg = load_config()
+    cfg = AppConfig()
     assert cfg.memory.topic_canonical_floor == 0.85
     assert cfg.memory.topic_canonicalization_prompt_topics == 40
 

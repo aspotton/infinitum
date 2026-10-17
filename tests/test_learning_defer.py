@@ -374,6 +374,6 @@ async def test_grace_zero_claims_once_counter_drains():
             await rt.db.close()
 
 
-def test_upstream_idle_grace_default_is_zero():
-    assert LearningConfig().upstream_idle_grace_seconds == 0.0
-    assert AppConfig().learning.upstream_idle_grace_seconds == 0.0
+def test_upstream_idle_grace_default_is_nonzero():
+    assert LearningConfig().upstream_idle_grace_seconds == 5.0
+    assert AppConfig().learning.upstream_idle_grace_seconds == 5.0
