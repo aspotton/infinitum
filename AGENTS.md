@@ -75,7 +75,7 @@ Use these canonical names in new code/docs:
 - `X-Infinitum-Learning`
 - `X-Infinitum-Debug`
 - `<infinitum_memory>...</infinitum_memory>`
-- `infinitum_memory_search` / `infinitum_memory_get` (read-only drill-down tool names, not headers; gated by `memory.tools_enabled`)
+- `infinitum_memory_search` / `infinitum_memory_get` (read-only drill-down tool names, not headers; gated by `memory.tools_enabled`, which defaults to true; set it false to restore the prior tool-free behavior on upstreams without a tool parser)
 - `x-infinitum-memory-tool-rejects` (debug-only response header; count of rejected or forward-stripped memory-tool calls)
 - `x-next-cursor` (response header on `GET /memory`, `GET /events`, `GET /topics`; opaque keyset pagination position, not a security token)
 
@@ -112,7 +112,7 @@ Topic summaries are incremental: dirty topic deltas are coalesced, then an exist
 
 An empty final response from a reasoning/local model must not create a retry storm. Topic summaries should degrade to a bounded deterministic active-memory representation; detailed memories remain authoritative. Vendor-specific background request knobs belong under `learning.extra_body`, never in foreground proxy requests.
 
-Background learning may optionally defer job start while foreground proxy requests are in flight via `learning.skip_when_upstream_busy`; deferred work stays in the durable job queue (deferred, not dropped) and consumes no attempt count. Additionally, `learning.upstream_idle_grace_seconds` (default 0) keeps claims deferred until the upstream has been continuously idle for that long since the last foreground activity, with any new request restarting the window. The active-request counter lives in `runtime.py` and is instrumented only in `routes/openai.py` around proxied upstream calls; the learner's own upstream calls bypass it by design, so the worker cannot starve itself. Separately, `learning.skip_subsessions` (default `true`) suppresses only the `learn_interaction` enqueue for requests carrying the parent-session marker, with precedence explicit `X-Infinitum-Learning: off` > explicit `on` > sub-session skip > default learning, and events/retrieval untouched by the gate.
+Background learning defers job start by default while foreground proxy requests are in flight via `learning.skip_when_upstream_busy` (default `true`); deferred work stays in the durable job queue (deferred, not dropped) and consumes no attempt count. Additionally, `learning.upstream_idle_grace_seconds` (default 5) keeps claims deferred until the upstream has been continuously idle for that long since the last foreground activity, with any new request restarting the window. The active-request counter lives in `runtime.py` and is instrumented only in `routes/openai.py` around proxied upstream calls; the learner's own upstream calls bypass it by design, so the worker cannot starve itself. Separately, `learning.skip_subsessions` (default `true`) suppresses only the `learn_interaction` enqueue for requests carrying the parent-session marker, with precedence explicit `X-Infinitum-Learning: off` > explicit `on` > sub-session skip > default learning, and events/retrieval untouched by the gate.
 
 ## Code map
 

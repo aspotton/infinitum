@@ -256,6 +256,13 @@ or:
 INFINITUM_CONFIG=config.yaml uvicorn infinitum.app:app --host 0.0.0.0 --port 8788
 ```
 
+Verify it's up:
+
+```bash
+curl -sS localhost:8788/health    # health check: version and active_requests
+curl -sS localhost:8788/v1/models # the OpenAI-compatible surface answers
+```
+
 ### Run with Docker
 
 ```bash
@@ -278,21 +285,12 @@ A minimal setup:
 ```yaml
 upstream:
   base_url: http://localhost:4000/v1
-  passthrough_authorization: true
-
-memory:
-  database_path: ./infinitum.db
-
-learning:
-  enabled: true
-
-embeddings:
-  enabled: false
+  api_key: ${UPSTREAM_API_KEY:-}
 ```
 
-With `passthrough_authorization: true`, the inbound `Authorization` header is forwarded to the upstream; the background-learning key caveat is documented in [docs/CONFIGURATION.md](docs/CONFIGURATION.md#minimal-config).
+Everything else has a tuned default baked into the program; the full key-by-key reference is in [docs/CONFIGURATION.md#defaults-at-a-glance](docs/CONFIGURATION.md#defaults-at-a-glance). `passthrough_authorization` is already `true` by default, so the inbound `Authorization` header is forwarded to the upstream; the background-learning key caveat is documented in [docs/CONFIGURATION.md](docs/CONFIGURATION.md#minimal-config).
 
-Everything else is reference material in [docs/CONFIGURATION.md](docs/CONFIGURATION.md):
+Further reference material in [docs/CONFIGURATION.md](docs/CONFIGURATION.md):
 
 - [Request-context and OpenCode headers](docs/CONFIGURATION.md#request-context-and-opencode-headers): canonical `X-Infinitum-*` headers, plus the OpenCode/Headroom/LiteLLM integration aliases.
 - [Embeddings](docs/CONFIGURATION.md#embeddings) are optional and configured there.

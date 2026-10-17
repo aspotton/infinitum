@@ -337,6 +337,8 @@ def run_scenario(scenario: Scenario, *, candidates: bool = False) -> ScenarioRes
         cfg.learning.enabled = True
         cfg.learning.poll_interval_seconds = _POLL_SECONDS
         cfg.learning.topic_summaries = False
+        # No foreground contention offline; don't burn the new 5s idle-grace per turn.
+        cfg.learning.upstream_idle_grace_seconds = 0.0
         cfg.upstream.passthrough_authorization = False
 
         app = create_app(cfg)

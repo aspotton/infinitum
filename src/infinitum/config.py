@@ -48,12 +48,12 @@ class MemoryConfig(BaseModel):
     # count keep the byte-identical verbatim full-scan path; a huge value is the
     # kill switch that pins every store to the full scan.
     full_scan_threshold: int = 500
-    minimum_retrieval_score: float = 0.18
+    minimum_retrieval_score: float = 0.25
     # Eligibility gate requiring at least one query-dependent signal (semantic,
     # lexical, or topic) above a deliberately low zero-signal net. This is NOT a
     # precision knob — precision remains minimum_retrieval_score's job. 0.0 disables.
     minimum_relevance_score: float = 0.08
-    inject_max_memories: int = 24
+    inject_max_memories: int = 8
     dedup_similarity: float = 0.88
     # Fast deterministic reinforcement for nearly identical wording.
     reinforce_similarity: float = 0.86
@@ -76,8 +76,8 @@ class MemoryConfig(BaseModel):
     freshness_half_life_days: float = 120.0
     # Exposes infinitum_memory_search/infinitum_memory_get to the model on every
     # memory-enabled request (static exposure for prompt-cache stability);
-    # default off for upstream compatibility.
-    tools_enabled: bool = False
+    # default on; set false for upstreams without a tool parser.
+    tools_enabled: bool = True
     # "live" streams model reasoning deltas to the client before a round decides;
     # "buffered" holds everything until the decision (pre-0.2 behavior).
     stream_reasoning: Literal["live", "buffered"] = "live"
@@ -119,32 +119,33 @@ class LearningConfig(BaseModel):
     # Bound extraction/summary generations. Without this, some OpenAI-compatible
     # servers may use a very large model default and hold the HTTP response open
     # until the client's read timeout expires.
-    max_tokens: int = 2048
+    max_tokens: int = 1024
     # Extra top-level fields merged into background Chat Completions requests.
     # This is useful for OpenAI-compatible servers with vendor-specific knobs,
     # e.g. chat_template_kwargs to disable thinking for extraction on compatible servers.
-    extra_body: dict[str, Any] = Field(default_factory=dict)
+    # opt-in vendor example: chat_template_kwargs: {enable_thinking: false}
+    extra_body: dict[str, Any] = Field(default_factory=lambda: {"tool_choice": "none"})
     poll_interval_seconds: float = 1.0
     # When true, the learning worker does not claim new jobs while Infinitum is
     # actively proxying a request to the upstream. Jobs stay pending, not lost.
-    skip_when_upstream_busy: bool = False
+    skip_when_upstream_busy: bool = True
     # After the upstream goes idle, wait this long before starting a deferred
     # learning job; any new foreground request restarts the window. 0 disables
     # the grace period (claim as soon as the counter drains). Only meaningful
     # when skip_when_upstream_busy is true.
-    upstream_idle_grace_seconds: float = 0.0
+    upstream_idle_grace_seconds: float = 5.0
     max_attempts: int = 5
     topic_summaries: bool = True
     topic_summary_min_memories: int = 3
     # Topic summaries are maintained incrementally rather than regenerated from
     # the full topic after every interaction. Changes are debounced so bursts of
     # related learning produce one summary update instead of one call per turn.
-    topic_summary_debounce_seconds: float = 30.0
-    topic_summary_update_threshold: int = 5
-    topic_summary_max_changed_memories: int = 24
-    topic_summary_context_memories: int = 8
-    topic_summary_bootstrap_max_memories: int = 32
-    topic_summary_max_tokens: int = 1024
+    topic_summary_debounce_seconds: float = 60.0
+    topic_summary_update_threshold: int = 3
+    topic_summary_max_changed_memories: int = 6
+    topic_summary_context_memories: int = 4
+    topic_summary_bootstrap_max_memories: int = 8
+    topic_summary_max_tokens: int = 512
     # If an upstream returns no final content (common when a reasoning model
     # exhausts its token budget before producing an answer), build a bounded
     # deterministic summary from active memories rather than retrying the same

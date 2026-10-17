@@ -52,7 +52,7 @@ Work packages N1–N7, ordered by evidence collected 2026-10-09 from the maintai
 | Active memories vs topics | 2,121 active memories across 1,760 distinct topics (median topic size = 1 memory) |
 | Topic-summary coverage | 84 summarized topics ≈ 15% of active memories (summaries require `learning.topic_summary_min_memories = 3`) |
 | Reinforcement | median `observation_count` = 1; ~87% of active memories were never reinforced |
-| Live retrieval signals | embeddings disabled (the semantic weight is inert), so lexical/FTS + topic only; drill-down tools off (`memory.tools_enabled=false`) and never called (zero `memory.tool_call` events); consolidation running but reaching only the ≥3-memory topics |
+| Live retrieval signals | embeddings disabled (the semantic weight is inert), so lexical/FTS + topic only; drill-down tools (`memory.tools_enabled` defaults to true as of the tuned-minimal-config change) were off in the measured store and never called (zero `memory.tool_call` events); consolidation running but reaching only the ≥3-memory topics |
 | Scale headroom | every retrieval pass loads all active rows capped at 5,000 and silently truncates above it (`retrieval.py`, `ponytail:` comment at the `list_active_memories(limit=5000)` call); actives grow ≈ 60/day, so the cap arrives in roughly 6–10 weeks |
 
 Each package is independently plannable: a planning agent should be able to turn any one of N1–N7 into a decision-complete plan without re-deriving the problem. Recommended sequence: **N1 → N2 → N3 (ops decision) → N4 → N5 → N6**, with N7 planned deliberately afterwards.
@@ -96,7 +96,7 @@ Each package is independently plannable: a planning agent should be able to turn
 
 ### N3 — Live-instance decision: enable embeddings and drill-down tools (ops, not code)
 
-**Status.** Both are shipped features running dark: `/health` on the live store reports `embeddings_enabled: false`, and `memory.tools_enabled` defaults to false with zero drill-down calls recorded. With embeddings off, the scorer's largest weight (semantic, 0.45 by default) is inert and paraphrase near-duplicates are only caught by lexical coincidence — the main driver of the never-reinforced 87% in N1's evidence.
+**Status.** Both are shipped features running dark: `/health` on the live store reports `embeddings_enabled: false`, and `memory.tools_enabled` now defaults to true as of the next release, with zero drill-down calls recorded in the measured store. With embeddings off, the scorer's largest weight (semantic, 0.45 by default) is inert and paraphrase near-duplicates are only caught by lexical coincidence — the main driver of the never-reinforced 87% in N1's evidence.
 
 **Decision required from the maintainer.** Either (a) point `embeddings.base_url` at an OpenAI-compatible embedding model on the same hardware and enable `memory.tools_enabled` in the live config, or (b) deliberately stay lexical-only and retune `retrieval_weights` for the FTS path. Option (a) first needs a config-only trial + one `python -m benchmarks.replay` / eval-skill pass against the live store; option (b) needs a weights sweep against the corpus. Record the outcome here and in the CHANGELOG if behavior changes.
 

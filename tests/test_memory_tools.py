@@ -61,6 +61,10 @@ async def test_search_result_shape_and_score_rounding():
 async def test_search_limit_clamped_to_max():
     with tempfile.TemporaryDirectory() as tmp:
         runtime = await make_runtime(tmp)
+        # Pin the pre-0.7 precision floor: this test asserts the limit clamp,
+        # not retrieval precision, and the thin synthetic facts score below the
+        # new 0.25 default.
+        runtime.retriever.config.memory.minimum_retrieval_score = 0.18
         try:
             for i in range(3):
                 await runtime.db.create_memory(
