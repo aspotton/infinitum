@@ -1,0 +1,42 @@
+name: episodic-boilerplate
+description: >-
+  The same release episode re-narrated a week later as session-start
+  boilerplate: the extractor proposes a near-verbatim (0.945 lexical) episodic
+  candidate filed under a fresh date-slug topic; the deterministic episodic
+  duplicate-skip in _apply must ignore it outright - no new memory, no new
+  topic - while the first memory stays untouched.
+context:
+  user_id: eval
+  project_id: episodic-boilerplate
+# The second topic is a digit-distinct date slug: the topic-similarity digit
+# veto scores it 0.0 against the first, so canonicalization can never file it
+# under the existing topic and reinforcement can never fire. Without the skip
+# guard the apply path therefore MINTS a duplicate under a new topic for sure
+# (retirement is not a factor: every row in the harness is days old).
+turns:
+  - user: "We shipped the v0.6.2 release to production on 2026-10-12, QA had signed off the runbook the morning before."
+    assistant: "Noted - v0.6.2 shipped on 2026-10-12 after QA signed off the runbook."
+    learn:
+      - operation: new
+        memory_type: episodic
+        topic: release-2026-10-12
+        content: "Shipped the v0.6.2 release on 2026-10-12 after the QA pass."
+        importance: 0.7
+        confidence: 0.85
+    expect:
+      created: ["v0.6.2 release on 2026-10-12"]
+
+  - user: "Picking this back up in a fresh session last week: same recap as always - the release we shipped in October, QA signed it off first, went out the same day it was planned."
+    assistant: "Right - shipped the v0.6.2 release on 2026-10-12 after the quick QA pass."
+    learn:
+      - operation: new
+        memory_type: episodic
+        topic: release-2026-10-19
+        content: "Shipped the v0.6.2 release on 2026-10-12 after the quick QA pass."
+        importance: 0.7
+        confidence: 0.85
+    expect:
+      ignored: ["quick QA pass"]
+    probe:
+      query: "when did the v0.6.2 release ship"
+      must_include: ["v0.6.2 release on 2026-10-12"]
