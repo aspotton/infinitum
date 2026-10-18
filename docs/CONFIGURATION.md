@@ -19,6 +19,7 @@ A working setup needs only the two `upstream:` keys below; every other setting s
 | `memory.tools_enabled` | `true` | expose the read-only drill-down tools (set `false` for upstreams without a tool parser) |
 | `memory.stream_reasoning` | `live` | streaming reasoning mode (`buffered` restores pre-0.2 hold) |
 | `memory.full_scan_threshold` | `500` | active-count ceiling for the byte-identical full-scan path |
+| `memory.episodic_retention_days` | `30` | how long unreinforced episodic memories stay active (`0` disables retirement) |
 | `embeddings.enabled` | `false` | opt-in semantic retrieval |
 | `learning.enabled` | `true` | asynchronous learning worker |
 | `learning.skip_subsessions` | `true` | do not learn from parent-session-marked sub-sessions |
@@ -366,8 +367,8 @@ learning:
 ```
 
 - `consolidation`: master gate, `false` by default. When unset, behavior is byte-identical to pre-consolidation builds. Enabling it also requires `learning.enabled` and an explicit `learning.model`: unlike per-interaction learning, a background sweep has no request model to reuse, so with the model unset the sweep stays silently idle.
-- `consolidation_interval_seconds`: how often one topic is eligible for a pass (default 7 days). The sweep enqueues at most one topic per minute and never while `learning.model` is unset.
-- `consolidation_min_changed_memories`: churn floor. A topic needs at least this many changed memories since its last checkpoint to be worth a pass. Consolidation's own writes do **not** count as churn for the next window — the checkpoint is stamped after mutations — so oversized topics advance via explicit continuation jobs that bypass only the churn floor.
+- `consolidation_interval_seconds`: how often one topic is eligible for a pass (default 7 days). The sweep enqueues at most one topic per minute, never while `learning.model` is unset, and only for topics at or above the churn floor. Sub-floor topics are never enqueued at all, so their pending changes accumulate instead of being discarded.
+- `consolidation_min_changed_memories`: churn floor. A topic needs at least this many changed memories since its last checkpoint to be worth a pass, checked at enqueue time and again when the pass runs. The checkpoint advances only on executed passes: a churn-floor no-op writes its audit event without stamping, so sub-floor churn keeps accumulating toward the next real pass, while an executed pass stamps even when it finds zero clusters, so floored work is never re-proposed every tick. Consolidation's own writes do **not** count as churn for the next window because the checkpoint is stamped after mutations, so oversized topics advance via explicit continuation jobs that bypass only the churn floor.
 - `consolidation_max_memories_per_pass`: bounded working set consumed by one pass.
 - `consolidation_max_tokens`: token cap for the consolidation generation itself.
 
@@ -400,6 +401,23 @@ memory:
 
 - `memory.topic_canonical_floor` (default `0.85`) — slug-aware similarity required to treat two topics as equivalent when merging at apply time and during the one-time startup backfill. This is deliberately separate from `supersede_similarity_floor`; topic slugs are short strings where a 0.30 floor would collapse unrelated topics.
 - `memory.topic_canonicalization_prompt_topics` (default `40`) — how many existing topics are listed in the extraction prompt so the extractor reuses canonical topic names instead of inventing near-duplicates. Set to `0` to disable the block.
+
+## Episodic retention
+
+```yaml
+memory:
+  episodic_retention_days: 30  # default; 0 disables retirement
+```
+
+Episodic memories are session-continuity records, not durable facts, so the runtime retires the ones that stopped being useful. Retirement is a deterministic pass on the learning worker's tick (every 60 seconds, up to 200 rows per tick, no LLM involvement): an **active** `episodic` memory is archived when it has never been reinforced (`observation_count < 2`) **and** both its `updated_at` and its last access (or its creation, for rows never injected) fall outside the `episodic_retention_days` window. Archiving is a status flip to `archived`: the memory stops being injected or retrieved, but the raw events that produced it are untouched and it stays inspectable via `GET /memory?status=archived`.
+
+What is exempt from retirement:
+
+- any memory reinforced at least once (`observation_count >= 2`), episodic or not: evidence of actual reuse;
+- anything created, updated, or injected within the window: a never-reinforced episodic that keeps getting retrieved stays active;
+- every non-episodic memory type: retirement touches `episodic` rows only.
+
+The same window drives the learner-side duplicate-skip guard: an episodic candidate that is near-verbatim (`memory.dedup_similarity`) to a still-fresh active episodic is skipped at apply time instead of minting a duplicate, and the diagnostic counter is surfaced as `skips.episodic_total` on `GET /status`. Set `episodic_retention_days: 0` to disable both the retirement pass and the guard (the guard's cutoff becomes `now`, so nothing is ever fresh enough to match). The window is deliberately shared and the two roles are complements: inside the window an episodic is a live anchor that absorbs near-duplicates; outside it, an unreinforced episodic is retirement fodder. Mechanics: [ARCHITECTURE.md](ARCHITECTURE.md#episodic-lifecycle).
 
 ## Retrieval candidate fast path
 

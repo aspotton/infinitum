@@ -45,21 +45,23 @@ The recommended execution order for the next releases is the evidence-ranked **I
 
 ## Immediate next work (post-v0.6.0) — evidence-ranked
 
-Work packages N1–N7, ordered by evidence collected 2026-10-09 from the maintainer's daily-driver instance (v0.6.0, one user, three CWD-derived projects, ~480 interactions in a five-hour working window, 42 days of history):
+Work packages N1–N7, ordered by evidence collected 2026-10-09 from the maintainer's daily-driver instance (v0.6.0, one user, three CWD-derived projects, ~480 interactions in a five-hour working window, 42 days of history) and refreshed with live-store measurements on 2026-10-17 (v0.6.2, six CWD-derived projects):
 
 | Measured | Value |
 |---|---|
-| Active memories vs topics | 2,121 active memories across 1,760 distinct topics (median topic size = 1 memory) |
-| Topic-summary coverage | 84 summarized topics ≈ 15% of active memories (summaries require `learning.topic_summary_min_memories = 3`) |
-| Reinforcement | median `observation_count` = 1; ~87% of active memories were never reinforced |
-| Live retrieval signals | embeddings disabled (the semantic weight is inert), so lexical/FTS + topic only; drill-down tools (`memory.tools_enabled` defaults to true as of the tuned-minimal-config change) were off in the measured store and never called (zero `memory.tool_call` events); consolidation running but reaching only the ≥3-memory topics |
-| Scale headroom | every retrieval pass loads all active rows capped at 5,000 and silently truncates above it (`retrieval.py`, `ponytail:` comment at the `list_active_memories(limit=5000)` call); actives grow ≈ 60/day, so the cap arrives in roughly 6–10 weeks |
+| Active memories vs topics | 2,385 active memories across 1,744 distinct topics; 84% singleton topics (the N1 canonicalization backfill ran and reduced 1,760 → 1,744) |
+| Episodic share | episodic is 941 actives = 39% of the store and 60% of creations since Oct 12 (158/263) |
+| Topic-summary coverage | 133 topic-summary rows against 1,744 topics (summaries require `learning.topic_summary_min_memories = 3`) |
+| Reinforcement | 2,002/2,385 (84%) of active memories never reinforced (`observation_count = 1`) |
+| Live retrieval signals | embeddings enabled (the semantic weight is live, vector coverage complete); drill-down tools in real use (468 `memory.tool_call` events); consolidation running but reaching only the ≥3-memory topics |
+| Consolidation output | 8 memories merged across 5,086 `consolidation.pass` events (changed dist: 2,937 zero-churn, 1,886 one-churn); fixed by the store-quality-loop release — the churn floor now gates the enqueue itself and the checkpoint advances only on executed passes |
+| Scale headroom | the N2 candidate fast path is live and working (retrieval latency 0.37–1.07s at ~2.4k actives); actives grow ≈ 50/day |
 
 Each package is independently plannable: a planning agent should be able to turn any one of N1–N7 into a decision-complete plan without re-deriving the problem. Recommended sequence: **N1 → N2 → N3 (ops decision) → N4 → N5 → N6**, with N7 planned deliberately afterwards.
 
 ### N1 — Topic discipline: canonicalization at apply time, boilerplate suppression (quality root cause)
 
-**Status.** Landed on `feat/topic-canonicalization` (open PR, pre-release): apply-time canonicalization at `memory.topic_canonical_floor`, a bounded existing-topics list in the extraction prompt, similarity-gated implicit supersede/refine routes, and a one-time idempotent startup backfill; the `topic-discipline` corpus scenario is the standing regression gate. Boilerplate suppression remains prompt-guidance only.
+**Status.** Landed on `feat/topic-canonicalization` (open PR, pre-release): apply-time canonicalization at `memory.topic_canonical_floor`, a bounded existing-topics list in the extraction prompt, similarity-gated implicit supersede/refine routes, and a one-time idempotent startup backfill; the `topic-discipline` corpus scenario is the standing regression gate. Boilerplate suppression is now deterministic as well: the store-quality-loop release added the episodic duplicate-skip guard in `_apply` (a near-verbatim episodic candidate against a still-fresh active episodic is never created) plus periodic retirement of stale unreinforced episodic rows, and the extraction-prompt rule was broadened to name session-start boilerplate and housekeeping notices explicitly.
 
 **Problem.** Topic strings are free-form LLM output — the extraction prompt asks for a `"short-stable-topic"` and nothing validates it against the existing topic namespace. The live store shows the result: 1,760 distinct topics for 2,121 active memories, including per-run slugs such as `...-execution-start-2026-09-24` where session-start boilerplate was learned as durable episodic memory with a date in the topic, so every session mints a fresh topic and a fresh memory. Consequences compound: topic summaries never trigger for one-memory topics (85% of the store has no summary); consolidation cannot find duplicates because they were filed under different topics (cross-topic passes are deferred); the topic relevance tier of the scorer is nearly inert; the store grows with session count rather than with new information.
 
@@ -96,9 +98,9 @@ Each package is independently plannable: a planning agent should be able to turn
 
 ### N3 — Live-instance decision: enable embeddings and drill-down tools (ops, not code)
 
-**Status.** Both are shipped features running dark: `/health` on the live store reports `embeddings_enabled: false`, and `memory.tools_enabled` now defaults to true as of the next release, with zero drill-down calls recorded in the measured store. With embeddings off, the scorer's largest weight (semantic, 0.45 by default) is inert and paraphrase near-duplicates are only caught by lexical coincidence — the main driver of the never-reinforced 87% in N1's evidence.
+**Status.** Resolved 2026-10-17 with option (a): the live instance now runs with embeddings enabled (an OpenAI-compatible embedding model on the same hardware, vector coverage complete including superseded rows) and the drill-down tools on and in real use (468 `memory.tool_call` events with genuine queries). Retrieval latency measures 0.37–1.07s at ~2.4k actives via the N2 candidate fast path. The scorer's largest weight (semantic, 0.45 by default) is no longer inert.
 
-**Decision required from the maintainer.** Either (a) point `embeddings.base_url` at an OpenAI-compatible embedding model on the same hardware and enable `memory.tools_enabled` in the live config, or (b) deliberately stay lexical-only and retune `retrieval_weights` for the FTS path. Option (a) first needs a config-only trial + one `python -m benchmarks.replay` / eval-skill pass against the live store; option (b) needs a weights sweep against the corpus. Record the outcome here and in the CHANGELOG if behavior changes.
+**Decision record.** The config-only trial plus evaluation pass called for in option (a) was completed on the live store; the measured outcomes are in the evidence table above and in the CHANGELOG. Option (b) (lexical-only retune) is moot with embeddings live.
 
 **Deferred.** Vector storage beyond float32 blobs; embedding version migration tooling.
 
