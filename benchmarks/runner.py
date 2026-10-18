@@ -339,6 +339,9 @@ def run_scenario(scenario: Scenario, *, candidates: bool = False) -> ScenarioRes
         cfg.learning.topic_summaries = False
         # No foreground contention offline; don't burn the new 5s idle-grace per turn.
         cfg.learning.upstream_idle_grace_seconds = 0.0
+        # The worker's -inf retirement tick would fire on its first poll and
+        # archive any stale seeded episodic rows mid-scenario; keep the knob off.
+        cfg.memory.episodic_retention_days = 0.0
         cfg.upstream.passthrough_authorization = False
 
         app = create_app(cfg)

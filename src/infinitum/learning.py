@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from .config import AppConfig
-from .database import Database
+from .database import Database, _EPISODIC_RETIRE_BATCH
 from .embeddings import EmbeddingClient
 from .models import Memory, MemoryCandidate, RequestContext, TopicSummary
 from .retrieval import MemoryRetriever
@@ -42,6 +42,11 @@ STALE_LOCK_GRACE_SECONDS = 60.0
 # last-sweep timestamp starts at -inf so the first poll is unconditionally due.
 _CONSOLIDATION_SWEEP_SECONDS = 60.0
 _CONSOLIDATION_SWEEP_BATCH = 1
+
+# Episodic retirement tick: same timestamp-gated 60s cadence as the
+# consolidation sweep, but retirement is deterministic (no LLM, no model), so
+# its gate is only memory.enabled + a positive retention window.
+_EPISODIC_RETIRE_SECONDS = 60.0
 
 STOP_GRACE_SECONDS = 5.0
 # Grace for worker shutdown before the worker task is cancelled. Deliberately
@@ -673,6 +678,19 @@ Schema:
         changed_ids = [memory_id for memory_id, _created_at in dirty_updates]
 
         active_count = await self.db.count_active_topic_memories(topic)
+        if active_count == 0:
+            # The active set is empty (e.g. deterministic episodic retirement
+            # archived every row). Consume the dirty batch AND clear the
+            # derived summary deterministically: stale text naming archived
+            # memories must never survive into injection. An empty topic gets
+            # no summary LLM call (invariant 2's cheap side and zero budget).
+            await self.db.clear_topic_updates(topic, dirty_updates)
+            current = await self.db.get_topic(topic)
+            if current is not None and current.summary:
+                await self.db.upsert_topic(
+                    TopicSummary(topic=topic, summary="", memory_count=0)
+                )
+            return False
         if active_count < self.config.learning.topic_summary_min_memories:
             # There is not enough evidence to justify a summary yet. Consume the
             # current dirty batch; future memories will mark the topic dirty again.
@@ -867,6 +885,8 @@ class LearningWorker:
         # once the monotonic epoch itself exceeded 60s, which fresh-boot CI
         # runners violate.
         self._last_consolidation_sweep = float("-inf")
+        # -inf so the very first poll is due, same rationale as the sweep stamp.
+        self._last_episodic_retirement = float("-inf")
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
@@ -927,6 +947,17 @@ class LearningWorker:
                     model=self.config.learning.model or "",
                     min_changed=self.config.learning.consolidation_min_changed_memories,
                 )
+            # Deterministic episodic retirement: gated ONLY by memory.enabled
+            # and a positive retention window — never by the consolidation
+            # model gate above, since no LLM runs on this path (invariant 2).
+            if (
+                self.config.memory.enabled
+                and self.config.memory.episodic_retention_days > 0
+                and time.monotonic() - self._last_episodic_retirement
+                >= _EPISODIC_RETIRE_SECONDS
+            ):
+                self._last_episodic_retirement = time.monotonic()
+                await self._retire_stale_episodic()
             cutoff = (
                 datetime.now(timezone.utc)
                 - timedelta(
@@ -1008,6 +1039,39 @@ class LearningWorker:
                     retry=retry,
                     delay_seconds=min(60.0, 2.0 ** job["attempts"]),
                 )
+
+    async def _retire_stale_episodic(self) -> int:
+        """One bounded archival pass plus per-topic dirty marking; returns count.
+
+        The cutoff window deliberately mirrors the learner's episodic
+        duplicate-skip guard. Results are grouped by topic so the existing
+        dirty-row/job coalescing in mark_topic_dirty bounds refresh-job volume
+        regardless of batch size.
+        """
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(days=self.config.memory.episodic_retention_days)
+        ).isoformat()
+        retired = await self.db.retire_stale_episodic(cutoff, _EPISODIC_RETIRE_BATCH)
+        if not retired:
+            return 0
+        by_topic: dict[str, list[str]] = {}
+        for memory_id, topic in retired:
+            by_topic.setdefault(topic, []).append(memory_id)
+        if not self.config.learning.topic_summaries:
+            # Same feature gate learn() honors: summaries off means no
+            # refresh-job churn from retired rows either.
+            return len(retired)
+        for topic, memory_ids in sorted(by_topic.items()):
+            await self.db.mark_topic_dirty(
+                topic,
+                memory_ids,
+                model=self.config.learning.model,
+                debounce_seconds=self.config.learning.topic_summary_debounce_seconds,
+                update_threshold=self.config.learning.topic_summary_update_threshold,
+            )
+        log.info("episodic retirement archived %d stale episodic memories", len(retired))
+        return len(retired)
 
 
 # Startup embedding backfill (N2 todo 6, GAP-8). Bounded probe batch per pass;

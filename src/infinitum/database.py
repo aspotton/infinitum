@@ -45,6 +45,11 @@ _EVENT_COMPRESSION_BATCH_BYTES = 8 * 1024 * 1024
 # ponytail: no config key; add one only when someone needs shorter retention.
 _DONE_JOB_RETENTION_DAYS = 7
 
+# Batch cap for the deterministic episodic retirement sweep (worker tick owns
+# periodicity, so this drains ~200/min). ponytail: fixed batch; upgrade path =
+# larger batch or a dedicated maintenance job if stores ever outgrow that rate.
+_EPISODIC_RETIRE_BATCH = 200
+
 # Meta key prefix for the per-topic consolidation checkpoint: one ISO timestamp
 # of the last completed consolidation pass, written by MemoryConsolidator via
 # set_meta_value and read by ensure_consolidation_jobs for cadence.
@@ -2007,3 +2012,55 @@ class Database:
             enqueued += 1
         self._conn.commit()
         return enqueued
+
+    # Periodic episodic retirement --------------------------------------------
+    async def retire_stale_episodic(self, cutoff_iso: str, limit: int) -> list[tuple[str, str]]:
+        """Archive aged, never-reinforced episodic rows in one bounded batch.
+
+        Deterministic maintenance (invariant 2): no LLM involvement. The window
+        is the complement of the learner's episodic duplicate-skip recency
+        guard for observation_count < 2 rows: active episodic memories whose
+        updated_at AND (last_accessed_at or created_at) both fall at or before
+        the cutoff. The COALESCE is load-bearing — never-injected rows have
+        last_accessed_at NULL, and a bare last_accessed_at comparison would
+        silently exclude exactly the never-accessed cohort this retires.
+        Returns the (id, topic) pairs archived so the caller can mark topics
+        dirty.
+        """
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._retire_stale_episodic_sync, cutoff_iso, limit
+            )
+
+    def _retire_stale_episodic_sync(
+        self, cutoff_iso: str, limit: int
+    ) -> list[tuple[str, str]]:
+        assert self._conn is not None
+        self._conn.execute("BEGIN IMMEDIATE")
+        rows = self._conn.execute(
+            "SELECT id, topic FROM memories"
+            " WHERE status='active' AND memory_type='episodic'"
+            " AND observation_count < 2"
+            " AND updated_at <= ? AND COALESCE(last_accessed_at, created_at) <= ?"
+            " LIMIT ?",
+            (cutoff_iso, cutoff_iso, limit),
+        ).fetchall()
+        if not rows:
+            self._conn.commit()
+            return []
+        ids = [str(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        self._conn.execute(
+            f"UPDATE memories SET status='archived', updated_at=? WHERE id IN ({placeholders})",
+            (_iso(utc_now()), *ids),
+        )
+        if self.fts_enabled:
+            # Mirrors archive_memory's FTS semantics (it refreshes by removing
+            # non-active rows); inlined as a delete so the whole batch stays in
+            # this one transaction, and archived rows can never re-enter FTS.
+            for memory_id in ids:
+                self._conn.execute(
+                    "DELETE FROM memories_fts WHERE memory_id=?", (memory_id,)
+                )
+        self._conn.commit()
+        return [(str(row["id"]), str(row["topic"])) for row in rows]
