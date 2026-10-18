@@ -43,13 +43,13 @@ Primary code lives in `src/infinitum/`.
 - `__main__.py` — `infinitum` CLI entrypoint (argparse + `INFINITUM_CONFIG` + uvicorn factory)
 - `routes/openai.py` — OpenAI-compatible proxy endpoints and per-request controls
 - `routes/memory.py` — memory management/search endpoints
-- `routes/admin.py` — health, event, topic, and request-context diagnostics
+- `routes/admin.py` — health, `/status` consolidated diagnostics (health payload + store/jobs/consolidation/skip counters, read-only), event, topic, and request-context diagnostics
 - `config.py` — configuration models and loading
-- `database.py` — SQLite schema, persistence, durable jobs (incl. the 7-day done-jobs startup sweep), provenance, `memory_observations`/`memory_observation_sources` evidence ledger, transparent event-content compression (lzma past 2048 chars into `events.content_blob` behind a 1-byte codec header, byte-identical reads), and additive temporal columns on `memories` (largest module)
+- `database.py` — SQLite schema, persistence, durable jobs (incl. the 7-day done-jobs startup sweep), provenance, `memory_observations`/`memory_observation_sources` evidence ledger, `retire_stale_episodic` batch archival (`_EPISODIC_RETIRE_BATCH` = 200/tick) and `increment_meta_value` diagnostic counters, transparent event-content compression (lzma past 2048 chars into `events.content_blob` behind a 1-byte codec header, byte-identical reads), and additive temporal columns on `memories` (largest module)
 - `request_context.py` — user/project/CWD header resolution
 - `retrieval.py` — hybrid scoring, temporal demotion, context affinity
 - `compiler.py` — token-aware memory selection/rendering/injection
-- `learning.py` — extraction, reinforcement, supersession, incremental topic summaries, worker (also hosts the gated consolidation sweep)
+- `learning.py` — extraction, reinforcement, supersession, deterministic episodic duplicate-skip guard in `_apply` (counter key `episodic_skips_total`), incremental topic summaries, worker (also hosts the gated consolidation sweep and the 60s episodic retirement tick)
 - `consolidation.py` — periodic deep consolidation: pure greedy union-find clustering (`build_clusters`) plus `MemoryConsolidator`, one bounded LLM proposal call per topic pass, merges applied only through the learner's guarded reinforce/supersede primitives, `consolidation.pass`/`consolidation.conflict` events, per-topic meta checkpoint
 - `text.py` — shared scoring primitives: normalization, lexical/topic similarity, bounded phrase comparison (length-bound skip + 8192-char backstop), freshness decay (used by retrieval and reinforcement guards)
 - `tokenizer.py` — `TokenCounter` feeding the compiler token budget

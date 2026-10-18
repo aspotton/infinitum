@@ -18,6 +18,34 @@ Transparent upstream passthrough.
 
 Returns service and feature status.
 
+### `GET /status`
+
+Read-only consolidated diagnostics: everything `/health` reports, plus store, queue, consolidation, and episodic-skip counters. Same trust level as `/health` (no authentication, no state mutation, not a security boundary).
+
+```json
+{
+  "status": "ok",
+  "version": "0.6.2",
+  "memory_enabled": true,
+  "learning_enabled": true,
+  "embeddings_enabled": true,
+  "fts_enabled": true,
+  "active_requests": 0,
+  "store": {
+    "active_total": 2385,
+    "active_by_type": {"episodic": 941, "decision": 616, "lesson": 306},
+    "active_topics": 1744,
+    "episodic_share": 0.39,
+    "created_7d": 263
+  },
+  "jobs": {"pending": 3, "running": 1, "failed": 0},
+  "consolidation_7d": {"passes": 42, "no_ops": 30, "merges": 2},
+  "skips": {"episodic_total": 7}
+}
+```
+
+`store` counts only active memories (`episodic_share` is the episodic fraction of actives, `created_7d` memories created in the last 7 days). `jobs` is the durable queue by state. `consolidation_7d` aggregates `consolidation.pass` events from the last 7 days (executed and no-op passes, plus total memories merged). `skips.episodic_total` is the lifetime count of episodic duplicate-skip guard hits; it is a best-effort diagnostic (a retried learn job can re-count a skip), not a precise ledger.
+
 ### `GET /memory`
 
 Lists memories. Optional `status` query parameter.
