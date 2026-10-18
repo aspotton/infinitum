@@ -1837,6 +1837,68 @@ class Database:
             (key, value),
         )
 
+    # Diagnostics (GET /status read side) --------------------------------------
+    async def get_store_stats(self, window_days: int = 7) -> dict[str, Any]:
+        """Aggregate the active memory store for read-only diagnostics.
+
+        Plain GROUP BY/COUNT scans over the bounded memories table; no new
+        indexes. ``episodic_share`` is rounded to 2 decimals and is 0.0 for
+        an empty store (no ZeroDivision).
+        """
+
+        cutoff = _iso(utc_now() - timedelta(days=window_days))
+        by_type = {
+            str(row["memory_type"]): int(row["n"])
+            for row in await self.fetchall(
+                "SELECT memory_type, COUNT(*) AS n FROM memories"
+                " WHERE status='active' GROUP BY memory_type"
+            )
+        }
+        active_total = sum(by_type.values())
+        row = await self.fetchone(
+            "SELECT COUNT(DISTINCT topic) AS topics,"
+            " SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END) AS created_7d"
+            " FROM memories WHERE status='active'",
+            (cutoff,),
+        )
+        return {
+            "active_total": active_total,
+            "active_by_type": by_type,
+            "active_topics": int(row["topics"] or 0),
+            "episodic_share": (
+                round(by_type.get("episodic", 0) / active_total, 2) if active_total else 0.0
+            ),
+            "created_7d": int(row["created_7d"] or 0),
+        }
+
+    async def get_job_status_counts(self) -> dict[str, int]:
+        """Counts of jobs grouped by status (pending/running/failed exposed)."""
+
+        return {
+            str(row["status"]): int(row["n"])
+            for row in await self.fetchall(
+                "SELECT status, COUNT(*) AS n FROM jobs GROUP BY status"
+            )
+        }
+
+    async def get_consolidation_stats(self, window_days: int = 7) -> dict[str, Any]:
+        """consolidation.pass event aggregates inside the window via json_extract."""
+
+        cutoff = _iso(utc_now() - timedelta(days=window_days))
+        row = await self.fetchone(
+            "SELECT COUNT(*) AS passes,"
+            " COALESCE(SUM(json_extract(metadata_json,'$.no_op')), 0) AS no_ops,"
+            " COALESCE(SUM(json_extract(metadata_json,'$.merged')), 0) AS merges"
+            " FROM events"
+            " WHERE event_type='consolidation.pass' AND created_at>=?",
+            (cutoff,),
+        )
+        return {
+            "passes": int(row["passes"]),
+            "no_ops": int(row["no_ops"]),
+            "merges": int(row["merges"]),
+        }
+
     async def list_active_topic_memories_oldest(
         self, topic: str, limit: int = 100
     ) -> list[Memory]:
