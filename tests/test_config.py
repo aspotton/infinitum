@@ -39,6 +39,15 @@ def test_minimal_setup_defaults_are_tuned():
     assert cfg.memory.minimum_relevance_score == 0.08
     assert cfg.learning.skip_when_upstream_busy is True
     assert cfg.learning.upstream_idle_grace_seconds == 5.0
+    assert cfg.memory.episodic_retention_days == 30.0
+
+
+def test_episodic_retention_days_zero_disables_retirement():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "config.yaml"
+        path.write_text("memory:\n  episodic_retention_days: 0\n")
+        cfg = load_config(path)
+        assert cfg.memory.episodic_retention_days == 0.0
 
 
 def test_reinforcement_controls_have_safe_defaults():

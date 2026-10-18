@@ -55,6 +55,9 @@ class MemoryConfig(BaseModel):
     minimum_relevance_score: float = 0.08
     inject_max_memories: int = 8
     dedup_similarity: float = 0.88
+    # Bounds how long unreinforced episodic memories stay active; 0 disables
+    # retirement. Must be >= 0.
+    episodic_retention_days: float = 30.0
     # Fast deterministic reinforcement for nearly identical wording.
     reinforce_similarity: float = 0.86
     # When embeddings are enabled, semantically equivalent memories can
