@@ -881,6 +881,7 @@ class LearningWorker:
                     self.config.learning.consolidation_interval_seconds,
                     _CONSOLIDATION_SWEEP_BATCH,
                     model=self.config.learning.model or "",
+                    min_changed=self.config.learning.consolidation_min_changed_memories,
                 )
             cutoff = (
                 datetime.now(timezone.utc)

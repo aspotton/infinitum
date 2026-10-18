@@ -1859,23 +1859,38 @@ class Database:
         return int(row["n"]) if row else 0
 
     async def ensure_consolidation_jobs(
-        self, interval_seconds: float, batch_cap: int, model: str
+        self,
+        interval_seconds: float,
+        batch_cap: int,
+        model: str,
+        min_changed: int = 0,
     ) -> int:
         """Enqueue due consolidate_topic jobs; at most batch_cap per sweep.
 
         Due means the topic has active memories, no pending/running
-        consolidate_topic job, and no checkpoint newer than now-interval.
-        Due topics are ranked by churn descending (most-changed first, using
-        the same created/updated-since-checkpoint formula as
-        count_active_topic_memories_updated_since), ties broken alphabetically.
+        consolidate_topic job, no checkpoint newer than now-interval, and at
+        least min_changed memories changed since its checkpoint (0 = no churn
+        floor). Topics with no checkpoint compare against the epoch, so their
+        churn is the lifetime active count. Due topics are ranked by churn
+        descending (most-changed first, using the same created/updated-since-
+        checkpoint formula as count_active_topic_memories_updated_since), ties
+        broken alphabetically.
         """
         async with self._lock:
             return await asyncio.to_thread(
-                self._ensure_consolidation_jobs_sync, interval_seconds, batch_cap, model
+                self._ensure_consolidation_jobs_sync,
+                interval_seconds,
+                batch_cap,
+                model,
+                min_changed,
             )
 
     def _ensure_consolidation_jobs_sync(
-        self, interval_seconds: float, batch_cap: int, model: str
+        self,
+        interval_seconds: float,
+        batch_cap: int,
+        model: str,
+        min_changed: int = 0,
     ) -> int:
         assert self._conn is not None
         now = datetime.now(timezone.utc)
@@ -1895,9 +1910,10 @@ class Database:
             " LEFT JOIN meta mt ON mt.key = ? || m.topic"
             " WHERE m.status='active' AND j.id IS NULL"
             " AND (mt.key IS NULL OR mt.value <= ?)"
-            " GROUP BY m.topic ORDER BY churn DESC, m.topic LIMIT ?)",
+            " GROUP BY m.topic HAVING churn >= ?"
+            " ORDER BY churn DESC, m.topic LIMIT ?)",
             (_CONSOLIDATION_EPOCH, _CONSOLIDATION_EPOCH,
-             _CONSOLIDATION_META_PREFIX, cutoff, batch_cap),
+             _CONSOLIDATION_META_PREFIX, cutoff, min_changed, batch_cap),
         ).fetchall()
         enqueued = 0
         for row in rows:
