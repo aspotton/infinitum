@@ -57,7 +57,7 @@ class MemoryConfig(BaseModel):
     dedup_similarity: float = 0.88
     # Bounds how long unreinforced episodic memories stay active; 0 disables
     # retirement. Must be >= 0.
-    episodic_retention_days: float = 30.0
+    episodic_retention_days: float = Field(default=30.0, ge=0)
     # Fast deterministic reinforcement for nearly identical wording.
     reinforce_similarity: float = 0.86
     # When embeddings are enabled, semantically equivalent memories can

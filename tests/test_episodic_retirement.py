@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from infinitum.app import create_app
+from infinitum.compiler import ContextCompiler
 from infinitum.config import AppConfig
 from infinitum.database import Database, _EPISODIC_RETIRE_BATCH
 from infinitum.embeddings import EmbeddingClient
@@ -20,6 +21,7 @@ from infinitum.learning import MemoryLearner, LearningWorker
 from infinitum.models import Memory, TopicSummary
 from infinitum.retrieval import MemoryRetriever
 from infinitum.runtime import build_runtime
+from infinitum.tokenizer import TokenCounter
 from infinitum.upstream import UpstreamClient
 
 RETENTION_DAYS = 1
@@ -301,3 +303,46 @@ async def test_retention_window_zero_keeps_the_worker_from_ever_calling_retireme
             await rt.upstream.close()
             await rt.embeddings.close()
             await rt.db.close()
+
+
+@pytest.mark.asyncio
+async def test_cleared_topic_never_injects_an_empty_summary_stub():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = _retirement_config(tmp)
+        cfg.learning.topic_summary_min_memories = 1
+        cfg.embeddings.enabled = False
+        db = Database(cfg.memory.database_path)
+        await db.connect()
+        learner, _ = _learner_with_empty_llm(db, cfg)
+        try:
+            await db.create_memory(
+                Memory(
+                    memory_type="episodic",
+                    topic="retro",
+                    content="Attended the all-hands retro on Tuesday.",
+                    created_at=datetime.fromisoformat(_old_iso()),
+                    updated_at=datetime.fromisoformat(_old_iso()),
+                )
+            )
+            await db.upsert_topic(
+                TopicSummary(
+                    topic="retro",
+                    summary="Logged: attended the all-hands retro on Tuesday.",
+                    memory_count=1,
+                )
+            )
+            worker = LearningWorker(db, learner, cfg)
+            assert await worker._retire_stale_episodic() == 1
+            assert await learner.refresh_topic_summary("retro", "memory-model") is False
+            compiler = ContextCompiler(
+                db, MemoryRetriever(db, learner.embeddings, cfg), TokenCounter(), cfg
+            )
+            compiled = await compiler.compile(
+                [{"role": "user", "content": "what happened in the retro?"}]
+            )
+            assert "topic-summary" not in compiled.text
+            assert "memories=0" not in compiled.text
+        finally:
+            await learner.upstream.close()
+            await learner.embeddings.close()
+            await db.close()

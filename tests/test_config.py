@@ -97,3 +97,8 @@ def test_database_path_falls_back_when_env_unset(monkeypatch):
         monkeypatch.delenv("INFINITUM_DATABASE_PATH", raising=False)
         cfg = load_config(path)
         assert cfg.memory.database_path == "./infinitum.db"
+
+
+def test_episodic_retention_days_rejects_negative():
+    with pytest.raises(ValidationError):
+        AppConfig(memory={"episodic_retention_days": -1})
