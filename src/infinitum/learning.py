@@ -142,7 +142,7 @@ class MemoryLearner:
         prompt = f"""Extract durable memories from this interaction. Return JSON only. Do not call tools or functions.
 Do not save transient chit-chat, guesses, assistant inventions, or obvious restatements, \
 or facts the user marks as temporary or today-only.
-Do not memorize session-start boilerplate or instructions that repeat verbatim across sessions.
+Do not memorize session-start boilerplate, status or housekeeping notices (plan-execution-complete or elapsed-time lines, branch and PR housekeeping), or instructions that repeat verbatim across sessions; such text is memory only when it carries a durable decision.
 Do not memorize generic how-to answers about tools the user merely asked about; a procedure is memory only when it describes the user's own project, environment, or decisions.
 Prefer concise current-state facts, decisions, preferences, goals, procedures, lessons, or episodic events.
 If the user explicitly corrects or replaces an existing memory, set operation_hint='supersede', explicit_correction=true, list only relevant existing memory IDs, and copy that memory's memory_type and topic exactly.
@@ -429,6 +429,50 @@ Schema:
             )
             if refined_ids is not None:
                 return refined_ids
+
+        # Deterministic episodic duplicate-skip: an episodic candidate that is
+        # near-verbatim (memory.dedup_similarity) to a still-live active episodic
+        # memory in the nearby set adds no new information, so skip the create
+        # entirely: zero mutations, no observation, no dirty-topic; the raw
+        # events remain the record. Recency deliberately matches the retirement
+        # window: an aged-but-recently-accessed twin stays a live anchor.
+        # Explicit corrections and supersede proposals never skip here so the
+        # create + supersede path below stays reachable for them.
+        # The counter is diagnostic and best-effort: a retried learn job may
+        # re-count a skip.
+        # ponytail: nearby-set scan, not corpus-wide dedupe; upgrade path =
+        # dedicated episodic similarity arm in retrieval.
+        if (
+            candidate.memory_type == "episodic"
+            and candidate.operation_hint != "supersede"
+            and not candidate.explicit_correction
+        ):
+            recency_cutoff = datetime.now(timezone.utc) - timedelta(
+                days=self.config.memory.episodic_retention_days
+            )
+            for m in matches:
+                if (
+                    m.memory.memory_type == "episodic"
+                    and m.memory.status == "active"
+                    and (
+                        m.memory.updated_at >= recency_cutoff
+                        or (
+                            m.memory.last_accessed_at is not None
+                            and m.memory.last_accessed_at >= recency_cutoff
+                        )
+                    )
+                ):
+                    similarity = lexical_similarity(candidate.content, m.memory.content)
+                    if similarity >= self.config.memory.dedup_similarity:
+                        log.info(
+                            "episodic duplicate-skip: new episodic candidate matches active"
+                            " episodic %s at lexical similarity %.3f (sources %s); skipping create",
+                            m.memory.id,
+                            similarity,
+                            source_ids,
+                        )
+                        await self.db.increment_meta_value("episodic_skips_total")
+                        return set()
 
         new_memory = Memory(
             memory_type=candidate.memory_type,

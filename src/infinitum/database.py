@@ -1837,6 +1837,21 @@ class Database:
             (key, value),
         )
 
+    async def increment_meta_value(self, key: str) -> int:
+        """Increment an integer meta counter in one statement; return the new value.
+
+        For diagnostic counters only (e.g. ``episodic_skips_total``). SQLite
+        CAST semantics mean a non-integer seed reads as 0 before the +1.
+        """
+
+        await self.execute(
+            "INSERT INTO meta(key, value) VALUES(?, '1')"
+            " ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",
+            (key,),
+        )
+        row = await self.fetchone("SELECT value FROM meta WHERE key=?", (key,))
+        return int(row["value"]) if row else 0
+
     # Diagnostics (GET /status read side) --------------------------------------
     async def get_store_stats(self, window_days: int = 7) -> dict[str, Any]:
         """Aggregate the active memory store for read-only diagnostics.
