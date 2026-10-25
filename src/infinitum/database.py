@@ -45,6 +45,11 @@ _EVENT_COMPRESSION_BATCH_BYTES = 8 * 1024 * 1024
 # ponytail: no config key; add one only when someone needs shorter retention.
 _DONE_JOB_RETENTION_DAYS = 7
 
+# Batch cap for the deterministic episodic retirement sweep (worker tick owns
+# periodicity, so this drains ~200/min). ponytail: fixed batch; upgrade path =
+# larger batch or a dedicated maintenance job if stores ever outgrow that rate.
+_EPISODIC_RETIRE_BATCH = 200
+
 # Meta key prefix for the per-topic consolidation checkpoint: one ISO timestamp
 # of the last completed consolidation pass, written by MemoryConsolidator via
 # set_meta_value and read by ensure_consolidation_jobs for cadence.
@@ -1837,6 +1842,83 @@ class Database:
             (key, value),
         )
 
+    async def increment_meta_value(self, key: str) -> int:
+        """Increment an integer meta counter in one statement; return the new value.
+
+        For diagnostic counters only (e.g. ``episodic_skips_total``). SQLite
+        CAST semantics mean a non-integer seed reads as 0 before the +1.
+        """
+
+        await self.execute(
+            "INSERT INTO meta(key, value) VALUES(?, '1')"
+            " ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1",
+            (key,),
+        )
+        row = await self.fetchone("SELECT value FROM meta WHERE key=?", (key,))
+        return int(row["value"]) if row else 0
+
+    # Diagnostics (GET /status read side) --------------------------------------
+    async def get_store_stats(self, window_days: int = 7) -> dict[str, Any]:
+        """Aggregate the active memory store for read-only diagnostics.
+
+        Plain GROUP BY/COUNT scans over the bounded memories table; no new
+        indexes. ``episodic_share`` is rounded to 2 decimals and is 0.0 for
+        an empty store (no ZeroDivision).
+        """
+
+        cutoff = _iso(utc_now() - timedelta(days=window_days))
+        by_type = {
+            str(row["memory_type"]): int(row["n"])
+            for row in await self.fetchall(
+                "SELECT memory_type, COUNT(*) AS n FROM memories"
+                " WHERE status='active' GROUP BY memory_type"
+            )
+        }
+        active_total = sum(by_type.values())
+        row = await self.fetchone(
+            "SELECT COUNT(DISTINCT topic) AS topics,"
+            " SUM(CASE WHEN created_at>=? THEN 1 ELSE 0 END) AS created_7d"
+            " FROM memories WHERE status='active'",
+            (cutoff,),
+        )
+        return {
+            "active_total": active_total,
+            "active_by_type": by_type,
+            "active_topics": int(row["topics"] or 0),
+            "episodic_share": (
+                round(by_type.get("episodic", 0) / active_total, 2) if active_total else 0.0
+            ),
+            "created_7d": int(row["created_7d"] or 0),
+        }
+
+    async def get_job_status_counts(self) -> dict[str, int]:
+        """Counts of jobs grouped by status (pending/running/failed exposed)."""
+
+        return {
+            str(row["status"]): int(row["n"])
+            for row in await self.fetchall(
+                "SELECT status, COUNT(*) AS n FROM jobs GROUP BY status"
+            )
+        }
+
+    async def get_consolidation_stats(self, window_days: int = 7) -> dict[str, Any]:
+        """consolidation.pass event aggregates inside the window via json_extract."""
+
+        cutoff = _iso(utc_now() - timedelta(days=window_days))
+        row = await self.fetchone(
+            "SELECT COUNT(*) AS passes,"
+            " COALESCE(SUM(json_extract(metadata_json,'$.no_op')), 0) AS no_ops,"
+            " COALESCE(SUM(json_extract(metadata_json,'$.merged')), 0) AS merges"
+            " FROM events"
+            " WHERE event_type='consolidation.pass' AND created_at>=?",
+            (cutoff,),
+        )
+        return {
+            "passes": int(row["passes"]),
+            "no_ops": int(row["no_ops"]),
+            "merges": int(row["merges"]),
+        }
+
     async def list_active_topic_memories_oldest(
         self, topic: str, limit: int = 100
     ) -> list[Memory]:
@@ -1859,23 +1941,38 @@ class Database:
         return int(row["n"]) if row else 0
 
     async def ensure_consolidation_jobs(
-        self, interval_seconds: float, batch_cap: int, model: str
+        self,
+        interval_seconds: float,
+        batch_cap: int,
+        model: str,
+        min_changed: int = 0,
     ) -> int:
         """Enqueue due consolidate_topic jobs; at most batch_cap per sweep.
 
         Due means the topic has active memories, no pending/running
-        consolidate_topic job, and no checkpoint newer than now-interval.
-        Due topics are ranked by churn descending (most-changed first, using
-        the same created/updated-since-checkpoint formula as
-        count_active_topic_memories_updated_since), ties broken alphabetically.
+        consolidate_topic job, no checkpoint newer than now-interval, and at
+        least min_changed memories changed since its checkpoint (0 = no churn
+        floor). Topics with no checkpoint compare against the epoch, so their
+        churn is the lifetime active count. Due topics are ranked by churn
+        descending (most-changed first, using the same created/updated-since-
+        checkpoint formula as count_active_topic_memories_updated_since), ties
+        broken alphabetically.
         """
         async with self._lock:
             return await asyncio.to_thread(
-                self._ensure_consolidation_jobs_sync, interval_seconds, batch_cap, model
+                self._ensure_consolidation_jobs_sync,
+                interval_seconds,
+                batch_cap,
+                model,
+                min_changed,
             )
 
     def _ensure_consolidation_jobs_sync(
-        self, interval_seconds: float, batch_cap: int, model: str
+        self,
+        interval_seconds: float,
+        batch_cap: int,
+        model: str,
+        min_changed: int = 0,
     ) -> int:
         assert self._conn is not None
         now = datetime.now(timezone.utc)
@@ -1895,9 +1992,10 @@ class Database:
             " LEFT JOIN meta mt ON mt.key = ? || m.topic"
             " WHERE m.status='active' AND j.id IS NULL"
             " AND (mt.key IS NULL OR mt.value <= ?)"
-            " GROUP BY m.topic ORDER BY churn DESC, m.topic LIMIT ?)",
+            " GROUP BY m.topic HAVING churn >= ?"
+            " ORDER BY churn DESC, m.topic LIMIT ?)",
             (_CONSOLIDATION_EPOCH, _CONSOLIDATION_EPOCH,
-             _CONSOLIDATION_META_PREFIX, cutoff, batch_cap),
+             _CONSOLIDATION_META_PREFIX, cutoff, min_changed, batch_cap),
         ).fetchall()
         enqueued = 0
         for row in rows:
@@ -1914,3 +2012,55 @@ class Database:
             enqueued += 1
         self._conn.commit()
         return enqueued
+
+    # Periodic episodic retirement --------------------------------------------
+    async def retire_stale_episodic(self, cutoff_iso: str, limit: int) -> list[tuple[str, str]]:
+        """Archive aged, never-reinforced episodic rows in one bounded batch.
+
+        Deterministic maintenance (invariant 2): no LLM involvement. The window
+        is the complement of the learner's episodic duplicate-skip recency
+        guard for observation_count < 2 rows: active episodic memories whose
+        updated_at AND (last_accessed_at or created_at) both fall at or before
+        the cutoff. The COALESCE is load-bearing — never-injected rows have
+        last_accessed_at NULL, and a bare last_accessed_at comparison would
+        silently exclude exactly the never-accessed cohort this retires.
+        Returns the (id, topic) pairs archived so the caller can mark topics
+        dirty.
+        """
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._retire_stale_episodic_sync, cutoff_iso, limit
+            )
+
+    def _retire_stale_episodic_sync(
+        self, cutoff_iso: str, limit: int
+    ) -> list[tuple[str, str]]:
+        assert self._conn is not None
+        self._conn.execute("BEGIN IMMEDIATE")
+        rows = self._conn.execute(
+            "SELECT id, topic FROM memories"
+            " WHERE status='active' AND memory_type='episodic'"
+            " AND observation_count < 2"
+            " AND updated_at <= ? AND COALESCE(last_accessed_at, created_at) <= ?"
+            " LIMIT ?",
+            (cutoff_iso, cutoff_iso, limit),
+        ).fetchall()
+        if not rows:
+            self._conn.commit()
+            return []
+        ids = [str(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        self._conn.execute(
+            f"UPDATE memories SET status='archived', updated_at=? WHERE id IN ({placeholders})",
+            (_iso(utc_now()), *ids),
+        )
+        if self.fts_enabled:
+            # Mirrors archive_memory's FTS semantics (it refreshes by removing
+            # non-active rows); inlined as a delete so the whole batch stays in
+            # this one transaction, and archived rows can never re-enter FTS.
+            for memory_id in ids:
+                self._conn.execute(
+                    "DELETE FROM memories_fts WHERE memory_id=?", (memory_id,)
+                )
+        self._conn.commit()
+        return [(str(row["id"]), str(row["topic"])) for row in rows]

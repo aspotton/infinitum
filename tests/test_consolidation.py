@@ -181,7 +181,39 @@ async def test_churn_below_floor_is_a_no_op():
         assert len(await db.list_active_topic_memories("t")) == 2  # zero mutations
         passes = await _events_by_type(db, "consolidation.pass")
         assert len(passes) == 1 and json.loads(passes[0].content)["no_op"] is True
-        assert await db.get_meta_value(_CONSOLIDATION_META_PREFIX + "t")
+        # A churn-floor no-op must NOT stamp: sub-floor churn accumulates toward
+        # the next real pass instead of the 7-day window silently resetting.
+        assert await db.get_meta_value(_CONSOLIDATION_META_PREFIX + "t") is None
+
+
+async def test_executed_zero_cluster_pass_stamps_the_checkpoint():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg, db, upstream = _setup(tmp)  # default churn floor = 8
+        await db.connect()
+        distinct = [
+            "The deploy target is the arm64 edge cluster",
+            "Green tea has less caffeine than brewed coffee",
+            "The repo pins Python 3.12 across CI matrices",
+            "Office desks are booked through the internal calendar",
+            "Postgres backups run weekly to cold storage",
+            "The on-call rotation hands over every Friday noon",
+            "Figma files live under the design team workspace",
+            "Receipts are expensed monthly in the finance tool",
+            "The garden watering schedule shifts with the seasons",
+        ]
+        for content in distinct:
+            await _seed(db, "wide", content)
+
+        async def empty_proposal(clusters, *, topic, model):
+            return {"clusters": []}
+
+        consolidator = MemoryConsolidator(db, upstream, cfg, proposal_fn=empty_proposal)
+        stats = await consolidator.consolidate_topic("wide", "test-model")
+
+        assert stats["no_op"] is False and stats["changed"] == 9
+        assert stats["clusters"] == 0 and stats["merged"] == 0
+        assert len(await _events_by_type(db, "consolidation.pass")) == 1
+        assert await db.get_meta_value(_CONSOLIDATION_META_PREFIX + "wide") is not None
 
 
 async def test_conflict_cluster_is_recorded_and_other_clusters_still_apply():

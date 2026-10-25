@@ -156,6 +156,11 @@ class MemoryConsolidator:
         if (not continuation and changed < cfg.consolidation_min_changed_memories) or len(
             working
         ) < 2:
+            # No-op: write the pass event but do NOT stamp the checkpoint.
+            # Sub-floor churn must accumulate toward the next real pass; the
+            # old always-stamp behavior reset the 7-day window on every
+            # no-op and silently discarded pending changes (the live store
+            # measured 2,937 changed=0 passes under it).
             stats["no_op"] = True
             await self._audit(topic, stats)
             return stats
@@ -187,6 +192,11 @@ class MemoryConsolidator:
                     update_threshold=cfg.topic_summary_update_threshold,
                 )
         await self._audit(topic, stats)
+        # Stamp only on executed passes — even a zero-cluster, zero-merge one,
+        # so churn the floor let through is never re-proposed every tick.
+        await self.db.set_meta_value(
+            _CONSOLIDATION_META_PREFIX + topic, utc_now().isoformat()
+        )
         if len(working) == cfg.consolidation_max_memories_per_pass and stats["merged"]:
             await self.db.enqueue_job(
                 "consolidate_topic",
@@ -342,7 +352,8 @@ Schema:
         return survivors
 
     async def _audit(self, topic: str, stats: dict[str, Any]) -> None:
-        """Write the pass event, then stamp the checkpoint AFTER the mutations."""
+        """Write the pass event. Checkpoint stamping lives in consolidate_topic
+        so churn-floor no-ops can record the pass without advancing the window."""
         await self.db.add_event(
             Event(
                 session_id=_SESSION_ID,
@@ -351,9 +362,6 @@ Schema:
                 content=json.dumps(stats, separators=(",", ":")),
                 metadata={"topic": topic, **stats},
             )
-        )
-        await self.db.set_meta_value(
-            _CONSOLIDATION_META_PREFIX + topic, utc_now().isoformat()
         )
 
     def _parse_json(self, text: str) -> dict[str, Any]:

@@ -165,6 +165,8 @@ class ContextCompiler:
         topic_blocks: list[str] = []
         covered_topics: set[str] = set()
         for topic in await self.db.list_topics(limit=100):
+            if not topic.summary:
+                continue
             relevance = lexical_similarity(query, f"{topic.topic} {topic.summary}")
             if relevance < 0.18:
                 continue

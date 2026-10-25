@@ -64,6 +64,9 @@ async def test_sweep_enqueues_on_first_poll_and_dispatch_threads_topic_model_con
         cfg = _worker_config(tmp)
         cfg.learning.consolidation = True
         cfg.learning.model = "test-model"
+        # The sweep now enqueues only topics at the churn floor; one seeded
+        # memory needs floor 1 to be due.
+        cfg.learning.consolidation_min_changed_memories = 1
         await db.create_memory(
             Memory(memory_type="fact", topic="dupes", content="We use SQLite.")
         )
@@ -134,7 +137,10 @@ async def test_sweep_tick_does_not_advance_while_upstream_busy_defers():
             await asyncio.sleep(0.2)  # stamped ~now: the 60s tick is not due again
             assert ensure.await_count == 1
             ensure.assert_awaited_once_with(
-                cfg.learning.consolidation_interval_seconds, 1, model="test-model"
+                cfg.learning.consolidation_interval_seconds,
+                1,
+                model="test-model",
+                min_changed=cfg.learning.consolidation_min_changed_memories,
             )
         finally:
             await worker.stop()

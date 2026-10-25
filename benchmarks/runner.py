@@ -339,6 +339,12 @@ def run_scenario(scenario: Scenario, *, candidates: bool = False) -> ScenarioRes
         cfg.learning.topic_summaries = False
         # No foreground contention offline; don't burn the new 5s idle-grace per turn.
         cfg.learning.upstream_idle_grace_seconds = 0.0
+        # The knob is shared with the episodic duplicate-skip guard's recency
+        # window: pinning it to 0.0 (retirement off) made that cutoff ``now``
+        # and deadened the guard offline. The production default keeps
+        # retirement inert across the corpus anyway - every row in the fresh
+        # temp DB is days old, so the retire query matches zero rows.
+        cfg.memory.episodic_retention_days = 30.0
         cfg.upstream.passthrough_authorization = False
 
         app = create_app(cfg)

@@ -31,9 +31,7 @@ def _runtime(request: Request) -> Runtime:
     return request.app.state.runtime
 
 
-@router.get("/health")
-async def health(request: Request):
-    runtime = _runtime(request)
+def _health_payload(runtime: Runtime) -> dict:
     return {
         "status": "ok",
         "version": __version__,
@@ -42,6 +40,30 @@ async def health(request: Request):
         "embeddings_enabled": runtime.config.embeddings.enabled,
         "fts_enabled": runtime.db.fts_enabled,
         "active_requests": runtime.active_requests.value,
+    }
+
+
+@router.get("/health")
+async def health(request: Request):
+    return _health_payload(_runtime(request))
+
+
+@router.get("/status")
+async def status(request: Request):
+    """Read-only consolidated diagnostics; same trust level as /health."""
+
+    runtime = _runtime(request)
+    jobs = await runtime.db.get_job_status_counts()
+    skips_total = await runtime.db.get_meta_value("episodic_skips_total")
+    return _health_payload(runtime) | {
+        "store": await runtime.db.get_store_stats(),
+        "jobs": {
+            "pending": jobs.get("pending", 0),
+            "running": jobs.get("running", 0),
+            "failed": jobs.get("failed", 0),
+        },
+        "consolidation_7d": await runtime.db.get_consolidation_stats(),
+        "skips": {"episodic_total": int(skips_total or 0)},
     }
 
 
